@@ -38,6 +38,14 @@ import {
 	reviewCapBoundReached,
 } from '../../db/repositories/reviewVerdictsRepository.js';
 import {
+	clearNextAttemptTrigger,
+	listRunAttempts,
+	type RunAttemptOutcome,
+	type RunAttemptSummary,
+	type RunAttemptTrigger,
+	recordNextAttemptTrigger,
+} from '../../db/repositories/runAttemptsRepository.js';
+import {
 	cancelDeferredRunInDb,
 	countMergedPullRequestsByRepository,
 	countRunsByStatusAndPhase,
@@ -620,6 +628,108 @@ async function reopenActiveDispatchForRetry(
 	return claim === 'stale'
 		? takeOverStaleDispatchForManualRetry(active.id, job, active)
 		: reopenDispatchForManualRetry(active.id, job);
+}
+
+/**
+ * Mark the attempt a "Retry now" starts as the operator's (issue #1400), before its
+ * dispatch can be claimed. Best-effort: losing the label must never refuse a retry.
+ * Returns the moment recorded, for {@link unmarkRefusedRetry}; `undefined` when
+ * nothing was recorded.
+ */
+async function markNextAttemptAsRetry(runId: string): Promise<Date | undefined> {
+	try {
+		return await recordNextAttemptTrigger(runId, 'retry');
+	} catch (err) {
+		logger.warn('retryNow: could not record the retry in the run’s attempt history', {
+			runId,
+			error: describeError(err),
+		});
+		return undefined;
+	}
+}
+
+/**
+ * Take back the "Retry now" marker of a retry that was refused or failed, so the next
+ * automatic attempt is not credited to an action SWARM did not take. Only this call's
+ * own marker is cleared, never a concurrent retry's. Best-effort, like the mark: the
+ * refusal the operator is about to see must not be replaced by a bookkeeping error.
+ */
+async function unmarkRefusedRetry(runId: string, requestedAt: Date | undefined): Promise<void> {
+	if (!requestedAt) return;
+	try {
+		await clearNextAttemptTrigger(runId, 'retry', requestedAt);
+	} catch (err) {
+		logger.warn('retryNow: could not take back the refused retry’s attempt-history marker', {
+			runId,
+			error: describeError(err),
+		});
+	}
+}
+
+/** One attempt as `runs.getAttempts` reports it. */
+export interface RunAttemptView {
+	id: string;
+	seq: number;
+	dispatchId: string | null;
+	trigger: RunAttemptTrigger;
+	requestedAt: Date | null;
+	workerId: string | null;
+	workerName: string | null;
+	engine: string | null;
+	model: string | null;
+	startedAt: Date;
+	endedAt: Date | null;
+	/** Null while the attempt is still executing. */
+	outcome: RunAttemptOutcome | null;
+	error: string | null;
+	failureDiagnosis: RunAttemptSummary['failureDiagnosis'];
+	nextRetryAt: Date | null;
+	exitCode: number | null;
+	/** `0` means the attempt stored no output at all. */
+	outputEventCount: number;
+	outputTruncated: boolean;
+}
+
+async function readRunAttempts(runId: string): Promise<{
+	attempts: RunAttemptView[];
+	unattributedOutputEventCount: number;
+}> {
+	const { attempts, unattributedOutputEventCount } = await listRunAttempts(runId);
+	const workerIds = [...new Set(attempts.flatMap((a) => (a.workerId ? [a.workerId] : [])))];
+	let names = new Map<string, string>();
+	if (workerIds.length > 0) {
+		try {
+			names = new Map((await getWorkers(workerIds)).map((w) => [w.id, w.displayName]));
+		} catch (error) {
+			logger.warn('runs.getAttempts: worker lookup failed; reporting ids without names', {
+				runId,
+				error: describeError(error),
+			});
+		}
+	}
+	return {
+		attempts: attempts.map((a) => ({
+			id: a.id,
+			seq: a.seq,
+			dispatchId: a.dispatchId,
+			trigger: a.trigger,
+			requestedAt: a.requestedAt,
+			workerId: a.workerId,
+			workerName: a.workerId ? (names.get(a.workerId) ?? null) : null,
+			engine: a.engine,
+			model: a.model,
+			startedAt: a.startedAt,
+			endedAt: a.endedAt,
+			outcome: a.outcome as RunAttemptOutcome | null,
+			error: a.error,
+			failureDiagnosis: a.failureDiagnosis,
+			nextRetryAt: a.nextRetryAt,
+			exitCode: a.exitCode,
+			outputEventCount: a.outputEventCount,
+			outputTruncated: a.outputTruncated,
+		})),
+		unattributedOutputEventCount,
+	};
 }
 
 /**
@@ -2454,8 +2564,16 @@ const runReadProcedures = {
 			return (await getRunLogsFromDb(input.runId)) ?? null;
 		}),
 
+	// Each event names the attempt that produced it (issue #1400); `attemptId` narrows
+	// the page to one attempt's output.
 	getOutput: authedProcedure
-		.input(z.object({ runId: z.string().min(1), after: z.number().int().nonnegative().default(0) }))
+		.input(
+			z.object({
+				runId: z.string().min(1),
+				after: z.number().int().nonnegative().default(0),
+				attemptId: z.string().uuid().optional(),
+			}),
+		)
 		.query(async ({ ctx, input }) => {
 			const run = await getRunByIdFromDb(input.runId);
 			if (!run) {
@@ -2470,7 +2588,7 @@ const runReadProcedures = {
 				'contributor',
 				`Run with ID "${input.runId}" not found`,
 			);
-			return await getRunOutputEvents(input.runId, input.after);
+			return await getRunOutputEvents(input.runId, input.after, input.attemptId);
 		}),
 };
 
@@ -2483,6 +2601,30 @@ export const runsReadRouter = router(runReadProcedures);
 
 export const runsRouter = router({
 	...runReadProcedures,
+
+	// The run's attempt history (issue #1400): every execution attempt in order, with
+	// its worker, CLI/model, start and end, outcome and error, what started it (the
+	// pipeline, a Reset & restart or a Retry now) and how much output it stored. The
+	// run row itself only ever describes the latest attempt. Mounted here rather than
+	// in the operator API's read slice, which stays exactly what `swarm run` reads.
+	getAttempts: authedProcedure
+		.input(z.object({ runId: z.string().min(1) }))
+		.query(async ({ ctx, input }) => {
+			const run = await getRunByIdFromDb(input.runId);
+			if (!run) {
+				throw new TRPCError({
+					code: 'NOT_FOUND',
+					message: `Run with ID "${input.runId}" not found`,
+				});
+			}
+			await assertProjectAccess(
+				ctx.user,
+				run.projectId,
+				'contributor',
+				`Run with ID "${input.runId}" not found`,
+			);
+			return await readRunAttempts(input.runId);
+		}),
 
 	// One pull request's automation state (issue #1342) — the operator MCP server's
 	// `pr_status` tool (`src/mcp/tools/pull-requests.ts`). Answered from SWARM's own
@@ -2828,8 +2970,18 @@ export const runsRouter = router({
 					run,
 					startFresh,
 				);
-				const reopened = await reopenActiveDispatchForRetry(active, job);
-				if (!reopened) throw alreadyRetrying();
+				const markedAt = await markNextAttemptAsRetry(run.id);
+				let reopened: Awaited<ReturnType<typeof reopenActiveDispatchForRetry>>;
+				try {
+					reopened = await reopenActiveDispatchForRetry(active, job);
+				} catch (err) {
+					await unmarkRefusedRetry(run.id, markedAt);
+					throw err;
+				}
+				if (!reopened) {
+					await unmarkRefusedRetry(run.id, markedAt);
+					throw alreadyRetrying();
+				}
 				try {
 					await publishDispatchWakeUp(reopened);
 				} catch (err) {
@@ -2869,6 +3021,7 @@ export const runsRouter = router({
 				run,
 				startFresh,
 			);
+			const markedAt = await markNextAttemptAsRetry(run.id);
 			try {
 				await createAndPublishDispatch({
 					projectId: run.projectId,
@@ -2881,6 +3034,7 @@ export const runsRouter = router({
 					phase: run.phase as TriggerPhase,
 				});
 			} catch (err) {
+				await unmarkRefusedRetry(run.id, markedAt);
 				const message = describeError(err);
 				// The one-active-dispatch-per-run unique index: a concurrent retry won.
 				if (message.includes('uq_dispatches_active_run') || message.includes('duplicate key')) {

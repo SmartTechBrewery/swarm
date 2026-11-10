@@ -49,7 +49,12 @@ import type { TriggerPhase } from '../../triggers/types.js';
 import { diagnoseFailure, type FailureDiagnosis } from '../../worker/failure-diagnosis.js';
 import { getDb } from '../client.js';
 import { dispatches } from '../schema/dispatches.js';
-import { runLogs, runOutputEvents, runs } from '../schema/runs.js';
+import { runAttempts, runLogs, runOutputEvents, runs } from '../schema/runs.js';
+import {
+	closeSettledRunAttempts,
+	type RunOutputSource,
+	resolveOutputAttempt,
+} from './runAttemptsRepository.js';
 
 export const MAX_RUN_OUTPUT_BYTES = 5_000_000;
 export const RUN_OUTPUT_PAGE_SIZE = 200;
@@ -668,7 +673,19 @@ export interface CompleteRunInput {
  * since moved off that status (someone else settled it first).
  */
 export async function completeRun(runId: string, input: CompleteRunInput): Promise<boolean> {
-	const rows = await getDb()
+	return await getDb().transaction(async (tx) => {
+		const settled = await completeRunIn(tx, runId, input);
+		if (settled) await closeSettledRunAttempts(tx, [runId]);
+		return settled;
+	});
+}
+
+async function completeRunIn(
+	tx: Pick<ReturnType<typeof getDb>, 'update'>,
+	runId: string,
+	input: CompleteRunInput,
+): Promise<boolean> {
+	const rows = await tx
 		.update(runs)
 		.set({
 			status: input.status,
@@ -745,7 +762,44 @@ export async function resetRunToRunning(
 	workerFencingToken?: number,
 	workerUserId?: string,
 ): Promise<boolean> {
-	const rows = await getDb()
+	// The previous attempt's outcome lives only in the columns overwritten below, so
+	// any attempt a settle writer did not close is closed from them first.
+	return await getDb().transaction(async (tx) => {
+		await closeSettledRunAttempts(tx, [runId]);
+		return await resetRunRowToRunning(
+			tx,
+			runId,
+			jobPayload,
+			fromStatus,
+			model,
+			timeoutMs,
+			reasoning,
+			engine,
+			agentSessionId,
+			recovery,
+			workerId,
+			workerFencingToken,
+			workerUserId,
+		);
+	});
+}
+
+async function resetRunRowToRunning(
+	tx: Pick<ReturnType<typeof getDb>, 'update'>,
+	runId: string,
+	jobPayload: SwarmJob | undefined,
+	fromStatus: RunStatus | undefined,
+	model: string | undefined,
+	timeoutMs: number | undefined,
+	reasoning: string | null | undefined,
+	engine: AgentCli | undefined,
+	agentSessionId: string | null | undefined,
+	recovery: typeof runs.$inferSelect.recovery | null | undefined,
+	workerId: string | undefined,
+	workerFencingToken: number | undefined,
+	workerUserId: string | undefined,
+): Promise<boolean> {
+	const rows = await tx
 		.update(runs)
 		.set({
 			status: 'running',
@@ -874,19 +928,25 @@ export async function failRunFromStatus(
 	fromStatus?: RunStatus,
 	failureDiagnosis?: FailureDiagnosis,
 ): Promise<boolean> {
-	const rows = await getDb()
-		.update(runs)
-		.set({
-			status: 'failed',
-			error: reason,
-			nextRetryAt: null,
-			agentSessionId: null,
-			failureDiagnosis,
-			completedAt: new Date(),
-		})
-		.where(fromStatus ? and(eq(runs.id, runId), eq(runs.status, fromStatus)) : eq(runs.id, runId))
-		.returning({ id: runs.id });
-	return rows.length > 0;
+	return await getDb().transaction(async (tx) => {
+		const rows = await tx
+			.update(runs)
+			.set({
+				status: 'failed',
+				error: reason,
+				nextRetryAt: null,
+				agentSessionId: null,
+				failureDiagnosis,
+				completedAt: new Date(),
+			})
+			.where(fromStatus ? and(eq(runs.id, runId), eq(runs.status, fromStatus)) : eq(runs.id, runId))
+			.returning({ id: runs.id });
+		await closeSettledRunAttempts(
+			tx,
+			rows.map((row) => row.id),
+		);
+		return rows.length > 0;
+	});
 }
 
 /**
@@ -1959,10 +2019,19 @@ function truncateUtf8(value: string, maxBytes: number): string {
 		.replace(/\uFFFD$/, '');
 }
 
-/** Append ordered CLI events while keeping each run below its durable retention cap. */
+/**
+ * Append ordered CLI events while keeping each attempt below its durable retention
+ * cap. `source` names who streamed the batch, which is what ties it to the attempt
+ * that produced it ({@link resolveOutputAttempt}, issue #1400); the cap is that
+ * attempt's own, so an attempt that floods it cannot silence the next one. Output no
+ * attempt matches is kept unattributed under the run-wide cap, as before attempts
+ * were recorded. `runs.output_bytes` counts everything stored, and
+ * `runs.output_truncated` says whether anything was clipped.
+ */
 export async function appendRunOutputEvents(
 	runId: string,
 	events: RunOutputEventInput[],
+	source?: RunOutputSource,
 ): Promise<void> {
 	if (events.length === 0) return;
 	await getDb().transaction(async (tx) => {
@@ -1973,40 +2042,66 @@ export async function appendRunOutputEvents(
 			.for('update')
 			.limit(1);
 		const run = rows[0];
-		if (!run || run.outputTruncated) return;
+		if (!run) return;
+		const attempt = await resolveOutputAttempt(tx, runId, source);
+		const capReached = attempt ? attempt.outputTruncated : run.outputTruncated;
+		if (capReached) return;
 
-		let remaining = MAX_RUN_OUTPUT_BYTES - run.outputBytes;
+		let remaining = MAX_RUN_OUTPUT_BYTES - (attempt ? attempt.outputBytes : run.outputBytes);
 		let storedBytes = 0;
 		let truncated = false;
 		const retained: RunOutputEventInput[] = [];
 		for (const event of events) {
-			const content = truncateUtf8(event.content, remaining);
+			const content = truncateUtf8(event.content, Math.max(remaining, 0));
 			const bytes = Buffer.byteLength(content);
 			if (content) retained.push({ ...event, content });
 			storedBytes += bytes;
 			remaining -= bytes;
-			if (content !== event.content || remaining === 0) {
+			if (content !== event.content || remaining <= 0) {
 				truncated = true;
 				break;
 			}
 		}
 		if (retained.length > 0)
-			await tx.insert(runOutputEvents).values(retained.map((e) => ({ ...e, runId })));
+			await tx
+				.insert(runOutputEvents)
+				.values(retained.map((e) => ({ ...e, runId, attemptId: attempt?.id ?? null })));
 		await tx
 			.update(runs)
 			.set({
 				outputBytes: sql`${runs.outputBytes} + ${storedBytes}`,
-				outputTruncated: truncated,
+				outputTruncated: run.outputTruncated || truncated,
 			})
 			.where(eq(runs.id, runId));
+		if (attempt) {
+			await tx
+				.update(runAttempts)
+				.set({
+					outputBytes: sql`${runAttempts.outputBytes} + ${storedBytes}`,
+					outputTruncated: truncated,
+				})
+				.where(eq(runAttempts.id, attempt.id));
+		}
 	});
 }
 
+/**
+ * One page of a run's stored output, in order. Each event names the attempt that
+ * produced it (`null` when none is recorded); `attemptId` narrows the page to one
+ * attempt's output.
+ */
 export async function getRunOutputEvents(
 	runId: string,
 	after: number,
+	attemptId?: string,
 ): Promise<{
-	events: Array<{ id: number; stream: 'stdout' | 'stderr'; content: string; emittedAt: Date }>;
+	events: Array<{
+		id: number;
+		attemptId: string | null;
+		stream: 'stdout' | 'stderr';
+		content: string;
+		emittedAt: Date;
+	}>;
 	nextCursor: number;
 	hasMore: boolean;
 	truncated: boolean;
@@ -2018,12 +2113,19 @@ export async function getRunOutputEvents(
 		db
 			.select({
 				id: runOutputEvents.id,
+				attemptId: runOutputEvents.attemptId,
 				stream: runOutputEvents.stream,
 				content: runOutputEvents.content,
 				emittedAt: runOutputEvents.emittedAt,
 			})
 			.from(runOutputEvents)
-			.where(and(eq(runOutputEvents.runId, runId), gt(runOutputEvents.id, after)))
+			.where(
+				and(
+					eq(runOutputEvents.runId, runId),
+					gt(runOutputEvents.id, after),
+					attemptId ? eq(runOutputEvents.attemptId, attemptId) : undefined,
+				),
+			)
 			.orderBy(asc(runOutputEvents.id))
 			.limit(RUN_OUTPUT_PAGE_SIZE + 1),
 	]);
@@ -2050,24 +2152,34 @@ export async function failOrphanedRunningRuns(
 	reason: string,
 	workerId: string | null,
 ): Promise<number> {
-	const rows = await getDb()
-		.update(runs)
-		.set({ status: 'failed', error: reason, completedAt: new Date() })
-		.where(
-			// The kind filter is a real guard here, not a cosmetic one (issue #971): a
-			// maintenance run records the very `worker_id` this sweep narrows on, so a
-			// worker's own startup reap would otherwise fail the update run that asked it
-			// to restart — the one moment the restart is expected.
-			workerId !== null
-				? and(
-						eq(runs.kind, PIPELINE_RUN_KIND),
-						eq(runs.status, 'running'),
-						eq(runs.workerId, workerId),
-					)
-				: and(eq(runs.kind, PIPELINE_RUN_KIND), eq(runs.status, 'running'), isNull(runs.workerId)),
-		)
-		.returning({ id: runs.id });
-	return rows.length;
+	return await getDb().transaction(async (tx) => {
+		const rows = await tx
+			.update(runs)
+			.set({ status: 'failed', error: reason, completedAt: new Date() })
+			.where(
+				// The kind filter is a real guard here, not a cosmetic one (issue #971): a
+				// maintenance run records the very `worker_id` this sweep narrows on, so a
+				// worker's own startup reap would otherwise fail the update run that asked it
+				// to restart — the one moment the restart is expected.
+				workerId !== null
+					? and(
+							eq(runs.kind, PIPELINE_RUN_KIND),
+							eq(runs.status, 'running'),
+							eq(runs.workerId, workerId),
+						)
+					: and(
+							eq(runs.kind, PIPELINE_RUN_KIND),
+							eq(runs.status, 'running'),
+							isNull(runs.workerId),
+						),
+			)
+			.returning({ id: runs.id });
+		await closeSettledRunAttempts(
+			tx,
+			rows.map((row) => row.id),
+		);
+		return rows.length;
+	});
 }
 
 /**
@@ -2095,17 +2207,23 @@ export async function failStaleRunningRuns(
 	marginMs: number,
 	reason: string,
 ): Promise<number> {
-	const rows = await getDb()
-		.update(runs)
-		.set({ status: 'failed', error: reason, completedAt: new Date() })
-		.where(
-			and(
-				eq(runs.status, 'running'),
-				sql`${runs.startedAt} < NOW() - (COALESCE(${runs.timeoutMs}, ${defaultTimeoutMs}) + ${marginMs}) * INTERVAL '1 millisecond'`,
-			),
-		)
-		.returning({ id: runs.id });
-	return rows.length;
+	return await getDb().transaction(async (tx) => {
+		const rows = await tx
+			.update(runs)
+			.set({ status: 'failed', error: reason, completedAt: new Date() })
+			.where(
+				and(
+					eq(runs.status, 'running'),
+					sql`${runs.startedAt} < NOW() - (COALESCE(${runs.timeoutMs}, ${defaultTimeoutMs}) + ${marginMs}) * INTERVAL '1 millisecond'`,
+				),
+			)
+			.returning({ id: runs.id });
+		await closeSettledRunAttempts(
+			tx,
+			rows.map((row) => row.id),
+		);
+		return rows.length;
+	});
 }
 
 export interface ListRunsFilter {

@@ -42,6 +42,7 @@ import { runs } from '../schema/runs.js';
 import { workerProjectEnrollments } from '../schema/workerProjectEnrollments.js';
 import { workerSessions } from '../schema/workerSessions.js';
 import { workers } from '../schema/workers.js';
+import { closeSettledRunAttempts } from './runAttemptsRepository.js';
 import {
 	isPipelineRun,
 	PIPELINE_RUN_KIND,
@@ -1026,6 +1027,10 @@ export async function retireWaitingDispatch(
 			})
 			.where(and(eq(runs.id, dispatch.runId), inArray(runs.status, [...UNSETTLED_RUN_STATUSES])))
 			.returning({ id: runs.id });
+		await closeSettledRunAttempts(
+			tx,
+			settled.map((row) => row.id),
+		);
 		return { dispatch, runSettled: settled.length > 0 };
 	});
 }

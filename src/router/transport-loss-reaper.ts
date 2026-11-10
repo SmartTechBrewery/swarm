@@ -247,7 +247,7 @@ function settleIfTransportStayedLost(
 		}
 		// Before the settle, so the run's own stream corrects the note that promised
 		// output would resume "when it reconnects" — it never did.
-		persistControlPlaneNote(target.runId, TRANSPORT_LOST_ORPHAN_NOTE);
+		persistControlPlaneNote(target.runId, TRANSPORT_LOST_ORPHAN_NOTE, { dispatchId, workerId });
 		// Remembered as an orphan of this worker, so a late return is stopped and
 		// fenced rather than trusted (issue #1073).
 		if (failOrphanedDispatchResultWait(dispatchId, TRANSPORT_LOST_ORPHAN_REASON)) {
@@ -285,7 +285,10 @@ export function stopOrphanedDispatchesOnReturn(workerId: string): void {
 	for (const orphan of listOrphanedDispatchesForWorker(workerId)) {
 		const sent = pushOrphanStop(orphan, ORPHAN_STOP_REASON);
 		if (!sent) continue;
-		persistControlPlaneNote(orphan.runId, TRANSPORT_RETURNED_AFTER_ORPHAN_NOTE);
+		persistControlPlaneNote(orphan.runId, TRANSPORT_RETURNED_AFTER_ORPHAN_NOTE, {
+			dispatchId: orphan.dispatchId,
+			workerId,
+		});
 		logger.warn('worker transport restored: stopping a phase settled while the worker was away', {
 			workerId,
 			dispatchId: orphan.dispatchId,
@@ -469,7 +472,10 @@ async function adoptLateOrphanResult(
 		);
 		return;
 	}
-	persistControlPlaneNote(orphan.runId, LATE_RESULT_ACCEPTED_NOTE);
+	persistControlPlaneNote(orphan.runId, LATE_RESULT_ACCEPTED_NOTE, {
+		dispatchId: orphan.dispatchId,
+		workerId: orphan.workerId,
+	});
 	if (orphan.runId) {
 		try {
 			await recordRunLateResultAccepted(orphan.runId, orphan.workerId);

@@ -1877,6 +1877,20 @@ write is refused, and its output is no longer shown. If the SWARM router restart
 the retry is waiting it forgets the returning worker: neither its output nor its late
 result is kept, and the retry runs when due.
 
+**Which attempt does this output belong to?** A run can be dispatched several times —
+an automatic retry, a Reset & restart, a Retry now — and its status and error at the
+top of the run page describe only the **latest** attempt. The run page's **Attempts**
+list (issue #1400) shows every attempt in order with its worker, CLI and model, start
+and end, outcome (completed, failed, deferred, …) and that attempt's own error, and
+marks the attempts an operator started with Reset & restart or Retry now. The output
+below is grouped under the attempt that produced it, and an attempt that produced none
+— one that failed while preparing its checkout, say — says so instead of showing an
+earlier attempt's output under its error. Over MCP, `run_get` returns the same list as
+`attempts`, each output event carries its `attemptId`, and `outputAttemptId` reads one
+attempt's output alone. Output stored before SWARM recorded attempts is shown apart, as
+not attributed to any attempt. The output retention limit applies to each attempt
+separately.
+
 **Is this worker running the fix?** The dashboard's **Workers** screen answers it.
 Each machine's daemon declares the SWARM build it is actually running and the
 per-worker detail view shows it, beside the build the control plane itself is on.

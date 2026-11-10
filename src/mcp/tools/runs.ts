@@ -73,6 +73,13 @@ const runGetInput = {
 		.describe(
 			'Return only output events after this cursor (the `nextCursor` of an earlier call); default 0, from the start.',
 		),
+	outputAttemptId: z
+		.string()
+		.uuid()
+		.optional()
+		.describe(
+			"Return only the output events of this attempt (an `id` from the result's `attempts`); default every attempt's.",
+		),
 	includeLogs: z
 		.boolean()
 		.default(false)
@@ -105,23 +112,31 @@ export function registerRunTools(server: McpServer, context: ToolContext): void 
 			title: 'Get a run',
 			description:
 				'Read-only. Reads one run in full — its status, error and failure diagnosis, ' +
-				'checkpoint and attribution — plus, optionally, its captured agent output and stored ' +
-				'logs, as `{ run, output?, logs? }`. A run in a project you cannot read is reported as not found.',
+				'checkpoint and attribution — plus its attempt history and, optionally, its captured ' +
+				'agent output and stored logs, as `{ run, attempts, output?, logs? }`. `run` describes ' +
+				'only the latest attempt; `attempts.attempts` lists every execution attempt in order ' +
+				'(`seq`, worker, CLI/model, start/end, `outcome`, `error`, what started it — `trigger` ' +
+				'`automatic`, `reset` or `retry` — and `outputEventCount`, `0` when the attempt produced ' +
+				'no output). Each output event carries the `attemptId` of the attempt that produced it ' +
+				'(`null` for output recorded before attempts were). A run in a project you cannot read ' +
+				'is reported as not found.',
 			inputSchema: runGetInput,
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
-		({ runId, includeOutput, outputAfter, includeLogs }) =>
+		({ runId, includeOutput, outputAfter, outputAttemptId, includeLogs }) =>
 			runTool(context, 'run_get', async () => {
 				const caller = callerFor(context.user);
 				// The run read goes first: it is the authorization check, so neither
 				// optional read is attempted for a run the caller cannot see.
 				const run = await caller.runs.getById({ id: runId });
+				const attempts = await caller.runs.getAttempts({ runId });
 				const output = includeOutput
-					? await caller.runs.getOutput({ runId, after: outputAfter })
+					? await caller.runs.getOutput({ runId, after: outputAfter, attemptId: outputAttemptId })
 					: undefined;
 				const logs = includeLogs ? await caller.runs.getLogs({ runId }) : undefined;
 				return {
 					run,
+					attempts,
 					...(output === undefined ? {} : { output }),
 					...(logs === undefined ? {} : { logs }),
 				};

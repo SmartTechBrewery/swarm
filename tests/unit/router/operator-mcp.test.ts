@@ -54,6 +54,14 @@ vi.mock('@/db/repositories/runsRepository.js', async () => ({
 	// `getById`'s Resolve problem attempts read (issue #1395).
 	listResolveProblemAttempts: async () => [],
 }));
+// The run's attempt history `run_get` returns beside the run (issue #1400).
+const { listRunAttempts } = vi.hoisted(() => ({ listRunAttempts: vi.fn() }));
+vi.mock('@/db/repositories/runAttemptsRepository.js', async () => ({
+	...(await vi.importActual<typeof import('@/db/repositories/runAttemptsRepository.js')>(
+		'@/db/repositories/runAttemptsRepository.js',
+	)),
+	listRunAttempts,
+}));
 // The review-verdict ledger read and the project record read behind `pr_status` and
 // `phase_agents_get` (issue #1342); the ledger's pure cap predicates stay real.
 const { listActiveReviewSlotsForPullRequest, getSubmittedReviewSlot, grantReviewCapOverride } =
@@ -463,6 +471,7 @@ beforeEach(() => {
 		);
 	getRunLogsFromDb.mockReset().mockResolvedValue(LOGS);
 	getRunOutputEvents.mockReset().mockResolvedValue(OUTPUT_PAGE);
+	listRunAttempts.mockReset().mockResolvedValue({ attempts: [], unattributedOutputEventCount: 0 });
 	getActiveDispatchByRunId.mockReset().mockResolvedValue(undefined);
 	listSnapshotRunsForProject.mockReset().mockResolvedValue([]);
 	countRunsSettledSinceByStatus.mockReset().mockResolvedValue({});
@@ -1029,8 +1038,56 @@ describe('operator MCP — run_get', () => {
 			output: { nextCursor: 1, events: [{ content: 'hello\n' }] },
 		});
 		expect(result.structuredContent).not.toHaveProperty('logs');
-		expect(getRunOutputEvents).toHaveBeenCalledWith(RUN_ID, 0);
+		expect(getRunOutputEvents).toHaveBeenCalledWith(RUN_ID, 0, undefined);
 		expect(getRunLogsFromDb).not.toHaveBeenCalled();
+	});
+
+	// Issue #1400: `run` is only the latest attempt, so every attempt's own outcome
+	// and error come back beside it, and output can be narrowed to one attempt.
+	it('returns the attempt history beside the run and narrows output to one attempt', async () => {
+		const attemptId = '77777777-7777-4777-8777-777777777777';
+		listRunAttempts.mockResolvedValue({
+			attempts: [
+				{
+					id: attemptId,
+					runId: RUN_ID,
+					seq: 1,
+					dispatchId: null,
+					trigger: 'automatic',
+					requestedAt: null,
+					workerId: null,
+					engine: 'codex',
+					model: null,
+					startedAt: new Date('2026-11-09T06:56:00Z'),
+					endedAt: new Date('2026-11-09T07:10:00Z'),
+					outcome: 'deferred',
+					error: 'usage limit',
+					failureDiagnosis: null,
+					nextRetryAt: null,
+					exitCode: 1,
+					outputBytes: 6,
+					outputTruncated: false,
+					outputEventCount: 1,
+				},
+			],
+			unattributedOutputEventCount: 0,
+		});
+
+		const result = await callTool(
+			'run_get',
+			{ runId: RUN_ID, outputAttemptId: attemptId },
+			'member-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toMatchObject({
+			attempts: {
+				attempts: [{ id: attemptId, seq: 1, outcome: 'deferred', error: 'usage limit' }],
+				unattributedOutputEventCount: 0,
+			},
+		});
+		expect(listRunAttempts).toHaveBeenCalledWith(RUN_ID);
+		expect(getRunOutputEvents).toHaveBeenCalledWith(RUN_ID, 0, attemptId);
 	});
 
 	it('reads logs and pages output on request', async () => {
@@ -1041,7 +1098,7 @@ describe('operator MCP — run_get', () => {
 		);
 
 		expect(result.structuredContent).toMatchObject({ logs: LOGS });
-		expect(getRunOutputEvents).toHaveBeenCalledWith(RUN_ID, 5);
+		expect(getRunOutputEvents).toHaveBeenCalledWith(RUN_ID, 5, undefined);
 	});
 
 	it('skips the output read when asked to', async () => {
@@ -1073,6 +1130,7 @@ describe('operator MCP — run_get', () => {
 		expect(unknown.content[0]?.text).toBe(`NOT_FOUND: Run with ID "${unknownId}" not found`);
 		expect(getRunOutputEvents).not.toHaveBeenCalled();
 		expect(getRunLogsFromDb).not.toHaveBeenCalled();
+		expect(listRunAttempts).not.toHaveBeenCalled();
 	});
 });
 
