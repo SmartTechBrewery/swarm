@@ -29,6 +29,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 
 import { type ToolContext, toolListedFor } from './tool-access.js';
+import { registerBugReportTools } from './tools/bug-reports.js';
 import { registerCliRateLimitSetTools } from './tools/cli-rate-limit-set.js';
 import { registerConsistencyTools } from './tools/consistency.js';
 import { registerDependencyWaitTools } from './tools/dependency-waits.js';
@@ -75,6 +76,7 @@ export function createSwarmMcpServer(context: ToolContext): McpServer {
 	registerWorkItemTools(server, context);
 	registerCliRateLimitSetTools(server, context);
 	registerProjectSetupTools(server, context);
+	registerBugReportTools(server, context);
 	listOnlyReachableTools(server, context);
 	return server;
 }

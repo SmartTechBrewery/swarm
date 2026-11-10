@@ -79,8 +79,8 @@ export interface ToolAccess {
 	scope: ToolScope;
 	/**
 	 * Whether a scoped agent credential (issue #1385) may list and call the tool:
-	 * `true` for every read tool and the five recovery writes in
-	 * `SCOPED_AGENT_RECOVERY_TOOLS`, `false` for every other tool.
+	 * `true` for every read tool and the writes in `SCOPED_AGENT_RECOVERY_TOOLS`,
+	 * `false` for every other tool.
 	 */
 	agentScoped: boolean;
 }
@@ -142,6 +142,22 @@ export const TOOL_ACCESS: Readonly<Record<string, ToolAccess>> = {
 	cli_rate_limit_set: { minRole: 'signedIn', scope: 'worker-owner', agentScoped: false },
 	// The New Project dialog is open to any signed-in user; the creator becomes its admin.
 	project_create: { minRole: 'signedIn', scope: 'none', agentScoped: false },
+	// SWARM's own bug reports (issue #1383): read at `contributor`, written at `member`
+	// on the report's project; an installation-wide report is an instance admin's. An
+	// agent may file and add occurrences; triage stays the holder's own.
+	bug_reports_list: { minRole: 'contributor', scope: 'accessible-projects', agentScoped: true },
+	bug_report_get: { minRole: 'contributor', scope: 'project', agentScoped: true },
+	bug_report_create: { minRole: 'member', scope: 'project-or-installation', agentScoped: true },
+	bug_report_add_occurrence: {
+		minRole: 'member',
+		scope: 'project-or-installation',
+		agentScoped: true,
+	},
+	bug_report_set_status: {
+		minRole: 'member',
+		scope: 'project-or-installation',
+		agentScoped: false,
+	},
 };
 
 /** `name`'s entry in {@link TOOL_ACCESS}, or {@link DEFAULT_TOOL_ACCESS} when it has none. */

@@ -1764,6 +1764,19 @@ that never reached a worker, a webhook that was dropped, or a merge that did not
 happen. It covers only an in-memory window of that process's last 20 000 lines since
 it last restarted; see [`docs/mcp.md`](./mcp.md#tools).
 
+**SWARM keeps its own bug reports** (issue #1383). A problem seen in SWARM itself,
+or in what it runs on, can be recorded as a bug report: a title and description,
+the project it was seen in (or none, for an installation-wide one, which only an
+instance administrator sees), and every occurrence of it, each naming the run,
+dispatch, pull request or task it was seen on. Reports are triaged through the
+statuses `new`, `confirmed`, `environmental` (the cause lies outside SWARM),
+`duplicate`, `ticketed` (it became a GitHub issue, which is filed outside SWARM and
+then linked), `resolved` and `dismissed`. For now they are read and written
+through the operator MCP server's `bug_report*` tools, by anyone with `member` on
+the project (`contributor` to read), and by an agent holding a scoped agent
+credential, which may file reports and add occurrences but not triage them; the
+dashboard view is not there yet. See [`docs/mcp.md`](./mcp.md#bug-reports).
+
 For a terminal recognised response stall, SWARM labels a task as **likely scope
 exceeded** only when it also observed substantial progress and the most recent
 successful Planning run recorded multiple independent concerns. A timeout alone
@@ -2158,7 +2171,8 @@ re-review past the review-verdict cap, re-check a pull request's mergeability
 so Resolve-conflicts runs where a merge's fan-out skipped it, close the work
 item behind a merged pull request whose closing reference the board missed, or
 reorder a phase's agent targets (say, Claude first while Codex is rate-limited)
-and later restore the previous order. It can set up a project too: create one,
+and later restore the previous order. It can file, search and triage SWARM's own
+bug reports. It can set up a project too: create one,
 store its credentials, connect and map its board, change its repositories,
 agents and pipeline options, and ask what is still missing before the first
 card is picked up. Every such write tool takes a mandatory `reason` and a

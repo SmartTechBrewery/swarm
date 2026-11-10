@@ -7,6 +7,7 @@ export default defineConfig({
 		'./src/db/schema/runs.ts',
 		'./src/db/schema/stalledDismissals.ts',
 		'./src/db/schema/operatorActions.ts',
+		'./src/db/schema/bugReports.ts',
 		'./src/db/schema/wipSlots.ts',
 		'./src/db/schema/appSettings.ts',
 		'./src/db/schema/cliQuotas.ts',

@@ -645,6 +645,13 @@
       "when": 1794293656307,
       "tag": "0091_scoped_agent_credential",
       "breakpoints": true
+    },
+    {
+      "idx": 92,
+      "version": "7",
+      "when": 1794295622244,
+      "tag": "0092_bug_reports",
+      "breakpoints": true
     }
   ]
 }
