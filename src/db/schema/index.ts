@@ -1,6 +1,7 @@
 export { agentAccessTokens } from './agentAccessTokens.js';
 export { appSettings } from './appSettings.js';
 export { bugReportOccurrences, bugReports } from './bugReports.js';
+export { checkoutDiscards } from './checkoutDiscards.js';
 export { cliQuotas } from './cliQuotas.js';
 export { dispatches } from './dispatches.js';
 export { instanceScmCredentials } from './instanceScmCredentials.js';

@@ -49,6 +49,14 @@ interface ResetRunSteps {
 	 * wait, so the report says which machine's work was discarded.
 	 */
 	abandonedPreservedWorkerId?: string | null;
+	/**
+	 * What the reset did about the checkout that preserved machine still holds (issue
+	 * #1402) — mirrors `ResetAbandonedCheckout`. `string` beyond the known values so a
+	 * new server-side answer renders rather than failing to typecheck.
+	 */
+	abandonedCheckout?: 'none' | 'discard-requested' | 'not-requested' | (string & {});
+	/** Why the discard could not be requested, when it could not. */
+	abandonedCheckoutError?: string | null;
 }
 
 /**
@@ -204,6 +212,37 @@ function describeWorktreeOutcome(worktree: ResetWorktreeReport): string {
 }
 
 /**
+ * The control-plane host's checkout line. A preserved checkout lives on the abandoned
+ * machine, which {@link describeAbandonedCheckout} accounts for (issue #1402) — so
+ * "none on this host" must not then suggest the restart settles it, when the restart
+ * may run anywhere.
+ */
+function describeLocalWorktree(
+	worktree: ResetWorktreeReport,
+	abandonedCheckout: ResetRunSteps['abandonedCheckout'],
+): string {
+	const preservedElsewhere = abandonedCheckout !== undefined && abandonedCheckout !== 'none';
+	return worktree.outcome === 'absent' && preservedElsewhere
+		? 'Checkout: none on this host.'
+		: describeWorktreeOutcome(worktree);
+}
+
+/**
+ * Where the abandoned machine's checkout stands (issue #1402). The restart may run on
+ * another worker, so the holder is asked directly — and until it has done so the
+ * checkout is still there, which this says rather than implying it is gone.
+ */
+function describeAbandonedCheckout(result: ResetRunReport): string | undefined {
+	if (result.abandonedCheckout === 'discard-requested') {
+		return 'Preserved checkout: pending removal on that machine — it discards the checkout now if it is connected, or as soon as it reconnects.';
+	}
+	if (result.abandonedCheckout === 'not-requested') {
+		return `Preserved checkout: still on that machine — its discard could not be requested${result.abandonedCheckoutError ? ` (${result.abandonedCheckoutError})` : ''}. The retention sweep removes it later.`;
+	}
+	return undefined;
+}
+
+/**
  * The success report, one line per step, in the order `resetRun` performs them.
  * Operators use this to tell a reset that actually freed the checkout from one
  * that restarted the run but left protected work behind.
@@ -245,7 +284,7 @@ export function describeResetResult(result: ResetRunReport): string[] {
 	}
 
 	if (result.worktree) {
-		lines.push(describeWorktreeOutcome(result.worktree));
+		lines.push(describeLocalWorktree(result.worktree, result.abandonedCheckout));
 	}
 	// A teardown throw no longer stops the reset (issue #744), so it is reported: this
 	// host's checkout still wants a look, while the restart's own discard intent
@@ -261,7 +300,7 @@ export function describeResetResult(result: ResetRunReport): string[] {
 	// restart has no dispatch to carry it.
 	if (result.outcome === 'restarted') {
 		lines.push(
-			'Restart intent: the worker holding the checkout discards it — dirty and unpushed work included — before provisioning.',
+			'Restart intent: the worker that runs the restart discards any checkout of this task it holds — dirty and unpushed work included — before provisioning.',
 		);
 	}
 
@@ -275,6 +314,8 @@ export function describeResetResult(result: ResetRunReport): string[] {
 		lines.push(
 			`Preserved work: discarded — this run is no longer pinned to the machine that held its checkout, and that attempt's progress is not carried over.`,
 		);
+		const checkout = describeAbandonedCheckout(result);
+		if (checkout) lines.push(checkout);
 	}
 
 	lines.push(

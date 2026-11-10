@@ -239,6 +239,7 @@ function deliveryDeps(
 		persistCliQuota: vi.fn(),
 		recordWorkerUpdateReport: vi.fn(),
 		recordWorktreeSweepReport: vi.fn(),
+		settleCheckoutDiscard: vi.fn().mockResolvedValue(true),
 		advanceWorkerRollout: vi.fn(),
 	};
 }

@@ -25,6 +25,7 @@ import {
 	handleMoveWorkItem,
 	handlePostComment,
 	handlePriorReview,
+	handleReportCheckoutDiscard,
 	handleReportCliQuota,
 	handleReportWorkerUpdate,
 	handleReportWorktreeSweep,
@@ -151,6 +152,7 @@ function makeDeps(overrides: Partial<WorkerDeliveryDeps> = {}): WorkerDeliveryDe
 		persistCliQuota: vi.fn().mockResolvedValue(undefined),
 		recordWorkerUpdateReport: vi.fn().mockResolvedValue(makeWorker()),
 		recordWorktreeSweepReport: vi.fn().mockResolvedValue(makeWorker()),
+		settleCheckoutDiscard: vi.fn().mockResolvedValue(true),
 		advanceWorkerRollout: vi.fn(),
 		...overrides,
 	};
@@ -1973,6 +1975,58 @@ describe('handleReportWorktreeSweep', () => {
 		);
 
 		expect(deps.advanceWorkerRollout).not.toHaveBeenCalled();
+	});
+});
+
+// Issue #1402 — a machine settles the discard a reset asked of it, and only its own.
+describe('handleReportCheckoutDiscard', () => {
+	const DISCARD_ID = '14021402-1402-4402-8402-140214021402';
+
+	function discardBody(overrides: Record<string, unknown> = {}) {
+		return {
+			requestId: DISCARD_ID,
+			outcome: 'discarded',
+			detail: "Discarded the reset run's checkout of task '2119-conflicts'.",
+			protocolVersion: TRANSPORT_PROTOCOL_VERSION,
+			...overrides,
+		};
+	}
+
+	it('settles the request against the authenticated worker', async () => {
+		const deps = makeDeps();
+
+		const result = await handleReportCheckoutDiscard(deps, CREDENTIAL, discardBody());
+
+		expect(result).toEqual({ status: 200, json: { recorded: true } });
+		expect(deps.settleCheckoutDiscard).toHaveBeenCalledWith(
+			WORKER_ID,
+			DISCARD_ID,
+			'discarded',
+			expect.stringContaining('2119-conflicts'),
+		);
+	});
+
+	it('answers recorded:false for a request already settled', async () => {
+		const deps = makeDeps({ settleCheckoutDiscard: vi.fn().mockResolvedValue(false) });
+
+		const result = await handleReportCheckoutDiscard(deps, CREDENTIAL, discardBody());
+
+		expect(result).toEqual({ status: 200, json: { recorded: false } });
+	});
+
+	it('is 401 for an unknown credential and 400 for a control-plane-only outcome', async () => {
+		const deps = makeDeps({ resolveWorkerByCredential: vi.fn().mockResolvedValue(undefined) });
+		expect(await handleReportCheckoutDiscard(deps, 'bogus', discardBody())).toEqual({
+			status: 401,
+			json: { authenticated: false },
+		});
+
+		const fresh = makeDeps();
+		expect(
+			(await handleReportCheckoutDiscard(fresh, CREDENTIAL, discardBody({ outcome: 'superseded' })))
+				.status,
+		).toBe(400);
+		expect(fresh.settleCheckoutDiscard).not.toHaveBeenCalled();
 	});
 });
 
