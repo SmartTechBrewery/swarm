@@ -51,6 +51,8 @@ vi.mock('@/db/repositories/runsRepository.js', async () => ({
 	countRunsByStatusAndPhase,
 	countMergedPullRequestsByRepository,
 	findTaskIdForStoredTaskBranch,
+	// `getById`'s Resolve problem attempts read (issue #1395).
+	listResolveProblemAttempts: async () => [],
 }));
 // The run's attempt history `run_get` returns beside the run (issue #1400).
 const { listRunAttempts } = vi.hoisted(() => ({ listRunAttempts: vi.fn() }));
@@ -162,18 +164,18 @@ const {
 	recordOperatorAction,
 	settleOperatorAction,
 	findLatestOperatorAction,
-	countAgentTokenActions,
+	countRunBoundActions,
 } = vi.hoisted(() => ({
 	recordOperatorAction: vi.fn(),
 	settleOperatorAction: vi.fn(),
 	findLatestOperatorAction: vi.fn(),
-	countAgentTokenActions: vi.fn(),
+	countRunBoundActions: vi.fn(),
 }));
 vi.mock('@/db/repositories/operatorActionsRepository.js', () => ({
 	recordOperatorAction,
 	settleOperatorAction,
 	findLatestOperatorAction,
-	countAgentTokenActions,
+	countRunBoundActions,
 }));
 const { resetRun } = vi.hoisted(() => ({ resetRun: vi.fn() }));
 vi.mock('@/dispatch/run-reset.js', async () => ({
@@ -500,7 +502,7 @@ beforeEach(() => {
 	recordOperatorAction.mockReset().mockResolvedValue('audit-1');
 	settleOperatorAction.mockReset().mockResolvedValue(undefined);
 	findLatestOperatorAction.mockReset().mockResolvedValue(undefined);
-	countAgentTokenActions.mockReset().mockResolvedValue(0);
+	countRunBoundActions.mockReset().mockResolvedValue(0);
 	resetRun.mockReset();
 	reopenDispatchForManualRetry.mockReset();
 	listDependencyWaits.mockReset().mockResolvedValue([]);
@@ -1770,6 +1772,7 @@ describe('operator MCP — run_reset and dispatch_redispatch_now', () => {
 			// A `swarm login` session is the account's own credential (issue #1385).
 			credentialKind: 'user',
 			agentTokenId: null,
+			runId: null,
 			outcome: 'succeeded',
 			error: null,
 		});
@@ -1807,13 +1810,14 @@ describe('operator MCP — run_reset and dispatch_redispatch_now', () => {
 
 		expect(result.content[0]?.text).toBe(`FORBIDDEN: dry run run_reset on ${RUN_ID} first`);
 		expect(resetRun).not.toHaveBeenCalled();
-		expect(countAgentTokenActions).toHaveBeenCalledWith(
-			expect.objectContaining({ agentTokenId: RUN_BOUND_TOKEN_ID, dryRun: false }),
+		expect(countRunBoundActions).toHaveBeenCalledWith(
+			expect.objectContaining({ runId: '99999999-9999-4999-8999-999999999999', dryRun: false }),
 		);
 		expect(auditRow()).toMatchObject({
 			tool: 'run_reset',
 			credentialKind: 'scoped-agent-token',
 			agentTokenId: RUN_BOUND_TOKEN_ID,
+			runId: '99999999-9999-4999-8999-999999999999',
 			outcome: 'refused',
 		});
 	});
@@ -2301,6 +2305,7 @@ describe('operator MCP — dependency_waits_wake', () => {
 			input: { projectId: 'proj-a' },
 			credentialKind: 'user',
 			agentTokenId: null,
+			runId: null,
 			outcome: 'succeeded',
 			error: null,
 		});

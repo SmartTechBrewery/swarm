@@ -136,6 +136,12 @@ describe('liveness unit identity', () => {
 		expect(implementation).toEqual([expect.stringContaining('work-item')]);
 	});
 
+	it('maps a Resolve problem dispatch to no unit: it is not work on the task (issue #1395)', () => {
+		expect(
+			livenessUnitKeysForDispatch(makeDispatchRef({ taskId: '92', phase: 'resolve-problem' })),
+		).toEqual([]);
+	});
+
 	it('maps a never-claimed dispatch to both candidate units', () => {
 		// Conservative in the safe direction: it can only suppress a stall report.
 		expect(livenessUnitKeysForDispatch(makeDispatchRef({ taskId: '92', phase: null })).length).toBe(

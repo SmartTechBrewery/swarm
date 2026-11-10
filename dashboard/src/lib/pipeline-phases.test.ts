@@ -16,6 +16,7 @@ const AS_A_DAEMON_DECLARES_THEM = [
 	'review',
 	'respond-to-review',
 	'planning',
+	'resolve-problem',
 ];
 
 describe('sortPipelinePhases', () => {

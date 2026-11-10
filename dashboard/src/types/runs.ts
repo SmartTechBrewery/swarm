@@ -25,6 +25,8 @@ export const runPhaseFilterSchema = z.enum([
 	'respond-to-review',
 	'respond-to-ci',
 	'resolve-conflicts',
+	// An attempt on one failed run (issue #1395).
+	'resolve-problem',
 	// A worker-update run's `phase` (issue #971) — machine maintenance rather than a
 	// `TriggerPhase`, so the list can isolate it the same way it isolates any phase.
 	'worker-update',
@@ -121,6 +123,7 @@ export const queuedPhaseHintSchema = z.enum([
 	'respond-to-review',
 	'respond-to-ci',
 	'resolve-conflicts',
+	'resolve-problem',
 	'merge-automation',
 	'worker-update',
 	'unknown',
@@ -218,7 +221,7 @@ export const queuedRunSchema = z.object({
 	 * repository, no pull request and no board item — only a machine being moved to
 	 * a build.
 	 */
-	type: z.enum(['scm', 'pm', 'merge-automation', 'worker-update']),
+	type: z.enum(['scm', 'pm', 'merge-automation', 'worker-update', 'resolve-problem']),
 	providerId: z.string().optional(),
 	state: queuedRunStateSchema,
 	phaseHint: queuedPhaseHintSchema,
@@ -763,4 +766,23 @@ export interface RunRow {
 	retryScheduled?: boolean | null;
 	/** Evidence-based terminal diagnosis; null for ordinary and historical runs. */
 	failureDiagnosis: FailureDiagnosis | null;
+	/**
+	 * The failed run this Resolve problem run is an attempt for (issue #1395) — the
+	 * `runs.resolves_run_id` column. Null for every other run.
+	 */
+	resolvesRunId?: string | null;
+	/**
+	 * The Resolve problem attempts made on this run, newest first (issue #1395).
+	 * Returned by `runs.getById` only.
+	 */
+	resolveProblemAttempts?: ResolveProblemAttempt[];
+}
+
+/** Mirrors the server `ResolveProblemAttempt` (`src/db/repositories/runsRepository.ts`). */
+export interface ResolveProblemAttempt {
+	id: string;
+	status: string;
+	error: string | null;
+	startedAt: string;
+	completedAt: string | null;
 }

@@ -22,6 +22,8 @@ vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
 	markRunUserTerminated: vi.fn(),
 	cancelDeferredRunInDb: vi.fn(),
 	recordRunCleanupBlocked: vi.fn(),
+	// `getById`'s Resolve problem attempts read (issue #1395).
+	listResolveProblemAttempts: vi.fn(async () => []),
 }));
 
 // The attempt history (issue #1400): what `getAttempts` reads and what Retry now
@@ -248,6 +250,7 @@ import {
 	getRunLogsFromDb,
 	getRunOutputEvents,
 	type ListedRunRow,
+	listResolveProblemAttempts,
 	listRunsFromDb,
 	listTaskActivitySince,
 	markRunUserTerminated,
@@ -378,6 +381,7 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		resetStartedAt: null,
 		nextAttemptTrigger: null,
 		nextAttemptRequestedAt: null,
+		resolvesRunId: null,
 		checkpoint: null,
 		continuationCount: 0,
 		continuationProgressCount: 0,
@@ -1977,9 +1981,27 @@ describe('runsRouter', () => {
 				reviewCapSpent: null,
 				reviewCapOverrideOutstanding: null,
 				reviewCapStop: null,
+				resolveProblemAttempts: [],
 			});
 			expect(result.nextRetryAt).toEqual(nextRetryAt);
 			expect(getRunByIdFromDb).toHaveBeenCalledWith('run-1');
+		});
+
+		it("lists the run's Resolve problem attempts (issue #1395)", async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(makeRun({ id: 'run-1', status: 'failed' }));
+			const attempt = {
+				id: 'run-2',
+				status: 'failed' as const,
+				error: 'unresolved: still stuck',
+				startedAt: new Date('2026-07-10T01:00:00Z'),
+				completedAt: new Date('2026-07-10T01:05:00Z'),
+			};
+			vi.mocked(listResolveProblemAttempts).mockResolvedValueOnce([attempt]);
+
+			const result = await caller.getById({ id: 'run-1' });
+
+			expect(listResolveProblemAttempts).toHaveBeenCalledWith('run-1');
+			expect(result.resolveProblemAttempts).toEqual([attempt]);
 		});
 
 		it('throws NOT_FOUND when getRunByIdFromDb resolves undefined', async () => {
@@ -2507,6 +2529,7 @@ describe('runsRouter', () => {
 					reviewCapSpent: null,
 					reviewCapOverrideOutstanding: null,
 					reviewCapStop: null,
+					resolveProblemAttempts: [],
 				});
 			});
 		});
@@ -6180,6 +6203,7 @@ describe('runsRouter', () => {
 					reviewCapSpent: null,
 					reviewCapOverrideOutstanding: null,
 					reviewCapStop: null,
+					resolveProblemAttempts: [],
 				});
 			});
 		});

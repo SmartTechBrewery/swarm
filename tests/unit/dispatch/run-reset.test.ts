@@ -170,6 +170,7 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		resetStartedAt: null,
 		nextAttemptTrigger: null,
 		nextAttemptRequestedAt: null,
+		resolvesRunId: null,
 		checkpoint: null,
 		continuationCount: 0,
 		continuationProgressCount: 0,

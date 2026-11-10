@@ -1348,6 +1348,50 @@ export function LateResultAcceptedNote({ run }: { run: RunRow }) {
 	);
 }
 
+/**
+ * The link between a Resolve problem run and the failed run it is for (issue #1395):
+ * on the attempt, "Resolving run <link>"; on the failed run, its attempts, newest
+ * first, each with its outcome. Renders nothing for a run that is neither.
+ */
+export function ResolveProblemLinks({ run }: { run: RunRow }) {
+	const attempts = run.resolveProblemAttempts ?? [];
+	if (!run.resolvesRunId && attempts.length === 0) return null;
+	const linkClass = 'font-mono text-violet-300 hover:text-violet-200 underline';
+	return (
+		<div
+			data-testid="resolve-problem-links"
+			className="p-3 bg-zinc-900/40 border border-zinc-800 rounded flex items-start gap-3"
+		>
+			<Info className="h-4 w-4 shrink-0 mt-0.5 text-zinc-400" />
+			<div className="space-y-1 text-xs text-zinc-300">
+				{run.resolvesRunId ? (
+					<p>
+						Resolving run{' '}
+						<Link to="/runs/$runId" params={{ runId: run.resolvesRunId }} className={linkClass}>
+							{run.resolvesRunId}
+						</Link>
+					</p>
+				) : null}
+				{attempts.length > 0 ? (
+					<>
+						<p className="font-semibold text-zinc-200">Resolve problem attempts</p>
+						<ul className="space-y-1">
+							{attempts.map((attempt) => (
+								<li key={attempt.id}>
+									<Link to="/runs/$runId" params={{ runId: attempt.id }} className={linkClass}>
+										{attempt.id}
+									</Link>{' '}
+									<span className="text-zinc-400">— {attempt.status}</span>
+								</li>
+							))}
+						</ul>
+					</>
+				) : null}
+			</div>
+		</div>
+	);
+}
+
 interface RecoveryCalloutProps {
 	run: RunRow;
 }
@@ -2365,6 +2409,7 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 
 			<PreservedWorkerCallout run={run} />
 			<LateResultAcceptedNote run={run} />
+			<ResolveProblemLinks run={run} />
 			<CheckpointPanel run={run} />
 			<RecoveryCallout run={run} />
 			<ReviewCapCallout run={run} project={project} />

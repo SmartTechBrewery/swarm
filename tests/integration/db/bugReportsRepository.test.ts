@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { getDb } from '../../../src/db/client.js';
 import {
 	addBugReportOccurrence,
+	findOccurrenceFiledByRun,
 	getBugReport,
 	insertBugReport,
 	listBugReportOccurrences,
@@ -165,5 +166,33 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('bugReportsRepository', ()
 
 		await getDb().delete(bugReports).where(eq(bugReports.id, original.id));
 		expect((await getBugReport(copy.id))?.duplicateOfId).toBeNull();
+	});
+
+	// issue #1395 — the Resolve problem settle's proof that the run filed something.
+	it('finds the newest occurrence a run filed, whether it filed the report or added to one', async () => {
+		const { report: own, occurrence: first } = await insertBugReport({
+			report: newReport({ filedByRunId: 'run-agent' }),
+			occurrence: occurrence({
+				filedByRunId: 'run-agent',
+				observedAt: new Date('2026-11-01T10:00:00Z'),
+			}),
+		});
+		expect(await findOccurrenceFiledByRun('run-agent')).toEqual({
+			id: first.id,
+			reportId: own.id,
+		});
+
+		const other = await file({ title: 'Merge never retried' });
+		const added = await addBugReportOccurrence(
+			other.id,
+			occurrence({ filedByRunId: 'run-agent', observedAt: new Date('2026-11-01T11:00:00Z') }),
+		);
+		expect(await findOccurrenceFiledByRun('run-agent')).toEqual({
+			id: added?.occurrence.id,
+			reportId: other.id,
+		});
+
+		// An occurrence filed by a person, or by another run, is not this run's.
+		expect(await findOccurrenceFiledByRun('run-other')).toBeUndefined();
 	});
 });

@@ -1,5 +1,5 @@
 {
-  "id": "f4fcfd79-dea4-4a82-a5f1-ebcc2a8e0f73",
+  "id": "5e261839-93e0-4dfc-98ac-c26ecf793fe4",
   "prevId": "dda1640c-6717-4f0d-82fa-59edbba69cc7",
   "version": "7",
   "dialect": "postgresql",
@@ -205,181 +205,6 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
-    "public.run_attempts": {
-      "name": "run_attempts",
-      "schema": "",
-      "columns": {
-        "id": {
-          "name": "id",
-          "type": "uuid",
-          "primaryKey": true,
-          "notNull": true,
-          "default": "gen_random_uuid()"
-        },
-        "run_id": {
-          "name": "run_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "seq": {
-          "name": "seq",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "dispatch_id": {
-          "name": "dispatch_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "trigger": {
-          "name": "trigger",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'automatic'"
-        },
-        "requested_at": {
-          "name": "requested_at",
-          "type": "timestamp",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "worker_id": {
-          "name": "worker_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "engine": {
-          "name": "engine",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "model": {
-          "name": "model",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "started_at": {
-          "name": "started_at",
-          "type": "timestamp",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        },
-        "ended_at": {
-          "name": "ended_at",
-          "type": "timestamp",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "outcome": {
-          "name": "outcome",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "error": {
-          "name": "error",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "failure_diagnosis": {
-          "name": "failure_diagnosis",
-          "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "next_retry_at": {
-          "name": "next_retry_at",
-          "type": "timestamp",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "exit_code": {
-          "name": "exit_code",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "output_bytes": {
-          "name": "output_bytes",
-          "type": "integer",
-          "primaryKey": false,
-          "notNull": true,
-          "default": 0
-        },
-        "output_truncated": {
-          "name": "output_truncated",
-          "type": "boolean",
-          "primaryKey": false,
-          "notNull": true,
-          "default": false
-        }
-      },
-      "indexes": {
-        "uq_run_attempts_run_seq": {
-          "name": "uq_run_attempts_run_seq",
-          "columns": [
-            {
-              "expression": "run_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "seq",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": true,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {
-        "run_attempts_run_id_runs_id_fk": {
-          "name": "run_attempts_run_id_runs_id_fk",
-          "tableFrom": "run_attempts",
-          "tableTo": "runs",
-          "columnsFrom": [
-            "run_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "run_attempts_worker_id_workers_id_fk": {
-          "name": "run_attempts_worker_id_workers_id_fk",
-          "tableFrom": "run_attempts",
-          "tableTo": "workers",
-          "columnsFrom": [
-            "worker_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "set null",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
     "public.run_logs": {
       "name": "run_logs",
       "schema": "",
@@ -456,12 +281,6 @@
           "primaryKey": false,
           "notNull": true
         },
-        "attempt_id": {
-          "name": "attempt_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
-        },
         "stream": {
           "name": "stream",
           "type": "text",
@@ -503,33 +322,6 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
-        },
-        "idx_run_output_events_attempt": {
-          "name": "idx_run_output_events_attempt",
-          "columns": [
-            {
-              "expression": "run_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "attempt_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            },
-            {
-              "expression": "id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
         }
       },
       "foreignKeys": {
@@ -544,19 +336,6 @@
             "id"
           ],
           "onDelete": "cascade",
-          "onUpdate": "no action"
-        },
-        "run_output_events_attempt_id_run_attempts_id_fk": {
-          "name": "run_output_events_attempt_id_run_attempts_id_fk",
-          "tableFrom": "run_output_events",
-          "tableTo": "run_attempts",
-          "columnsFrom": [
-            "attempt_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "set null",
           "onUpdate": "no action"
         }
       },
@@ -904,15 +683,9 @@
           "primaryKey": false,
           "notNull": false
         },
-        "next_attempt_trigger": {
-          "name": "next_attempt_trigger",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "next_attempt_requested_at": {
-          "name": "next_attempt_requested_at",
-          "type": "timestamp",
+        "resolves_run_id": {
+          "name": "resolves_run_id",
+          "type": "uuid",
           "primaryKey": false,
           "notNull": false
         }
@@ -978,6 +751,21 @@
           "method": "btree",
           "with": {}
         },
+        "idx_runs_resolves_run_id": {
+          "name": "idx_runs_resolves_run_id",
+          "columns": [
+            {
+              "expression": "resolves_run_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "idx_runs_maintenance_request": {
           "name": "idx_runs_maintenance_request",
           "columns": [
@@ -1028,6 +816,19 @@
           "tableTo": "users",
           "columnsFrom": [
             "worker_user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "runs_resolves_run_id_runs_id_fk": {
+          "name": "runs_resolves_run_id_runs_id_fk",
+          "tableFrom": "runs",
+          "tableTo": "runs",
+          "columnsFrom": [
+            "resolves_run_id"
           ],
           "columnsTo": [
             "id"
@@ -3272,7 +3073,7 @@
           "type": "jsonb",
           "primaryKey": false,
           "notNull": true,
-          "default": "'[\"planning\",\"implementation\",\"review\",\"respond-to-review\",\"respond-to-ci\",\"resolve-conflicts\"]'::jsonb"
+          "default": "'[\"planning\",\"implementation\",\"review\",\"respond-to-review\",\"respond-to-ci\",\"resolve-conflicts\",\"resolve-problem\"]'::jsonb"
         },
         "repositories": {
           "name": "repositories",
@@ -3646,7 +3447,7 @@
           "type": "jsonb",
           "primaryKey": false,
           "notNull": true,
-          "default": "'[\"planning\",\"implementation\",\"review\",\"respond-to-review\",\"respond-to-ci\",\"resolve-conflicts\"]'::jsonb"
+          "default": "'[\"planning\",\"implementation\",\"review\",\"respond-to-review\",\"respond-to-ci\",\"resolve-conflicts\",\"resolve-problem\"]'::jsonb"
         },
         "concurrency_allocation": {
           "name": "concurrency_allocation",

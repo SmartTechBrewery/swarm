@@ -23,6 +23,7 @@
 import { z } from 'zod';
 
 import type { ProjectConfig } from '../config/schema.js';
+import type { ResolveProblemFailedRun } from '../pipeline/prompts/resolve-problem.js';
 import type { PmEvent } from '../pm/events.js';
 import type { PMProvider, PMType, WorkItem } from '../pm/types.js';
 import type { MergeCatchUpRequest } from '../queue/jobs.js';
@@ -194,7 +195,8 @@ export type TriggerPhase =
 	| 'review'
 	| 'respond-to-review'
 	| 'respond-to-ci'
-	| 'resolve-conflicts';
+	| 'resolve-conflicts'
+	| 'resolve-problem';
 
 /**
  * Every `TriggerPhase`, keyed so the object literal must name *exactly* the union
@@ -215,6 +217,7 @@ const TRIGGER_PHASE_KEYS: Record<TriggerPhase, true> = {
 	'respond-to-review': true,
 	'respond-to-ci': true,
 	'resolve-conflicts': true,
+	'resolve-problem': true,
 };
 
 /** Every pipeline phase, as a runtime list (see {@link TRIGGER_PHASE_KEYS}). */
@@ -327,6 +330,32 @@ export type TriggerResult =
 			 * control plane.
 			 */
 			mergeCatchUp?: MergeCatchUpRequest;
+	  })
+	| (TriggerResultBase & {
+			/**
+			 * Resolve problem (issue #1395): an agent with the SWARM operator MCP
+			 * attached diagnoses one **failed run** and tries to get the pipeline
+			 * moving again. It is not ticket work — it holds no WIP slot, provisions no
+			 * worktree, never moves the board card, and is deduplicated on the failed
+			 * run rather than on the task. `taskId` is the failed run's task, carried
+			 * for display and the board-item failure comment only.
+			 */
+			phase: 'resolve-problem';
+			/** The `runs` row this attempt is resolving (`runs.resolves_run_id`). */
+			failedRunId: string;
+			/** The pull request the failed run acted on, when it named one. */
+			prNumber?: string;
+			/**
+			 * The failed run's board card (`runs.work_item_id`), when it had one — where
+			 * an unresolved attempt's failure comment is posted. Never moved.
+			 */
+			workItemId?: string;
+			/**
+			 * What SWARM recorded about the failed run, read at dispatch — the agent's
+			 * starting point, composed into the prompt on the control plane, which is
+			 * the side holding the run.
+			 */
+			failedRun: ResolveProblemFailedRun;
 	  });
 
 export interface TriggerHandler {

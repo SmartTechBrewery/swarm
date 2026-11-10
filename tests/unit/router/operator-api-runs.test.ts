@@ -28,6 +28,8 @@ vi.mock('@/db/repositories/runsRepository.js', async () => ({
 	getRunByIdFromDb,
 	getRunLogsFromDb,
 	getRunOutputEvents,
+	// `getById`'s Resolve problem attempts read (issue #1395).
+	listResolveProblemAttempts: async () => [],
 }));
 const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
 	getMembership: vi.fn(),

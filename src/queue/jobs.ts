@@ -648,11 +648,32 @@ export const WorkerUpdateJobSchema = jobBase.extend({
 	target: WorkerUpdateTargetSchema,
 });
 
+/**
+ * A **Resolve problem** dispatch (issue #1395): run the Resolve problem agent
+ * against one failed run. It carries no webhook event and resolves no trigger —
+ * the phase's inputs are read off the failed run itself at dispatch — and, unlike
+ * every phase a webhook starts, it is not ticket work: it holds no WIP slot,
+ * provisions no worktree and never moves the board card. Its dedup key is the
+ * failed run (`resolve-problem:<failedRunId>`), never the task.
+ */
+export const ResolveProblemJobSchema = jobBase.extend({
+	type: z.literal('resolve-problem'),
+	/** The failed `runs` row this dispatch tries to resolve. */
+	failedRunId: z.string().uuid(),
+	/**
+	 * The failed run's own repository (`runs.repository`), so the project is scoped
+	 * to the repository the failed work was for — the {@link repositoryForJob} read.
+	 * Absent when the failed run recorded none, which means the default entry.
+	 */
+	repository: z.string().min(1).optional(),
+});
+
 const swarmJobVariants = z.discriminatedUnion('type', [
 	ScmWebhookJobSchema,
 	PmWebhookJobSchema,
 	MergeAutomationJobSchema,
 	WorkerUpdateJobSchema,
+	ResolveProblemJobSchema,
 ]);
 
 /**
@@ -692,6 +713,7 @@ export type ScmWebhookJob = z.infer<typeof ScmWebhookJobSchema>;
 export type PmWebhookJob = z.infer<typeof PmWebhookJobSchema>;
 export type MergeAutomationJob = z.infer<typeof MergeAutomationJobSchema>;
 export type WorkerUpdateJob = z.infer<typeof WorkerUpdateJobSchema>;
+export type ResolveProblemJob = z.infer<typeof ResolveProblemJobSchema>;
 export type SwarmJob = z.infer<typeof swarmJobVariants>;
 
 /**
@@ -715,6 +737,8 @@ export type SwarmJob = z.infer<typeof swarmJobVariants>;
  *   (`ProjectRepository.pmRoutingToken`), and a card claiming none or two is
  *   refused at ingress rather than enqueued. `undefined` only for a row written
  *   before that — the default entry, exactly as it ran then.
+ * - `resolve-problem` — the failed run's own repository, copied onto the job when
+ *   the dispatch was scheduled (issue #1395).
  * - `worker-update` — none, stated rather than defaulted (see the case below).
  *
  * One `switch` exhaustive over the discriminator rather than a lookup with a
@@ -728,6 +752,7 @@ export function repositoryForJob(job: SwarmJob): string | undefined {
 		case 'merge-automation':
 			return job.repo;
 		case 'pm':
+		case 'resolve-problem':
 			return job.repository;
 		case 'worker-update':
 			// None. It moves a machine's SWARM install root; it touches no repository's

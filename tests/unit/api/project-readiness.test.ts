@@ -300,11 +300,20 @@ describe('checkProjectReadiness', () => {
 
 describe('enabledPhases', () => {
 	it('drops only the review-loop phases a pipeline turns off', () => {
-		expect(enabledPhases({ pipeline: undefined })).toEqual([...ALL_TRIGGER_PHASES]);
+		expect(enabledPhases({ pipeline: undefined })).toEqual(
+			ALL_TRIGGER_PHASES.filter((phase) => phase !== 'resolve-problem'),
+		);
 		expect(
 			enabledPhases({
 				pipeline: { review: { enabled: false }, respondToReview: { enabled: false } },
 			}),
 		).toEqual(['planning', 'implementation', 'respond-to-ci', 'resolve-conflicts']);
+	});
+
+	it('runs Resolve problem only when the project turns it on (issue #1395)', () => {
+		expect(enabledPhases({ pipeline: undefined })).not.toContain('resolve-problem');
+		expect(enabledPhases({ pipeline: { resolveProblem: { enabled: true } } })).toEqual([
+			...ALL_TRIGGER_PHASES,
+		]);
 	});
 });

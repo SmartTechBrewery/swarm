@@ -58,6 +58,7 @@ import {
 	isRetryPendingStatus,
 	type ListRunsFilter,
 	type ListRunsSort,
+	listResolveProblemAttempts,
 	listRunsFromDb,
 	listTaskActivitySince,
 	type PipelineRunRow,
@@ -425,7 +426,7 @@ function partitionQueuedRuns(items: QueuedRun[]): QueuedRunsPage {
 // router declares its own filter enums — keeping Zod the source of truth for the
 // API boundary and rejecting garbage filter values before they reach the DB.
 const RunStatusEnum = z.enum(['running', 'completed', 'failed', 'deferred', 'checkpointed']);
-// `WORKER_UPDATE_RUN_PHASE` sits beside the six `TriggerPhase`s (issue #971) so the
+// `WORKER_UPDATE_RUN_PHASE` sits beside the seven `TriggerPhase`s (issue #971) so the
 // list's existing phase filter can isolate maintenance runs; `kind`, not this, is
 // what tells the two apart for anything that reasons about them.
 const RunPhaseEnum = z.enum([
@@ -435,6 +436,7 @@ const RunPhaseEnum = z.enum([
 	'respond-to-review',
 	'respond-to-ci',
 	'resolve-conflicts',
+	'resolve-problem',
 	WORKER_UPDATE_RUN_PHASE,
 ]);
 
@@ -2533,6 +2535,9 @@ const runReadProcedures = {
 				reviewCapSpent: resolveReviewCapSpent(run, reviewCapSlots),
 				reviewCapOverrideOutstanding: resolveReviewCapOverrideOutstanding(run, reviewCapSlots),
 				reviewCapStop: resolveReviewCapStop(run, reviewCapSlots),
+				// The Resolve problem attempts made on this run (issue #1395); the run's own
+				// `resolvesRunId` names the failed run when it is one of them.
+				resolveProblemAttempts: await listResolveProblemAttempts(run.id),
 			};
 		}),
 

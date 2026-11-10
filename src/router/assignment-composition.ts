@@ -19,10 +19,12 @@
  * value, so behavior is unchanged.
  */
 
+import { resolveProblemMaxWriteActions } from '../config/resolve-problem.js';
 import type { ProjectConfig } from '../config/schema.js';
 import { buildImplementationPrompt } from '../pipeline/prompts/implementation.js';
 import { buildPlanningPrompt } from '../pipeline/prompts/planning.js';
 import { buildResolveConflictsPrompt } from '../pipeline/prompts/resolve-conflicts.js';
+import { buildResolveProblemPrompt } from '../pipeline/prompts/resolve-problem.js';
 import { buildRespondToCiPrompt } from '../pipeline/prompts/respond-to-ci.js';
 import { buildRespondToReviewPrompt } from '../pipeline/prompts/respond-to-review.js';
 import { buildReviewPrompt } from '../pipeline/prompts/review.js';
@@ -51,6 +53,10 @@ export function resolveTargetBranch(
 		case 'respond-to-ci':
 		case 'resolve-conflicts':
 			return trigger.prBranch;
+		case 'resolve-problem':
+			// No branch: the phase runs in a scratch directory and touches no repository.
+			// The frame requires a value, so it names the base, which nothing reads.
+			return project.baseBranch;
 	}
 }
 
@@ -73,6 +79,8 @@ export function composeSystemPrompt(
 	trigger: TriggerResult,
 	customPrompt?: string,
 	taskBranch?: string,
+	/** resolve-problem only: the run being composed for — what its bug report must name. */
+	runId?: string,
 ): string {
 	switch (trigger.phase) {
 		case 'planning':
@@ -136,6 +144,19 @@ export function composeSystemPrompt(
 					headSha: trigger.headSha,
 					baseBranch: trigger.baseBranch,
 					baseSha: trigger.baseSha,
+				},
+				customPrompt,
+			);
+		case 'resolve-problem':
+			// The one prompt the worker runs verbatim (`../pipeline/resolve-problem.ts`):
+			// the failed run's record is here, on the side with the database.
+			if (!runId) throw new Error('resolve-problem prompt requires the run id');
+			return buildResolveProblemPrompt(
+				{
+					project,
+					runId,
+					failedRun: trigger.failedRun,
+					maxWriteActions: resolveProblemMaxWriteActions(project.pipeline),
 				},
 				customPrompt,
 			);

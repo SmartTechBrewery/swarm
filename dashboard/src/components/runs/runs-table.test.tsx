@@ -211,6 +211,20 @@ describe('RunsTable', () => {
 			expect(within(card).getByText('Acme')).not.toBeNull();
 		});
 
+		it('labels a Resolve problem run by its phase (issue #1395)', () => {
+			renderTable(
+				<RunsTable
+					runs={[{ ...baseRun, phase: 'resolve-problem', resolvesRunId: 'failed-run-1' }]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+			const card = screen.getByTestId('run-card');
+			expect(within(card).getByText('resolve problem')).not.toBeNull();
+		});
+
 		it('omits Project from the card when showProject is false', () => {
 			renderTable(
 				<RunsTable

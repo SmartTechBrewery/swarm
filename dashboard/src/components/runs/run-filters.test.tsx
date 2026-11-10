@@ -65,7 +65,18 @@ describe('the Phase filter isolates worker-update runs (issues #971, #974)', () 
 			'respond-to-review',
 			'respond-to-ci',
 			'resolve-conflicts',
+			'resolve-problem',
 			'worker-update',
 		]);
+	});
+});
+
+describe('the Phase filter isolates Resolve problem runs (issue #1395)', () => {
+	it('offers the resolve-problem phase, labelled "Resolve problem"', () => {
+		renderFilters();
+
+		const phaseSelect = screen.getByLabelText('Phase') as HTMLSelectElement;
+		const option = Array.from(phaseSelect.options).find((o) => o.value === 'resolve-problem');
+		expect(option?.textContent).toBe('Resolve problem');
 	});
 });

@@ -93,7 +93,7 @@ import { CommitUnavailableError } from '../worktree/commit-availability.js';
 import { createHostLocalWorktreeRuntime } from '../worktree/host-local-runtime.js';
 import { BlockedRecoveryError } from '../worktree/reclaim.js';
 import { reconstructProjectConfig } from './db-free-project.js';
-import type { DeliveryClientOptions, FetchLike } from './delivery-client.js';
+import { type DeliveryClientOptions, deliveryUrl, type FetchLike } from './delivery-client.js';
 import { createTransportFollowUpReviewScheduler } from './follow-up-review-delivery.js';
 import type {
 	AssignedWorkItem,
@@ -364,6 +364,9 @@ export function succeededResult(
 		// hand it to the merge dispatch waiting on it (issue #1117). Absent for every
 		// other run.
 		mergeCatchUp: result.mergeCatchUp,
+		// A Resolve problem run's report, which the control plane — the side with the
+		// database — checks against the bug report the run filed (issue #1395).
+		resolveProblem: result.resolveProblem,
 	};
 }
 
@@ -664,7 +667,7 @@ export function deferrableOrFailedResult(
 }
 
 /**
- * The pipeline phases a DB-free worker can run — since issue #536, **all six**, so
+ * The pipeline phases a DB-free worker can run — since issue #536, **all of them**, so
  * which phases an instance can run no longer depends on which machine a worker
  * happens to be. Each, and how it is delivered:
  *
@@ -701,6 +704,10 @@ export function deferrableOrFailedResult(
  *   that travels, so a retry still short-circuits before re-creating a child. The
  *   alternative — Planning running only where the database is — pinned the whole
  *   instance to one machine (issue #536).
+ * - `resolve-problem` (issue #1395) — no source ops and no board write at all: the
+ *   agent runs in a scratch directory and reaches SWARM only through the operator
+ *   MCP endpoint, with the run-bound token the assignment carried. Whether the
+ *   attempt counts is decided control-plane side, where its bug report is read.
  */
 export const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhase>([
 	'respond-to-ci',
@@ -709,6 +716,7 @@ export const SUPPORTED_DB_FREE_PHASES: ReadonlySet<TaskPhase> = new Set<TaskPhas
 	'review',
 	'respond-to-review',
 	'planning',
+	'resolve-problem',
 ]);
 
 /**
@@ -936,8 +944,11 @@ interface DbFreePhaseInputsParams {
 	project: ProjectConfig;
 	signal: AbortSignal;
 	sink: AssignmentSink;
-	/** The SCM delivery provider this phase runs against ({@link resolveDbFreeDelivery}). */
-	delivery: ScmDeliveryProvider;
+	/**
+	 * The SCM delivery provider this phase runs against ({@link resolveDbFreeDelivery}),
+	 * or undefined for Resolve problem, which delivers nothing (issue #1395).
+	 */
+	delivery: ScmDeliveryProvider | undefined;
 	/** The PM provider this phase runs against, or undefined for a phase that takes none. */
 	pm: PMProvider | undefined;
 	/** Review only: the transport-backed review-verdict ledger ({@link resolveDbFreeReviewLedger}). */
@@ -947,10 +958,27 @@ interface DbFreePhaseInputsParams {
 	 * ({@link resolveDbFreeFollowUpReview}).
 	 */
 	scheduleFollowUpReview: ScheduleFollowUpReview | undefined;
-	/** The worker operator's own credential this assignment carried (`TaskAssignment.operatorCredential`). */
-	operatorCredential: string;
+	/**
+	 * The worker operator's own credential this assignment carried
+	 * (`TaskAssignment.operatorCredential`) — absent only for Resolve problem.
+	 */
+	operatorCredential: string | undefined;
 	baseRunAgent: typeof runAgentCli;
 	worktrees: GitWorktreeManager;
+	/**
+	 * This worker's control-plane base URL — where the operator MCP endpoint is
+	 * addressed when a Resolve problem assignment names no URL of its own.
+	 */
+	mcpBaseUrl: string;
+}
+
+/**
+ * The operator MCP endpoint on this worker's own control-plane URL — joined as the
+ * delivery API's routes are ({@link deliveryUrl}), so a router mounted under a
+ * sub-path keeps it.
+ */
+function operatorMcpUrlOn(controlPlaneUrl: string): string {
+	return deliveryUrl(controlPlaneUrl, '/operator/mcp');
 }
 
 /** Assemble the normalized phase inputs from a pushed assignment + the reconstructed project. */
@@ -966,6 +994,7 @@ function buildDbFreePhaseInputs({
 	operatorCredential,
 	baseRunAgent,
 	worktrees,
+	mcpBaseUrl,
 }: DbFreePhaseInputsParams): AssignedPhaseInputs {
 	return {
 		phase: assignment.phase,
@@ -1047,6 +1076,15 @@ function buildDbFreePhaseInputs({
 		baseBranch: assignment.baseBranch,
 		baseSha: assignment.baseSha,
 		catchUpOnly: assignment.catchUpOnly,
+		// Resolve problem (issue #1395): the prompt the control plane composed from the
+		// failed run's record, and the operator MCP endpoint with its run-bound token.
+		systemPrompt: assignment.systemPrompt,
+		swarmMcp: assignment.swarmMcp
+			? {
+					url: assignment.swarmMcp.url ?? operatorMcpUrlOn(mcpBaseUrl),
+					token: assignment.swarmMcp.token,
+				}
+			: undefined,
 		// The DB-free injection seam: the phase's resolved delivery/PM providers plus
 		// the operator credential as the agent's `getToken`, so no phase reaches the
 		// secret store or DB. Source ops run under the operator's own account; the
@@ -1174,8 +1212,26 @@ export async function runAssignmentDbFree(
 		// Terminal `failed` rather than a throw, for the same reason as the two gates
 		// above: every settlement on this path is a frame, and no retry on this worker
 		// can conjure a credential the control plane did not send.
+		//
+		// Resolve problem (issue #1395) is the one phase that needs none — it commits,
+		// pushes and comments nothing — and the one that needs `swarmMcp` instead.
+		const resolveProblem = phase === 'resolve-problem';
 		const operatorCredential = assignment.operatorCredential;
-		if (!operatorCredential) {
+		if (resolveProblem && !assignment.swarmMcp) {
+			sink.send({
+				type: 'task-execution-result',
+				dispatchId,
+				runId,
+				status: 'failed',
+				phase,
+				taskId,
+				error:
+					'this Resolve problem assignment carried no SWARM operator MCP credential — the ' +
+					'control plane predates issue #1395 or could not mint one.',
+			});
+			return;
+		}
+		if (!resolveProblem && !operatorCredential) {
 			sink.send({
 				type: 'task-execution-result',
 				dispatchId,
@@ -1206,12 +1262,12 @@ export async function runAssignmentDbFree(
 				preserveOnCancel: () => isAssignmentCheckoutPreserved(dispatchId),
 			}),
 		);
-		worktreePath = worktrees.worktreePath(taskId);
-		const operatorDelivery = await resolveOperatorDelivery(
-			project,
-			operatorCredential,
-			deps.buildDelivery,
-		);
+		// No checkout for Resolve problem: it runs in a scratch directory, and the task id
+		// it carries is its failed run's, whose checkout is not this run's to report on.
+		worktreePath = resolveProblem ? undefined : worktrees.worktreePath(taskId);
+		const operatorDelivery = operatorCredential
+			? await resolveOperatorDelivery(project, operatorCredential, deps.buildDelivery)
+			: undefined;
 		// Where a metadata write this worker cannot perform itself is delivered: the
 		// control plane, authenticated by the worker's own credential (never a
 		// project credential — those stay server-side, ADR-004 §2). Every call names
@@ -1258,13 +1314,15 @@ export async function runAssignmentDbFree(
 			project,
 			signal: controller.signal,
 			sink,
-			delivery: resolveDbFreeDelivery(phase, operatorDelivery, transport, project),
+			delivery:
+				operatorDelivery && resolveDbFreeDelivery(phase, operatorDelivery, transport, project),
 			pm: resolveDbFreePm(phase, project, transport),
 			reviewLedger: resolveDbFreeReviewLedger(phase, project.id, transport),
 			scheduleFollowUpReview: resolveDbFreeFollowUpReview(phase, project.id, transport),
 			operatorCredential,
 			baseRunAgent: deps.baseRunAgent,
 			worktrees,
+			mcpBaseUrl: options.controlPlaneUrl,
 		});
 		const result = await deps.runPhase(inputs);
 		// A run the harness killed for exceeding its wall-clock timeout is a terminal
