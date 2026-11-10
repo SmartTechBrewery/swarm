@@ -98,7 +98,8 @@ describe('swarm-worker-agent install', () => {
 			harness,
 			[
 				"uname() { printf 'Darwin\\n'; }",
-				`launchctl() { printf '%s\\n' "$*" >> ${JSON.stringify(calls)}; }`,
+				// `print` finds no job, as on a host with nothing loaded under this label.
+				`launchctl() { printf '%s\\n' "$*" >> ${JSON.stringify(calls)}; [ "$1" != print ]; }`,
 				'plutil() { return 0; }',
 				`source ${JSON.stringify(installer)} install ${JSON.stringify(checkout)}`,
 			].join('\n'),
@@ -213,7 +214,8 @@ describe('swarm-worker-agent install', () => {
 				harness,
 				[
 					"uname() { printf 'Darwin\\n'; }",
-					`launchctl() { printf '%s\\n' "$*" >> ${JSON.stringify(calls)}; }`,
+					// `print` finds no job, as on a host with nothing loaded under this label.
+					`launchctl() { printf '%s\\n' "$*" >> ${JSON.stringify(calls)}; [ "$1" != print ]; }`,
 					`plutil() {
 						[ "$1" = '-extract' ] || return 0
 						sed -n "/<key>$2<\\/key>/{n;s/.*<string>\\(.*\\)<\\/string>.*/\\1/p;}" "$4" | grep .
