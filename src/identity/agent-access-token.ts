@@ -63,18 +63,63 @@ export function agentAccessTokenExpiry(now: Date): Date {
 	return new Date(now.getTime() + AGENT_ACCESS_TOKEN_VALIDITY_DAYS * DAY_MS);
 }
 
+/** The most projects one scoped agent credential may be limited to. */
+export const SCOPED_AGENT_TOKEN_MAX_PROJECTS = 50;
+
 /**
- * The issuing input: the **name and nothing else**. The account comes from the
- * session and the expiry from {@link agentAccessTokenExpiry}, so there is no
- * field through which either could be pointed elsewhere. `.strict()` refuses one
- * that tries. The dashboard parses with this same schema before sending, so a
+ * The issuing input: the **name**, and — for a **scoped agent credential** (issue
+ * #1385) — the `projectIds` it is limited to. The account comes from the session
+ * and the expiry from {@link agentAccessTokenExpiry}, so there is no field through
+ * which either could be pointed elsewhere. `.strict()` refuses one that tries.
+ * Omitting `projectIds` issues an ordinary token acting with the holder's full
+ * access; an empty list is refused rather than read as either. Repeated ids are
+ * collapsed. The dashboard parses with this same schema before sending, so a
  * blank name is refused with this message without a request.
  */
 export const IssueAgentAccessTokenInputSchema = z
-	.object({ name: z.string().trim().min(1, 'A token name is required.').max(80) })
+	.object({
+		name: z.string().trim().min(1, 'A token name is required.').max(80),
+		projectIds: z
+			.array(z.string().min(1))
+			.min(1, 'A scoped agent credential needs at least one project.')
+			.max(SCOPED_AGENT_TOKEN_MAX_PROJECTS)
+			.transform((ids) => [...new Set(ids)])
+			.optional(),
+	})
 	.strict();
 
 export type IssueAgentAccessTokenInput = z.infer<typeof IssueAgentAccessTokenInputSchema>;
+
+/**
+ * The **write tools** a scoped agent credential may call (issue #1385) — on top of
+ * every read tool, and nothing else. Each one recovers a stuck pipeline inside a
+ * project the credential is limited to, is audited, and changes no configuration,
+ * credential, board or work item:
+ *
+ *  - `run_reset` — resets a wedged run and re-dispatches its phase from scratch,
+ *    as the dashboard's "Reset & restart" does; it touches that run alone.
+ *  - `dispatch_redispatch_now` — re-dispatches a deferred, checkpointed or failed
+ *    run immediately instead of at its scheduled retry ("Retry now").
+ *  - `pr_force_re_review` — grants one extra review to a pull request the
+ *    review-verdict cap stopped ("Force re-review").
+ *  - `pr_recheck_mergeability` — schedules the conflict check a skipped
+ *    resolve-conflicts fan-out would have scheduled.
+ *  - `dependency_waits_wake` — re-checks the dependency gate now; a dependent still
+ *    blocked simply waits again.
+ *
+ * Everything else that writes — project creation and configuration, credentials,
+ * the board mapping, closing a work item, the phase agents, a worker's CLI rate
+ * limit — stays the holder's own, through their own session. A constant, like
+ * {@link AGENT_ACCESS_TOKEN_VALIDITY_DAYS}; `src/mcp/tool-access.ts` marks the same
+ * five `agentScoped`, and its test keeps the two in step.
+ */
+export const SCOPED_AGENT_RECOVERY_TOOLS = [
+	'run_reset',
+	'dispatch_redispatch_now',
+	'pr_force_re_review',
+	'pr_recheck_mergeability',
+	'dependency_waits_wake',
+] as const;
 
 /**
  * A token as every read sees it — **without the raw value**, which exists nowhere
@@ -89,6 +134,11 @@ export const AgentAccessTokenSchema = z.object({
 	createdAt: z.string().datetime(),
 	expiresAt: z.string().datetime(),
 	lastUsedAt: z.string().datetime().optional(),
+	/**
+	 * The projects a scoped agent credential is limited to (issue #1385); absent on
+	 * an ordinary token, which acts with its holder's full access.
+	 */
+	projectIds: z.array(z.string()).optional(),
 });
 
 export type AgentAccessToken = z.infer<typeof AgentAccessTokenSchema>;

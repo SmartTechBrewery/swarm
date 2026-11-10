@@ -17,7 +17,9 @@
  * `../api/operator-router.ts` is for `/operator/trpc`.
  *
  * {@link runTool} first refuses a caller whose role ceiling is below the tool's
- * `TOOL_ACCESS` role (`./tool-access.ts`, issue #1382) with `FORBIDDEN`, then turns a tool body's outcome into the MCP result shape: the value
+ * `TOOL_ACCESS` role (`./tool-access.ts`, issue #1382) — or a scoped agent
+ * credential calling a tool outside its allowlist (issue #1385) — with
+ * `FORBIDDEN`, then turns a tool body's outcome into the MCP result shape: the value
  * as pretty-printed JSON text (what every client renders) plus the same value as
  * `structuredContent` when it is an object, and a refusal or failure as an
  * `isError` result rather than a JSON-RPC error, so the calling model sees the
@@ -87,7 +89,7 @@ export async function runTool(
 	body: () => Promise<unknown>,
 ): Promise<CallToolResult> {
 	try {
-		assertToolAccess(tool, context.ceiling);
+		assertToolAccess(tool, context);
 		return jsonResult(await body());
 	} catch (error) {
 		return errorResult(describeToolFailure(tool, error).message);

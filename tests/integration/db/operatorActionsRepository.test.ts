@@ -55,6 +55,23 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('operatorActionsRepository
 		expect(settled?.completedAt).toBeInstanceOf(Date);
 	});
 
+	// issue #1385 — a scoped agent credential's call is told apart from its holder's own.
+	it("records the credential kind, defaulting to the account's own, and a scoped token's id", async () => {
+		await recordOperatorAction(CALL);
+		const TOKEN_ID = '33333333-3333-4333-8333-333333333333';
+		await recordOperatorAction({
+			...CALL,
+			credentialKind: 'scoped-agent-token',
+			agentTokenId: TOKEN_ID,
+		});
+
+		const rows = await getDb().select().from(operatorActions);
+		expect(rows.map((row) => [row.credentialKind, row.agentTokenId]).sort()).toEqual([
+			['scoped-agent-token', TOKEN_ID],
+			['user', null],
+		]);
+	});
+
 	it('keeps an already-recorded project when the settle names none', async () => {
 		const id = await recordOperatorAction({ ...CALL, projectId: 'proj-a' });
 

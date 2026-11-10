@@ -11,9 +11,10 @@
  *    verdict and the intended changes — and changes nothing: only the tool's
  *    `preview` runs, never its `apply`.
  *  - **The tool's role, then the procedure's.** A caller below the tool's
- *    `TOOL_ACCESS` role (`./tool-access.ts`, issue #1382) is refused with
- *    `FORBIDDEN` right after the audit row is written, so the refusal is audited
- *    and neither `preview` nor `apply` runs.
+ *    `TOOL_ACCESS` role (`./tool-access.ts`, issue #1382) — or a scoped agent
+ *    credential calling a tool outside its allowlist (issue #1385) — is refused
+ *    with `FORBIDDEN` right after the audit row is written, so the refusal is
+ *    audited and neither `preview` nor `apply` runs.
  *  - **Authorization before anything, dry run included.** `preview` is a dashboard
  *    procedure gated exactly as the write it describes, and it runs first on *every*
  *    call. A dry run therefore cannot tell a caller about state the real call would
@@ -34,6 +35,9 @@
  *    later tool can undo it (`phase_agents_restore` reads the `{ previous, next }`
  *    order `phase_agents_reorder` records). `apply` is handed the very preview it was
  *    authorized by, so what it writes is what the row says it wrote.
+ *  - **Which credential acted.** The row records the request's credential kind —
+ *    `user`, or `scoped-agent-token` with the token's id (issue #1385) — so an
+ *    agent's calls read apart from its holder's own.
  *  - **No secret in the audit trail.** A tool that accepts a secret names the field in
  *    `secretInputs`, and the row records it as `[redacted]` (issue #1359).
  *
@@ -182,7 +186,7 @@ export async function runWriteTool<
 	context: ToolContext,
 	args: WriteToolArgs<Shape>,
 ): Promise<CallToolResult> {
-	const { user, ceiling } = context;
+	const { user, credential } = context;
 	const { reason, dryRun, ...rest } = args;
 	const input = rest as unknown as z.objectOutputType<Shape, z.ZodTypeAny>;
 
@@ -197,6 +201,8 @@ export async function runWriteTool<
 			reason,
 			dryRun,
 			input: auditableInput(input, definition.secretInputs),
+			credentialKind: credential.kind,
+			agentTokenId: credential.kind === 'scoped-agent-token' ? credential.tokenId : null,
 		});
 	} catch (error) {
 		const message = describeError(error);
@@ -232,7 +238,7 @@ export async function runWriteTool<
 	try {
 		// After the row is written, so a caller below the tool's role is audited as
 		// refused — and before anything else, so they learn nothing more.
-		assertToolAccess(definition.name, ceiling);
+		assertToolAccess(definition.name, context);
 		if (reason.trim().length === 0) {
 			throw new TRPCError({
 				code: 'BAD_REQUEST',

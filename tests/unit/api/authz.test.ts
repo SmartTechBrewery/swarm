@@ -18,7 +18,7 @@ import {
 	mayAccessProject,
 } from '@/api/authz.js';
 import type { ProjectMembership, ProjectRole } from '@/identity/membership.js';
-import type { SwarmUser } from '@/identity/schema.js';
+import { agentScopeOf, type SwarmUser, scopeUserToProjects } from '@/identity/schema.js';
 
 const USER_ID = '11111111-1111-4111-8111-111111111111';
 
@@ -201,5 +201,78 @@ describe('filterAccessibleProjects', () => {
 	it('returns an empty list for a non-admin with no memberships', async () => {
 		listAccessibleProjectIds.mockResolvedValue([]);
 		await expect(filterAccessibleProjects(user(), projects)).resolves.toEqual([]);
+	});
+});
+
+// Issue #1385: a scoped agent credential's user is limited to its projects, before
+// and regardless of the administrator bypass.
+describe('a scoped agent credential', () => {
+	const scopedAdmin = () =>
+		scopeUserToProjects(user({ instanceAdmin: true }), ['proj-a', 'proj-b']);
+	const scopedMember = () => scopeUserToProjects(user(), ['proj-a', 'proj-b']);
+
+	beforeEach(() => {
+		getMembership.mockReset();
+		listAccessibleProjectIds.mockReset();
+	});
+
+	it('reads a project outside its scope as NOT_FOUND, even for an administrator holder', async () => {
+		await expect(assertProjectAccess(scopedAdmin(), 'proj-z', 'contributor')).rejects.toThrowError(
+			expect.objectContaining({ code: 'NOT_FOUND', message: 'Project with ID "proj-z" not found' }),
+		);
+		await expect(
+			assertProjectAccess(scopedAdmin(), 'proj-z', 'contributor', 'Run with ID "r" not found'),
+		).rejects.toThrowError(expect.objectContaining({ message: 'Run with ID "r" not found' }));
+		expect(await mayAccessProject(scopedAdmin(), 'proj-z', 'contributor')).toBe(false);
+		expect(getMembership).not.toHaveBeenCalled();
+	});
+
+	it('passes an administrator holder inside the scope without consulting membership', async () => {
+		await expect(
+			assertProjectAccess(scopedAdmin(), 'proj-a', 'projectAdmin'),
+		).resolves.toBeUndefined();
+		expect(await mayAccessProject(scopedAdmin(), 'proj-b', 'projectAdmin')).toBe(true);
+		expect(getMembership).not.toHaveBeenCalled();
+	});
+
+	it("applies a non-admin holder's own membership inside the scope", async () => {
+		getMembership.mockResolvedValue(membership('contributor'));
+
+		await expect(
+			assertProjectAccess(scopedMember(), 'proj-a', 'contributor'),
+		).resolves.toBeUndefined();
+		await expect(assertProjectAccess(scopedMember(), 'proj-a', 'member')).rejects.toThrowError(
+			expect.objectContaining({ code: 'FORBIDDEN' }),
+		);
+		expect(await mayAccessProject(scopedMember(), 'proj-a', 'member')).toBe(false);
+	});
+
+	it('scopes cross-project reads to its projects, intersected with what the holder may read', async () => {
+		expect(await accessibleProjectScope(scopedAdmin())).toEqual(['proj-a', 'proj-b']);
+		expect(listAccessibleProjectIds).not.toHaveBeenCalled();
+
+		listAccessibleProjectIds.mockResolvedValue(['proj-b', 'proj-z']);
+		expect(await accessibleProjectScope(scopedMember())).toEqual(['proj-b']);
+		expect(
+			await filterAccessibleProjects(scopedAdmin(), [{ id: 'proj-a' }, { id: 'proj-z' }]),
+		).toEqual([{ id: 'proj-a' }]);
+	});
+
+	it('is refused every installation-wide view, even for an administrator holder', () => {
+		expect(() => assertInstanceAdmin(scopedAdmin(), 'workers')).toThrowError(
+			expect.objectContaining({ code: 'FORBIDDEN' }),
+		);
+	});
+
+	it('acts as its holder with the installation-admin flag cleared', () => {
+		const scoped = scopedAdmin();
+
+		expect(scoped.id).toBe(USER_ID);
+		expect(scoped.instanceAdmin).toBe(false);
+		expect(agentScopeOf(scoped)).toEqual({
+			projectIds: ['proj-a', 'proj-b'],
+			holderInstanceAdmin: true,
+		});
+		expect(agentScopeOf(user())).toBeUndefined();
 	});
 });

@@ -13,7 +13,8 @@
  * is served to installation administrators only.
  *
  * **Every tool is registered for every caller; `tools/list` shows only the ones
- * their role ceiling reaches** (issue #1382). A hidden tool stays registered so a
+ * their role ceiling reaches** (issue #1382) — and, for a scoped agent credential,
+ * only the `agentScoped` ones among those (issue #1385). A hidden tool stays registered so a
  * direct call to it reaches the tool's own `FORBIDDEN` refusal — audited, for a
  * write tool — rather than the SDK's "tool not found". The SDK's per-tool
  * `disable()` is not used for the same reason: a disabled tool's call is refused
@@ -27,7 +28,7 @@ import {
 	type ListToolsResult,
 } from '@modelcontextprotocol/sdk/types.js';
 
-import { ceilingReaches, type ToolContext, toolAccessFor } from './tool-access.js';
+import { type ToolContext, toolListedFor } from './tool-access.js';
 import { registerCliRateLimitSetTools } from './tools/cli-rate-limit-set.js';
 import { registerConsistencyTools } from './tools/consistency.js';
 import { registerDependencyWaitTools } from './tools/dependency-waits.js';
@@ -55,7 +56,7 @@ export const SWARM_MCP_SERVER_VERSION = '1.0.0';
 
 /**
  * Build the MCP server for one request, with every tool authorizing as
- * `context.user` and `tools/list` showing only the tools `context.ceiling` reaches.
+ * `context.user` and `tools/list` showing only the tools `context` may call.
  */
 export function createSwarmMcpServer(context: ToolContext): McpServer {
 	const server = new McpServer({ name: SWARM_MCP_SERVER_NAME, version: SWARM_MCP_SERVER_VERSION });
@@ -85,7 +86,8 @@ type RequestHandlers = Map<
 >;
 
 /**
- * Narrow `server`'s `tools/list` answer to the tools `context.ceiling` reaches.
+ * Narrow `server`'s `tools/list` answer to the tools `context` may call
+ * (`toolListedFor`: its ceiling, and a scoped agent credential's allowlist).
  * `McpServer` builds that answer from its private tool registry, so this wraps the
  * handler the SDK installed (read from the low-level server's private handler map)
  * rather than re-implementing the schema conversion it does. That is SDK
@@ -101,9 +103,7 @@ function listOnlyReachableTools(server: McpServer, context: ToolContext): void {
 		const result = await listAll(request, extra);
 		return {
 			...result,
-			tools: result.tools.filter((tool) =>
-				ceilingReaches(context.ceiling, toolAccessFor(tool.name).minRole),
-			),
+			tools: result.tools.filter((tool) => toolListedFor(tool.name, context)),
 		};
 	});
 }

@@ -21,7 +21,7 @@ vi.mock('@/lib/logger.js', async () => ({
 }));
 
 import type { SwarmUser } from '@/identity/schema.js';
-import type { ToolContext } from '@/mcp/tool-access.js';
+import { scopedAgentPrincipal, type ToolContext } from '@/mcp/tool-access.js';
 import { runWriteTool, type WriteToolDefinition } from '@/mcp/write-tool.js';
 
 const USER: SwarmUser = {
@@ -38,7 +38,9 @@ const USER: SwarmUser = {
  * an installation administrator; the framework's own behaviour is exercised at that
  * ceiling, and the role refusal on its own below.
  */
-const CONTEXT: ToolContext = { user: USER, ceiling: 'instanceAdmin' };
+const CONTEXT: ToolContext = { user: USER, credential: { kind: 'user' }, ceiling: 'instanceAdmin' };
+
+const TOKEN_ID = '33333333-3333-4333-8333-333333333333';
 
 const shape = { runId: z.string() };
 let preview: ReturnType<typeof vi.fn>;
@@ -91,6 +93,8 @@ describe('runWriteTool', () => {
 			reason: 'wedged since yesterday',
 			dryRun: false,
 			input: { runId: 'run-1' },
+			credentialKind: 'user',
+			agentTokenId: null,
 		});
 		expect(recordOperatorAction.mock.invocationCallOrder[0]).toBeLessThan(
 			preview.mock.invocationCallOrder[0] ?? 0,
@@ -215,7 +219,7 @@ describe('runWriteTool', () => {
 	])('refuses %s to a caller below its role, audited, touching nothing', async (_, tool, ceiling, needs) => {
 		const result = await runWriteTool(
 			tool,
-			{ user: USER, ceiling },
+			{ user: USER, credential: { kind: 'user' }, ceiling },
 			{
 				runId: 'run-1',
 				reason: 'r',
@@ -236,10 +240,50 @@ describe('runWriteTool', () => {
 		});
 	});
 
+	// Issue #1385: a scoped agent credential's calls are audited as its own, and a
+	// tool outside its allowlist is refused (audited) whatever the ceiling.
+	it('records a scoped agent credential and its token id on the audit row', async () => {
+		const scoped = scopedAgentPrincipal(USER, TOKEN_ID, ['proj-a']);
+		const result = await runWriteTool(
+			{ ...definition(), name: 'run_reset' },
+			{ ...scoped, ceiling: 'member' },
+			{ runId: 'run-1', reason: 'r', dryRun: false },
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(recordOperatorAction).toHaveBeenCalledWith(
+			expect.objectContaining({
+				userId: USER.id,
+				credentialKind: 'scoped-agent-token',
+				agentTokenId: TOKEN_ID,
+			}),
+		);
+	});
+
+	it('refuses a scoped agent credential a tool outside its allowlist, audited', async () => {
+		const scoped = scopedAgentPrincipal(USER, TOKEN_ID, ['proj-a']);
+		const result = await runWriteTool(
+			{ ...definition(), name: 'project_update' },
+			{ ...scoped, ceiling: 'projectAdmin' },
+			{ runId: 'run-1', reason: 'r', dryRun: false },
+		);
+
+		expect(text(result)).toBe(
+			'FORBIDDEN: Tool "project_update" is not available to a scoped agent credential.',
+		);
+		expect(preview).not.toHaveBeenCalled();
+		expect(apply).not.toHaveBeenCalled();
+		expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
+			outcome: 'refused',
+			error: expect.stringMatching(/^FORBIDDEN: /),
+			projectId: null,
+		});
+	});
+
 	it('runs a listed tool for a caller at exactly its role', async () => {
 		const result = await runWriteTool(
 			{ ...definition(), name: 'run_reset' },
-			{ user: USER, ceiling: 'member' },
+			{ user: USER, credential: { kind: 'user' }, ceiling: 'member' },
 			{ runId: 'run-1', reason: 'r', dryRun: false },
 		);
 

@@ -28,6 +28,13 @@
  * project by the dashboard procedure the tool wraps. Agent access tokens are still
  * issued to installation administrators only (`MAY_USE_AGENT_ACCESS_TOKENS`), so a
  * non-admin connects with their `swarm login` session.
+ *
+ * **A scoped agent credential** (issue #1385) — an agent access token issued with
+ * `projectIds` — acts as its holder limited to those projects: every other project
+ * reads as `NOT_FOUND`, an installation-wide view is `FORBIDDEN`
+ * (`../api/authz.ts`), and only the read tools plus the recovery allowlist are
+ * listed or callable (`agentScoped`, `../mcp/tool-access.ts`). Its write-tool
+ * calls are audited as `scoped-agent-token` with the token's id.
  * **`SWARM_SINGLE_USER_MODE` is deliberately not honoured**, for the reason
  * `./operator-api.ts` gives: on an internet-reachable process it would make anyone
  * who found the URL an installation admin. Nothing in this module reads that
@@ -55,13 +62,21 @@ import type { Hono } from 'hono';
 // tools call read the registry at request time, and this module must not depend on
 // a sibling having loaded it first.
 import '../integrations/entrypoint.js';
-import { resolveAgentAccessToken } from '../identity/agent-access-token-service.js';
+import {
+	type LiveAgentAccessToken,
+	resolveAgentAccessToken,
+} from '../identity/agent-access-token-service.js';
 import { resolveSession } from '../identity/auth.js';
 import { type InstallationRole, installationRoleFor, type SwarmUser } from '../identity/schema.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { createSwarmMcpServer } from '../mcp/server.js';
-import { mcpCeilingFor } from '../mcp/tool-access.js';
+import {
+	type McpPrincipal,
+	mcpCeilingFor,
+	scopedAgentPrincipal,
+	userPrincipal,
+} from '../mcp/tool-access.js';
 import { resolveOperatorBearer } from './operator-session.js';
 
 /** The path the operator MCP server is served at. Kept as one constant so the mount and the docs agree. */
@@ -74,7 +89,7 @@ export const OPERATOR_MCP_ENDPOINT = '/operator/mcp';
  */
 export interface OperatorMcpDeps {
 	resolveSession: (rawToken: string) => Promise<SwarmUser | undefined>;
-	resolveAgentAccessToken: (rawToken: string) => Promise<SwarmUser | undefined>;
+	resolveAgentAccessToken: (rawToken: string) => Promise<LiveAgentAccessToken | undefined>;
 }
 
 /**
@@ -90,29 +105,39 @@ export const MAY_USE_OPERATOR_MCP: Record<InstallationRole, boolean> = {
 };
 
 /**
- * The bearer's user: a `swarm login` session first, then an agent access token.
- * The two are hashed into different tables, so a token resolves in at most one.
+ * The bearer's principal: a `swarm login` session first, then an agent access
+ * token. The two are hashed into different tables, so a token resolves in at most
+ * one. A session and an ordinary token act as their user; a token carrying
+ * projects is a **scoped agent credential** (issue #1385), acting as its holder
+ * limited to those projects.
  */
-async function resolveBearerUser(
+async function resolveBearerPrincipal(
 	deps: OperatorMcpDeps,
 	token: string,
-): Promise<SwarmUser | undefined> {
-	return (await deps.resolveSession(token)) ?? (await deps.resolveAgentAccessToken(token));
+): Promise<McpPrincipal | undefined> {
+	const session = await deps.resolveSession(token);
+	if (session) return userPrincipal(session);
+	const agentToken = await deps.resolveAgentAccessToken(token);
+	if (!agentToken) return undefined;
+	return agentToken.projectIds && agentToken.projectIds.length > 0
+		? scopedAgentPrincipal(agentToken.user, agentToken.tokenId, agentToken.projectIds)
+		: userPrincipal(agentToken.user);
 }
 
 /**
- * Serve one MCP request as an already-authenticated `user`: their role ceiling,
- * read once, then a fresh server and transport, torn down once the JSON reply has
- * settled. The mount below runs the credential and installation-role gates first;
- * exported so the tools' own per-user authorization can be exercised directly.
+ * Serve one MCP request as an already-authenticated `principal`: its role
+ * ceiling, read once, then a fresh server and transport, torn down once the JSON
+ * reply has settled. The mount below runs the credential and installation-role
+ * gates first; exported so the tools' own per-user authorization can be exercised
+ * directly.
  */
 export async function serveOperatorMcpRequest(
-	user: SwarmUser,
+	principal: McpPrincipal,
 	request: Request,
 ): Promise<Response> {
 	let server: McpServer | undefined;
 	try {
-		server = createSwarmMcpServer({ user, ceiling: await mcpCeilingFor(user) });
+		server = createSwarmMcpServer({ ...principal, ceiling: await mcpCeilingFor(principal.user) });
 		const transport = new WebStandardStreamableHTTPServerTransport({
 			sessionIdGenerator: undefined,
 			enableJsonResponse: true,
@@ -142,11 +167,11 @@ export function registerOperatorMcp(app: Hono, overrides: Partial<OperatorMcpDep
 
 	app.all(OPERATOR_MCP_ENDPOINT, async (c) => {
 		const token = resolveOperatorBearer(c);
-		const user = token ? await resolveBearerUser(deps, token) : undefined;
-		if (!user) {
+		const principal = token ? await resolveBearerPrincipal(deps, token) : undefined;
+		if (!principal) {
 			return c.json({ error: 'Unauthorized' }, 401);
 		}
-		if (!MAY_USE_OPERATOR_MCP[installationRoleFor(user)]) {
+		if (!MAY_USE_OPERATOR_MCP[installationRoleFor(principal.user)]) {
 			return c.json({ error: 'Forbidden: your installation role may not use the MCP server' }, 403);
 		}
 		if (c.req.method !== 'POST') {
@@ -154,6 +179,6 @@ export function registerOperatorMcp(app: Hono, overrides: Partial<OperatorMcpDep
 			return c.json({ error: 'Method not allowed: this MCP server is stateless, POST only' }, 405);
 		}
 
-		return serveOperatorMcpRequest(user, c.req.raw);
+		return serveOperatorMcpRequest(principal, c.req.raw);
 	});
 }
