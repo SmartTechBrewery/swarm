@@ -24,7 +24,7 @@ import { logger } from '../lib/logger.js';
 import { provisionalTaskBranch } from '../pipeline/task-branch.js';
 import { HANDOFF_FILENAMES, SCRATCH_PATHSPECS } from '../scm/delivery.js';
 import { normalizeRepoSlug, resolveOriginRepoSlug } from '../scm/repo-slug.js';
-import { CommitUnavailableError } from '../worktree/commit-availability.js';
+import { BranchUnavailableError, CommitUnavailableError } from '../worktree/commit-availability.js';
 import {
 	BlockedRecoveryError,
 	evaluateWorktreeLiveness,
@@ -200,6 +200,16 @@ export class GitWorktreeManager {
 	 * provisioning call site, so it can never describe another task's fetch.
 	 */
 	private lastFetchError?: string;
+
+	/**
+	 * Why this manager's last provision-time `git fetch origin` failed, or `undefined`
+	 * when it succeeded or never ran. Read by the branch phases (issue #1401) to tell
+	 * an agent that stopped because it could not sync with origin from one that
+	 * merely wrote no hand-off (`assertBranchSyncReachedOrigin`, `../worktree/commit-availability.ts`).
+	 */
+	get provisionFetchError(): string | undefined {
+		return this.lastFetchError;
+	}
 
 	constructor(
 		private readonly project: ProjectConfig,
@@ -581,7 +591,7 @@ export class GitWorktreeManager {
 			detached,
 			checkoutMode: checkout.mode,
 		});
-		await this.addWorktree(args);
+		await this.addWorktree(args, createBranch ? undefined : { taskId, branch });
 
 		await this.runtime.claim(this.project.id, taskId, leaseToken);
 
@@ -749,16 +759,42 @@ export class GitWorktreeManager {
 	 * failed into a `logger.warn` on this machine. Naming it here is what carries the
 	 * cause to the control plane instead of leaving it git's message about a ref whose
 	 * absence already had an explanation nobody reported.
+	 *
+	 * `existing` is set when the checkout is of an existing branch (`createBranch:
+	 * false` — the pull request's branch, which lives on the remote). When that branch
+	 * then resolves neither locally nor as `origin/<branch>`, the failed fetch is not
+	 * merely likely to be the cause but the only thing that could have supplied it, so
+	 * the failure is raised as {@link BranchUnavailableError} (issue #1401): deferred
+	 * and re-routed to another worker like a missing commit, not settled terminally.
 	 */
-	private async addWorktree(args: string[]): Promise<void> {
+	private async addWorktree(
+		args: string[],
+		existing?: { taskId: string; branch: string },
+	): Promise<void> {
 		try {
 			await this.git(args);
 		} catch (err) {
 			if (!this.lastFetchError) throw err;
+			if (existing && !(await this.branchResolvesLocally(existing.branch))) {
+				throw new BranchUnavailableError(existing.branch, {
+					repoRoot: this.project.repoRoot,
+					taskId: existing.taskId,
+					fetchError: this.lastFetchError,
+					checkoutError: describeError(err),
+				});
+			}
 			throw new Error(
 				`${describeError(err)} (this worker's \`git fetch origin\` had failed first: ${this.lastFetchError})`,
 			);
 		}
+	}
+
+	/** Whether `branch` resolves in this clone as a local or a remote-tracking branch. */
+	private async branchResolvesLocally(branch: string): Promise<boolean> {
+		return (
+			(await this.refExists(`refs/heads/${branch}`)) ||
+			(await this.refExists(`refs/remotes/origin/${branch}`))
+		);
 	}
 
 	/** Whether a ref resolves in this repository — used for `origin/<branch>`. */
