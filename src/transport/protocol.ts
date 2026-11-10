@@ -633,6 +633,54 @@ export const WorktreeSweepSchema = z.object({
 export type WorktreeSweep = z.infer<typeof WorktreeSweepSchema>;
 
 /**
+ * Cloud→worker control frame asking a machine to discard the checkout it still holds
+ * for a run that was **reset away from it** (issue #1402). Reset & restart abandons a
+ * preserved worker and the restart may run elsewhere, so the `'discard'` intent on the
+ * replacement dispatch never reaches this machine; the reset records a
+ * `checkout_discards` row instead and the router pushes this frame now or on the
+ * machine's next connection (`../router/checkout-discard-dispatch.ts`).
+ *
+ * Like {@link WorktreeSweepSchema} it carries **no host path**: the machine picks its
+ * own checkout root for `repository` and resolves the relative `worktreeRoot` under
+ * it. It discards only a checkout whose pin or lease names `runId` and that no live
+ * phase holds (`./checkout-discard.ts`), so a newer run's checkout is never touched.
+ *
+ * `requestId` is the row's id, which the report settles. Additive, so
+ * `TRANSPORT_PROTOCOL_VERSION` is not bumped, on the same terms as the sweep frame:
+ * an older daemon logs and ignores it, and the request stays pending.
+ */
+export const CheckoutDiscardSchema = z.object({
+	type: z.literal('checkout-discard'),
+	requestId: z.string().uuid(),
+	runId: z.string().uuid(),
+	projectId: z.string().min(1),
+	repository: z.string().min(1),
+	taskId: z.string().min(1),
+	worktreeRoot: z.string().min(1),
+});
+export type CheckoutDiscard = z.infer<typeof CheckoutDiscardSchema>;
+
+/**
+ * What became of a {@link CheckoutDiscardSchema} request:
+ *
+ * - `discarded` — the run's checkout was removed;
+ * - `absent` — there was no checkout for the task under that root;
+ * - `retained` — a checkout exists but is not provably the reset run's, or a live
+ *   phase holds it, so it was kept (the report's `detail` says which);
+ * - `failed` — the removal itself threw;
+ * - `superseded` — decided control-plane side: the run was preserved on this machine
+ *   again after the reset, so the checkout there is the newer attempt's.
+ */
+export const CheckoutDiscardOutcomeSchema = z.enum([
+	'discarded',
+	'absent',
+	'retained',
+	'failed',
+	'superseded',
+]);
+export type CheckoutDiscardOutcome = z.infer<typeof CheckoutDiscardOutcomeSchema>;
+
+/**
  * One captured agent-output line, the transport mirror of a `run_output_events`
  * row (`../worker/live-output.ts`): the `stream` it came from, its `content`
  * (newline-terminated, as the batcher stores it), and the ISO-8601 instant it
@@ -963,6 +1011,7 @@ export const ControlPlaneMessageSchema = z.discriminatedUnion('type', [
 	TaskCancelSchema,
 	WorkerUpdateSchema,
 	WorktreeSweepSchema,
+	CheckoutDiscardSchema,
 ]);
 export type ControlPlaneMessage = z.infer<typeof ControlPlaneMessageSchema>;
 
@@ -1722,4 +1771,37 @@ export const ReportWorktreeSweepDeliveryResponseSchema = z.object({
 });
 export type ReportWorktreeSweepDeliveryResponse = z.infer<
 	typeof ReportWorktreeSweepDeliveryResponseSchema
+>;
+
+/**
+ * Checkout-discard **report** (issue #1402) — what a machine did with a
+ * {@link CheckoutDiscardSchema} request, settling its `checkout_discards` row. An HTTP
+ * delivery route rather than a stream frame, for the reason
+ * {@link ReportWorktreeSweepDeliveryRequestSchema} states: an unserved route is a 404
+ * the client explains, where an unparseable stream frame closes the socket. Names no
+ * worker — the authenticating credential does, so a daemon settles only its own
+ * requests. `detail` is bounded operator-facing prose carrying no secret.
+ *
+ * `superseded` is a control-plane-only outcome and is refused here.
+ */
+export const ReportCheckoutDiscardDeliveryRequestSchema = z.object({
+	requestId: z.string().uuid(),
+	outcome: CheckoutDiscardOutcomeSchema.exclude(['superseded']),
+	detail: z.string().max(4000),
+	protocolVersion: z.number().int(),
+});
+export type ReportCheckoutDiscardDeliveryRequest = z.infer<
+	typeof ReportCheckoutDiscardDeliveryRequestSchema
+>;
+
+/**
+ * `POST /worker/delivery/checkout-discard-report` success body — whether this report
+ * settled a request still pending. `false` is a duplicate or an already-settled one,
+ * never a refusal.
+ */
+export const ReportCheckoutDiscardDeliveryResponseSchema = z.object({
+	recorded: z.boolean(),
+});
+export type ReportCheckoutDiscardDeliveryResponse = z.infer<
+	typeof ReportCheckoutDiscardDeliveryResponseSchema
 >;

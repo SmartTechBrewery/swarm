@@ -278,10 +278,15 @@ exits **1**; a missing session says to run `swarm login`.
      for a saved agent session — restarting from scratch is the point of it. A
      teardown that *throws* is reported and stepped over rather than stopping the
      reset, since the checkout in the way may not even be on this host;
-  5. **restart intent** — what the *restart* will do to the checkout wherever it
-     lives (issue #592), which is the half of the answer step 4 cannot give:
-     `discards it — dirty and unpushed work included`;
-  6. **recovery record** — clears it plus any captured session id;
+  5. **restart intent** — what the *restart* will do (issue #592): the worker that
+     runs it discards any checkout of the task it holds — dirty and unpushed work
+     included;
+  6. **recovery record** — clears it plus any captured session id. When the run was
+     preserved on a worker, the `preserved work` line names that worker and a
+     `preserved checkout` line follows (issue #1402): `pending removal on worker …`
+     — the reset asked that worker to discard the checkout, which it does now if it
+     is connected or when it next reconnects, since the restart may run elsewhere —
+     or `still on worker …` with the reason the request could not be recorded;
   7. **restarted** — re-dispatches the phase from scratch and prints the new
      dispatch id. A run that cannot be re-dispatched at all — no stored job
      payload, or a project that no longer exists — prints `not restarted` with the
@@ -314,8 +319,9 @@ you reach it when the services that serve it are down.
 
 **It can be run from anywhere** (issue #592). Step 3 inspects and removes a
 checkout on *this* machine's disk; a checkout on another worker is settled by that
-worker when it provisions the restart, following the discard intent step 4
-reports. Running it on the host that owns the worktree still settles that checkout
+worker when it provisions the restart, following the discard intent step 5
+reports — and a checkout preserved on a worker the restart does not go back to is
+discarded by that worker on the reset's own request (issue #1402). Running it on the host that owns the worktree still settles that checkout
 one step sooner, but it is no longer required to free a wedged one.
 
 ### `swarm run:worker`

@@ -45,8 +45,11 @@ export function registerRunActionTools(server: McpServer, context: ToolContext):
 			'cancels its active dispatch (even a claimed one), clears its cancellation flag, tears ' +
 			'down its checkout discarding uncommitted and unpushed work, clears its recovery ' +
 			'record, then restarts the phase as a fresh first attempt (or settles the run failed ' +
-			"when it has no payload or project). Needs `member` on the run's project. Requires a " +
-			'`reason`; pass `dryRun: true` first to see what it would do.',
+			'when it has no payload or project). A checkout preserved on another worker is ' +
+			'discarded by that worker asynchronously, now or when it reconnects: the result ' +
+			"reports it as `abandonedCheckout: 'discard-requested'` (pending removal there), while " +
+			"`worktree` describes the control-plane host only. Needs `member` on the run's project. " +
+			'Requires a `reason`; pass `dryRun: true` first to see what it would do.',
 		inputSchema: runActionInput,
 		destructive: true,
 		targetOf: (input) => input.runId,
