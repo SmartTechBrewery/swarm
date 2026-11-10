@@ -18,6 +18,7 @@ const PHASE_FILTER_LABELS: Record<RunPhaseFilter, string> = {
 	'respond-to-review': 'Respond to review',
 	'respond-to-ci': 'Respond to CI',
 	'resolve-conflicts': 'Resolve conflicts',
+	'resolve-problem': 'Resolve problem',
 	// Not a pipeline phase at all (issue #971) — machine maintenance, which
 	// `sortPipelinePhases` therefore ranks after every known phase.
 	'worker-update': 'Worker update',

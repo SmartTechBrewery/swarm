@@ -206,3 +206,21 @@ export async function updateBugReportStatus(
 		.returning();
 	return row;
 }
+
+/**
+ * The newest occurrence an agent run filed (`filed_by_run_id = runId`), or
+ * `undefined` when it filed none — the Resolve problem settle's proof that the run
+ * recorded what it found (issue #1395). Filing a report records its first
+ * occurrence too, so one read covers both a new report and an added occurrence.
+ */
+export async function findOccurrenceFiledByRun(
+	runId: string,
+): Promise<Pick<BugReportOccurrenceRow, 'id' | 'reportId'> | undefined> {
+	const rows = await getDb()
+		.select({ id: bugReportOccurrences.id, reportId: bugReportOccurrences.reportId })
+		.from(bugReportOccurrences)
+		.where(eq(bugReportOccurrences.filedByRunId, runId))
+		.orderBy(desc(bugReportOccurrences.observedAt))
+		.limit(1);
+	return rows[0];
+}

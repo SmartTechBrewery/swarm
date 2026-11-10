@@ -114,6 +114,11 @@ registration and approval, and each of your own workers' live CLI quota.
 | **Respond-to-CI** | A check fails on a task branch, and the failure isn't attributed to the PR's base branch already being red on the same check ([docs/pipeline.md](docs/pipeline.md#base-branch-health)) | Fixes the failure, or reports that it can't | Commits/pushes and explains on the PR, under a per-PR attempt cap, which records a durable give-up when it is spent. Reporting that it can't fix the build hands the PR back to Review rather than ending the line |
 | **Resolve conflicts** | A PR is confirmed conflicting with its base | Merges the current base and resolves | Commits and pushes; rechecks are coalesced, bounded, and deduplicated |
 
+An optional seventh, **Resolve problem** (off unless a project turns it on), runs
+an agent against one *failed run* with SWARM's own operator MCP tools and no
+checkout: it diagnoses, tries SWARM's recovery tools within a write cap, and files
+a bug report; it never changes code ([docs/pipeline.md](docs/pipeline.md#pipeline-phases)).
+
 All six run on any worker, over the same transport — which machine a worker
 happens to be is not a factor. One deliberate exception: a phase *continuing*
 work already on disk — a preserved checkout, which is machine-local and has no

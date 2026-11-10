@@ -44,6 +44,7 @@ import {
 	hasResumableDeferredRun,
 	hasRunForTask,
 	type ListRunsFilter,
+	listResolveProblemAttempts,
 	listRunPassedOverWorkerIds,
 	listRunsFromDb,
 	listSnapshotRunsForProject,
@@ -3931,6 +3932,73 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 
 			expect(byTask['103'].producedPrUrl).toBe('https://github.com/acme/widgets/pull/92');
 			expect(byTask['92'].reviewMergeOutcome).toBe('merged');
+		});
+	});
+
+	describe('resolves_run_id (issue #1395)', () => {
+		it('links a Resolve problem run to its failed run, which lists its attempts newest first', async () => {
+			const failed = await createRun({ projectId: PROJECT_ID, taskId: '1395', phase: 'review' });
+			await completeRun(failed, { status: 'failed', error: 'boom' });
+			const first = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '1395',
+				phase: 'resolve-problem',
+				resolvesRunId: failed,
+			});
+			await completeRun(first, { status: 'failed', error: 'could not resolve' });
+			const second = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '1395',
+				phase: 'resolve-problem',
+				resolvesRunId: failed,
+			});
+
+			expect((await getRunByIdFromDb(first))?.resolvesRunId).toBe(failed);
+			expect((await getRunByIdFromDb(failed))?.resolvesRunId).toBeNull();
+			const attempts = await listResolveProblemAttempts(failed);
+			expect(attempts.map((attempt) => attempt.id).sort()).toEqual([first, second].sort());
+			expect(attempts.find((attempt) => attempt.id === first)).toMatchObject({
+				status: 'failed',
+				error: 'could not resolve',
+			});
+			expect(await listResolveProblemAttempts(first)).toEqual([]);
+		});
+
+		it('keeps an attempt when its failed run is deleted (ON DELETE SET NULL)', async () => {
+			const failed = await createRun({ projectId: PROJECT_ID, taskId: '7', phase: 'review' });
+			const attempt = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '7',
+				phase: 'resolve-problem',
+				resolvesRunId: failed,
+			});
+
+			await getDb().delete(runs).where(eq(runs.id, failed));
+
+			const kept = await getRunByIdFromDb(attempt);
+			expect(kept).toBeDefined();
+			expect(kept?.resolvesRunId).toBeNull();
+		});
+
+		it("leaves Resolve problem runs out of the task's liveness activity", async () => {
+			const failed = await createRun({ projectId: PROJECT_ID, taskId: '9', phase: 'review' });
+			await completeRun(failed, { status: 'failed', error: 'boom' });
+			// A live attempt on the task: it must not read as the task running.
+			await createRun({
+				projectId: PROJECT_ID,
+				taskId: '9',
+				phase: 'resolve-problem',
+				resolvesRunId: failed,
+			});
+
+			const activity = await listTaskActivitySince({ since: new Date(0) });
+			expect(activity).toHaveLength(1);
+			expect(activity[0]).toMatchObject({
+				taskId: '9',
+				phase: 'review',
+				runId: failed,
+				liveRunCount: 0,
+			});
 		});
 	});
 });

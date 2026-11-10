@@ -215,6 +215,16 @@ const PULL_REQUEST_PHASES = new Set([
 	'merge-automation',
 ]);
 
+/**
+ * Whether a phase is work on its task at all. Resolve problem (issue #1395) is the
+ * one that is not: it shares the failed run's task id, but it diagnoses a run, so
+ * neither its runs (left out by `listTaskActivitySince`) nor its dispatches count
+ * toward the task's liveness.
+ */
+function isTicketWorkPhase(phase: string): boolean {
+	return phase !== 'resolve-problem';
+}
+
 /** Phases whose dispatch is always about a board card. */
 export const BOARD_PHASES: ReadonlySet<string> = new Set(['planning', 'implementation']);
 
@@ -291,6 +301,9 @@ export function livenessUnitKeyForRun(row: TaskActivityRow): string {
  * suppress a stall report, never invent one.
  */
 export function livenessUnitKeysForDispatch(ref: ActiveDispatchTaskRef): string[] {
+	// A Resolve problem dispatch carries the failed run's task id but is not work on
+	// that task (issue #1395): it must not report the task as picked up.
+	if (ref.phase !== null && !isTicketWorkPhase(ref.phase)) return [];
 	const stripped = stripPullRequestTaskSuffix(ref.taskId);
 	if (stripped) return [dispatchKey(ref.projectId, 'pull-request', stripped)];
 	if (ref.phase !== null && BOARD_PHASES.has(ref.phase)) {

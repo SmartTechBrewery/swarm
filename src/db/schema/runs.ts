@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm';
 import {
+	type AnyPgColumn,
 	bigint,
 	bigserial,
 	boolean,
@@ -436,12 +437,23 @@ export const runs = pgTable(
 		 * out of that window. Never cleared: it only ever matters while it is fresh.
 		 */
 		resetStartedAt: timestamp('reset_started_at'),
+		/**
+		 * The failed run this run is a **Resolve problem** attempt for (issue #1395) —
+		 * set only on a `resolve-problem` run, from the dispatch that named the failed
+		 * run, and read back by the failed run's own detail to list its attempts.
+		 * `ON DELETE SET NULL`: deleting the failed run must not take the record of
+		 * what was tried for it down with it. Null for every other run.
+		 */
+		resolvesRunId: uuid('resolves_run_id').references((): AnyPgColumn => runs.id, {
+			onDelete: 'set null',
+		}),
 	},
 	(table) => [
 		index('idx_runs_project_id').on(table.projectId),
 		index('idx_runs_status').on(table.status),
 		index('idx_runs_started_at').on(table.startedAt),
 		index('idx_runs_worker_id').on(table.workerId),
+		index('idx_runs_resolves_run_id').on(table.resolvesRunId),
 		// Partial: only a maintenance run carries a request id, and a pipeline run's
 		// NULL must not be constrained at all (issue #971).
 		uniqueIndex('idx_runs_maintenance_request')

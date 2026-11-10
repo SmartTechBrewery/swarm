@@ -51,6 +51,8 @@ vi.mock('@/db/repositories/runsRepository.js', async () => ({
 	countRunsByStatusAndPhase,
 	countMergedPullRequestsByRepository,
 	findTaskIdForStoredTaskBranch,
+	// `getById`'s Resolve problem attempts read (issue #1395).
+	listResolveProblemAttempts: async () => [],
 }));
 // The review-verdict ledger read and the project record read behind `pr_status` and
 // `phase_agents_get` (issue #1342); the ledger's pure cap predicates stay real.

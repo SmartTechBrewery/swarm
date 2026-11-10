@@ -191,7 +191,8 @@ const UNREACHABLE_STATUSES: ReadonlySet<number> = new Set([
  * Build the handshake request body, stamping the current protocol version.
  *
  * `supportedPhases` is the caller's phase repertoire (issue #467): every daemon
- * passes `SUPPORTED_DB_FREE_PHASES`, which since issue #536 is all six. It
+ * passes `SUPPORTED_DB_FREE_PHASES`, which is every phase (the six since issue
+ * #536, Resolve problem since issue #1395). It
  * stays required rather than defaulted because a default would be a claim the
  * transport made on a caller's behalf: a daemon that later narrows its repertoire
  * would silently keep claiming phases it refuses.

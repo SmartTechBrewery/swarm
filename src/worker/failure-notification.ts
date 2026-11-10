@@ -94,7 +94,10 @@ async function openDependents(
 	const workItemId =
 		'workItem' in trigger
 			? trigger.workItem.id
-			: await resolveBoardItemIdForPrBranch(project, trigger.prBranch);
+			: trigger.phase === 'resolve-problem'
+				? // The failed run's own card (issue #1395) — what is waiting on it waits still.
+					trigger.workItemId
+				: await resolveBoardItemIdForPrBranch(project, trigger.prBranch);
 	if (!workItemId) return [];
 	return (await pm.listDependents(workItemId)).filter((dependent) => dependent.open);
 }

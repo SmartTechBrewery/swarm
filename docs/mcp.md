@@ -89,7 +89,7 @@ credentials](#scoped-agent-credentials).
 
 A **scoped agent credential** is an agent access token issued for one or more
 projects. It is meant for an autonomous agent that unblocks the pipeline in those
-projects, such as a planned *Resolve problem* phase, without holding your full
+projects, such as the *Resolve problem* phase, without holding your full
 access. A request made with it acts as you, limited in three ways:
 
 - **It reaches only its projects.** Every other project reads as `NOT_FOUND`,
@@ -169,6 +169,14 @@ the server enforces on its write tools.
   project, and is audited as `scoped-agent-token` with its own id. It is a system
   credential: it never appears on that account's **MCP** tab or in
   `agentAccessTokens.list`.
+- **Where it travels.** The Resolve problem phase
+  ([pipeline.md](pipeline.md#pipeline-phases)) mints one when the control plane
+  builds the run's assignment: held by the selected worker's owner, capped at
+  `pipeline.resolveProblem.maxWriteActions`, valid for the phase timeout plus ten
+  minutes. It is sent to the worker on the assignment with the `/operator/mcp`
+  address, and revoked at every settle. It is the **one per-run credential that
+  reaches a worker**. That is allowed because it is short-lived, bound to one run,
+  write-capped, and limited to the recovery tools.
 - **Guardrails.** A real call (`dryRun: false`) to a write tool is refused with
   `FORBIDDEN`, and the refusal is audited with outcome `refused`, before the tool
   does anything, when:

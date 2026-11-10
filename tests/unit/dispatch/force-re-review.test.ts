@@ -135,6 +135,7 @@ function makeCappedReviewRun(overrides: Partial<RunRow> = {}): RunRow {
 		recovery: null,
 		cancellation: null,
 		resetStartedAt: null,
+		resolvesRunId: null,
 		outputBytes: 0,
 		outputTruncated: false,
 		...overrides,

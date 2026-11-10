@@ -39,6 +39,7 @@ export const QueuedPhaseHintSchema = z.enum([
 	'respond-to-review',
 	'respond-to-ci',
 	'resolve-conflicts',
+	'resolve-problem',
 	'merge-automation',
 	'worker-update',
 	'unknown',
@@ -153,11 +154,11 @@ export const QueuedRunSchema = z.object({
 	projectId: z.string(),
 	/**
 	 * What produced the dispatch: `scm` for an SCM job, `pm` for a board job (both
-	 * carrying `providerId` separately), `merge-automation`, or `worker-update` —
+	 * carrying `providerId` separately), `merge-automation`, `worker-update` —
 	 * the machine-scoped kind that names no repository and no work item at all
-	 * (issue #972).
+	 * (issue #972) — or `resolve-problem`, an attempt on one failed run (issue #1395).
 	 */
-	type: z.enum(['scm', 'pm', 'merge-automation', 'worker-update']),
+	type: z.enum(['scm', 'pm', 'merge-automation', 'worker-update', 'resolve-problem']),
 	/** SCM and `pm` jobs only — the producing provider's id (`github`, `github-projects`). */
 	providerId: z.union([ScmProviderIdSchema, PmProviderIdSchema]).optional(),
 	state: PendingJobStateSchema,
@@ -243,6 +244,7 @@ export function deriveQueuedPhaseHint(job: SwarmJob): QueuedPhaseHint {
 	if (job.type === 'pm') return 'board';
 	if (job.type === 'merge-automation') return 'merge-automation';
 	if (job.type === 'worker-update') return 'worker-update';
+	if (job.type === 'resolve-problem') return 'resolve-problem';
 
 	const { event } = job;
 	switch (event.kind) {
@@ -382,8 +384,9 @@ function toQueuedRun(dispatch: DispatchRow): QueuedRun {
 			? { ...shared, prNumber: data.event.workItemId }
 			: data.type === 'merge-automation'
 				? { ...shared, prNumber: data.prNumber }
-				: data.type === 'worker-update'
-					? // A machine, not an artifact: no pull request and no board item to name.
+				: data.type === 'worker-update' || data.type === 'resolve-problem'
+					? // A machine, or a failed run (issue #1395) — no event to name a pull request
+						// or board item from; a resolve-problem dispatch names its task once claimed.
 						shared
 					: { ...shared, workItemNodeId: data.event.itemId, contentType: data.event.contentType },
 	);

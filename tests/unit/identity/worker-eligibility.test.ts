@@ -377,6 +377,21 @@ describe('evaluateWorkerEligibility', () => {
 		});
 	});
 
+	it('refuses Resolve problem on a CLI that cannot attach the SWARM MCP server (issue #1395)', () => {
+		const worker = makeWorker({ capabilities: ['claude', 'antigravity'] });
+		const enrollment = makeEnrollment({ allowedClis: ['claude', 'antigravity'] });
+		expect(
+			evaluate({ worker, enrollment, phase: 'resolve-problem', target: { cli: 'antigravity' } }),
+		).toEqual({ eligible: false, reason: 'missing-cli-capability' });
+		expect(
+			evaluate({ worker, enrollment, phase: 'resolve-problem', target: { cli: 'claude' } }),
+		).toEqual({ eligible: true });
+		// Every other phase still runs on Antigravity.
+		expect(
+			evaluate({ worker, enrollment, phase: 'review', target: { cli: 'antigravity' } }),
+		).toEqual({ eligible: true });
+	});
+
 	describe('a target that omits its cli falls back to the phase coded default', () => {
 		it('is eligible when the worker can run that default', () => {
 			expect(evaluate({ target: {}, phaseDefaultCli: 'codex' })).toEqual({ eligible: true });

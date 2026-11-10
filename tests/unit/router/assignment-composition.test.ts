@@ -153,3 +153,53 @@ describe('composeSystemPrompt', () => {
 		expect(prompt).toContain('ALWAYS run the widget linter.');
 	});
 });
+
+describe('the Resolve problem prompt (issue #1395)', () => {
+	const RESOLVE_PROBLEM: TriggerResult = {
+		phase: 'resolve-problem',
+		taskId: '407',
+		failedRunId: 'failed-run-1',
+		prNumber: '88',
+		failedRun: {
+			id: 'failed-run-1',
+			phase: 'review',
+			taskId: '88',
+			prNumber: '88',
+			error: 'Review agent (claude) exited with code 1',
+			failureDiagnosis: {
+				kind: 'review-provider-unreachable',
+				title: 'The provider failed',
+				message: 'GitHub answered 502.',
+				recovery: 'Retry once it is back.',
+			},
+		},
+	};
+
+	it('composes the prompt from the failed run, names this run and carries the custom prompt', () => {
+		const project = {
+			...PROJECT,
+			pipeline: { resolveProblem: { enabled: true, maxWriteActions: 3 } },
+		} as unknown as ProjectConfig;
+		const prompt = composeSystemPrompt(
+			project,
+			RESOLVE_PROBLEM,
+			'Page the on-call first.',
+			undefined,
+			'this-run',
+		);
+		expect(prompt).toContain('run failed-run-1');
+		expect(prompt).toContain('Review agent (claude) exited with code 1');
+		expect(prompt).toContain('GitHub answered 502.');
+		expect(prompt).toContain('filedByRunId: "this-run"');
+		expect(prompt).toContain('at most 3 real');
+		expect(prompt).toContain('Page the on-call first.');
+	});
+
+	it('refuses to compose without the run id its bug report must name', () => {
+		expect(() => composeSystemPrompt(PROJECT, RESOLVE_PROBLEM)).toThrow(/run id/);
+	});
+
+	it('names the base branch as its target: it has no branch of its own', () => {
+		expect(resolveTargetBranch(PROJECT, RESOLVE_PROBLEM)).toBe('main');
+	});
+});

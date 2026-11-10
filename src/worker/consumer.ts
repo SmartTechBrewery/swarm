@@ -98,6 +98,12 @@ import {
 	preservedCheckoutMachineUnknown,
 	preservedContinuationKind,
 } from '../dispatch/preserved-worker.js';
+import {
+	type ResolveProblemSkip,
+	resolveProblemTrigger,
+	revokeResolveProblemAccess,
+	verifyResolveProblemOutcome,
+} from '../dispatch/resolve-problem.js';
 import { derivePreRunPendingPayload, deriveRetryJobPayload } from '../dispatch/retry-payload.js';
 import {
 	admitTicket,
@@ -149,6 +155,11 @@ import {
 	runResolveConflictsCatchUp,
 	runResolveConflictsPhase,
 } from '../pipeline/resolve-conflicts.js';
+import {
+	type ResolveProblemReport,
+	runResolveProblem,
+	type SwarmMcpAccess,
+} from '../pipeline/resolve-problem.js';
 import { type RespondCiOutcome, runRespondToCiPhase } from '../pipeline/respond-to-ci.js';
 import { runRespondToReviewPhase } from '../pipeline/respond-to-review.js';
 import {
@@ -182,6 +193,7 @@ import {
 import {
 	type PhaseRecovery,
 	type PmWebhookJob,
+	type ResolveProblemJob,
 	repositoryForJob,
 	type ScmWebhookJob,
 	type SwarmJob,
@@ -2530,11 +2542,15 @@ interface PullRequestRef {
 }
 
 /** The trigger results that carry a pull request — the four PR-driven phases. */
-type PullRequestTrigger = Extract<TriggerResult, { prNumber: string }>;
+type PullRequestTrigger = Extract<TriggerResult, { prNumber: string; prBranch: string }>;
 
-/** The PR-driven half of a trigger, or `undefined` for a board-driven phase. */
+/**
+ * The PR-driven half of a trigger, or `undefined` for a board-driven phase — and for
+ * Resolve problem (issue #1395), which may *name* its failed run's pull request but
+ * never acts on it, so it must hold nothing keyed on one.
+ */
 function pullRequestTrigger(trigger: TriggerResult): PullRequestTrigger | undefined {
-	return 'prNumber' in trigger ? trigger : undefined;
+	return trigger.phase !== 'resolve-problem' && 'prNumber' in trigger ? trigger : undefined;
 }
 
 /**
@@ -2554,7 +2570,8 @@ function pullRequestRefForTrigger(
 /** What a claim resolved, for the two writers that normalize it onto the row. */
 function dispatchResolutionFor(project: ProjectConfig, trigger: TriggerResult): DispatchResolution {
 	return {
-		taskId: trigger.taskId,
+		// Never task-keyed (issue #1395): see `DispatchResolution.taskId`.
+		taskId: trigger.phase === 'resolve-problem' ? null : trigger.taskId,
 		phase: trigger.phase,
 		pullRequest: pullRequestRefForTrigger(project, trigger),
 	};
@@ -2996,6 +3013,12 @@ export interface PhaseRunResult {
 	 * waiting on it ({@link handBackWorkerBranchUpdate}). Absent for every other run.
 	 */
 	mergeCatchUp?: WorkerBranchUpdateOutcome;
+	/**
+	 * The report a Resolve problem run's agent handed back (issue #1395), which the
+	 * control plane verifies against the bug report the run filed before settling it
+	 * (`verifyResolveProblemOutcome`). Absent for every other run.
+	 */
+	resolveProblem?: ResolveProblemReport;
 }
 
 /**
@@ -3102,6 +3125,13 @@ export interface AssignedPhaseInputs {
 	 * (issue #1117, `runResolveConflictsCatchUp`) instead of a conflict resolution.
 	 */
 	catchUpOnly?: boolean;
+	/**
+	 * resolve-problem only (issue #1395): the prompt the control plane composed — it
+	 * holds the failed run's record, so the worker runs this text verbatim — and the
+	 * operator MCP endpoint with the run-bound token minted for this run.
+	 */
+	systemPrompt?: string;
+	swarmMcp?: SwarmMcpAccess;
 	/**
 	 * review / respond-to-review only: the resolved control-plane SCM delivery
 	 * provider (ADR-004 §2, {@link resolveScmDelivery}) or DB-free dispatch
@@ -3392,6 +3422,28 @@ export async function runAssignedPhase(inputs: AssignedPhaseInputs): Promise<Pha
 				signal,
 				runAgent,
 			});
+		case 'resolve-problem': {
+			if (inputs.systemPrompt === undefined || inputs.swarmMcp === undefined) {
+				throw new Error('resolve-problem phase requires systemPrompt and swarmMcp');
+			}
+			// No worktree and no session resume: the agent runs in a fresh scratch
+			// directory, which is what a CLI's session store keys on. The project's custom
+			// prompt is already part of the composed prompt.
+			const { agent, report } = await runResolveProblem({
+				taskId,
+				prompt: inputs.systemPrompt,
+				swarmMcp: inputs.swarmMcp,
+				cli,
+				model,
+				reasoning,
+				sessionId: session.sessionId,
+				runId,
+				timeoutMs,
+				signal,
+				runAgent,
+			});
+			return { agent, resolveProblem: report };
+		}
 	}
 }
 
@@ -3735,6 +3787,9 @@ async function reuseRunRow(
 		}
 		return tryResetCarriedRun(project, resolution, trigger, job, implementationUnplanned);
 	}
+	// Every Resolve problem attempt is its own row, linked to the run it is for (issue
+	// #1395): the latest one for the task may belong to another failed run entirely.
+	if (trigger.phase === 'resolve-problem') return undefined;
 	try {
 		return await tryReuseLatestRun(
 			project,
@@ -3825,7 +3880,11 @@ async function tryCreateRun(
 		implementationUnplanned,
 	);
 	if (reusedRunId) return reusedRunId;
-	const prNumber = 'prNumber' in trigger ? trigger.prNumber : undefined;
+	// A Resolve problem run records no pull request of its own (issue #1395): it acts
+	// on none, and every read keyed on `runs.pr_number` means "a run of that PR's
+	// pipeline". Its failed run, linked by `resolves_run_id`, names the PR.
+	const prNumber =
+		trigger.phase !== 'resolve-problem' && 'prNumber' in trigger ? trigger.prNumber : undefined;
 	try {
 		const overrides = agentOverrideFor(
 			project,
@@ -3849,7 +3908,12 @@ async function tryCreateRun(
 			// user half of the attribution record (ADR-004 §4, issue #398).
 			workerUserId: resolution.selection?.ownerUserId,
 			workerFencingToken: resolution.executionIdentity?.fencingToken,
-			workItemId: 'workItem' in trigger ? trigger.workItem.id : undefined,
+			workItemId:
+				'workItem' in trigger
+					? trigger.workItem.id
+					: trigger.phase === 'resolve-problem'
+						? trigger.workItemId
+						: undefined,
 			workItemTitle: 'workItem' in trigger ? trigger.workItem.title : undefined,
 			workItemUrl: 'workItem' in trigger && trigger.workItem.url ? trigger.workItem.url : undefined,
 			prNumber,
@@ -3859,6 +3923,9 @@ async function tryCreateRun(
 			reasoning: overrides.reasoning,
 			timeoutMs: overrides.timeoutMs,
 			jobPayload: job,
+			// The failed run this attempt is for (issue #1395) — what links the two on
+			// the run list and in either run's detail.
+			resolvesRunId: trigger.phase === 'resolve-problem' ? trigger.failedRunId : undefined,
 		});
 		job.agentSessionId = runId;
 		return runId;
@@ -4565,7 +4632,9 @@ export function phaseFailureCommentBody(
 	const lines = [
 		'## ⚠️ SWARM run failed',
 		'',
-		`The **${phase}** phase did not complete — no result was produced.`,
+		phase === 'resolve-problem'
+			? 'SWARM’s **Resolve problem** attempt on a failed run of this item did not get the pipeline moving again — a person needs to look.'
+			: `The **${phase}** phase did not complete — no result was produced.`,
 		'',
 		'```',
 		error,
@@ -4601,6 +4670,26 @@ async function reportPhaseFailureToBoardOrPr(
 ): Promise<void> {
 	try {
 		const body = phaseFailureCommentBody(trigger.phase, error, failureDiagnosis);
+		if (trigger.phase === 'resolve-problem') {
+			// The failed run's own item: its board card when it had one, else the pull
+			// request it acted on (issue #1395). The card is commented on, never moved.
+			if (trigger.workItemId) {
+				const commentId = await requireProjectPMProvider(project).addComment(
+					trigger.workItemId,
+					body,
+				);
+				logger.debug('Posted Resolve problem failure comment to the board item', {
+					projectId: project.id,
+					failedRunId: trigger.failedRunId,
+					workItemId: trigger.workItemId,
+					commentId,
+				});
+			} else if (trigger.prNumber) {
+				const scm = requireProjectSCMProvider(project);
+				await scm.commentOnPullRequest(project, Number(trigger.prNumber), body);
+			}
+			return;
+		}
 		if ('workItem' in trigger) {
 			const pm = requireProjectPMProvider(project);
 			const commentId = await pm.addComment(trigger.workItem.id, body);
@@ -4714,6 +4803,16 @@ export async function reportInterruptedJobToBoard(jobData: unknown, error: strin
 			logger.debug('Interrupted-job report: merge-automation dispatch — skipping comment', {
 				projectId: job.projectId,
 				prNumber: job.prNumber,
+			});
+			return;
+		}
+
+		// A Resolve problem dispatch (issue #1395) is about a failed run, and its outcome
+		// is on its own run row; a stalled attempt is not the work item's news.
+		if (job.type === 'resolve-problem') {
+			logger.debug('Interrupted-job report: resolve-problem dispatch — skipping comment', {
+				projectId: job.projectId,
+				failedRunId: job.failedRunId,
 			});
 			return;
 		}
@@ -4863,6 +4962,9 @@ async function resolveGatedWorkItem(
 	trigger: TriggerResult,
 ): Promise<WorkItem | undefined> {
 	if ('workItem' in trigger) return trigger.workItem;
+	// Resolve problem (issue #1395) acts on SWARM's record of a failed run, not on its
+	// work item, and a failed run had already passed these gates to exist at all.
+	if (trigger.phase === 'resolve-problem') return undefined;
 	const logContext = {
 		projectId: project.id,
 		phase: trigger.phase,
@@ -4894,6 +4996,36 @@ async function resolveGatedWorkItem(
 		});
 		return undefined;
 	}
+}
+
+/**
+ * Settles a Resolve problem dispatch whose failed run may not be worked on (issue
+ * #1395) — the project has not turned the phase on, the run is gone, or it is no
+ * longer `failed`. Nothing ran and nothing was claimed, so this is the skip the
+ * work-item gates settle with: a carried run is finalized with the reason, and the
+ * dispatch completes `skipped-not-eligible`.
+ */
+async function skipResolveProblemDispatch(
+	job: ResolveProblemJob,
+	dispatch: DispatchRow,
+	project: ProjectConfig,
+	skip: ResolveProblemSkip,
+): Promise<JobOutcome> {
+	logger.info('Resolve problem skipped', {
+		projectId: project.id,
+		failedRunId: job.failedRunId,
+		reason: skip.skip,
+	});
+	if (job.runId) {
+		await finalizeRun(job.runId, { status: 'failed', error: skip.skip });
+	}
+	await tryCompleteDispatch(dispatch.id, 'skipped-not-eligible');
+	return {
+		status: 'skipped-not-eligible',
+		phase: 'resolve-problem',
+		taskId: skip.taskId ?? job.failedRunId,
+		reason: skip.skip,
+	};
 }
 
 /**
@@ -6224,23 +6356,33 @@ async function processClaimedDispatch(
 		return processMergeAutomationDispatch(dispatch, job, project);
 	}
 
+	// A Resolve problem dispatch (issue #1395) names a failed run rather than an
+	// event, so no trigger handler resolves it: its inputs are read off that run, and
+	// a run that may not be worked on settles the dispatch as a skip, with the reason.
+	let trigger: TriggerResult;
 	// Where a handler records a decline the operator would read differently from
 	// "nothing matched" (issue #1019). Read only on the no-trigger path below, so a
 	// note left by a handler the registry then walked past is discarded with it.
 	let decline: TriggerDecline | undefined;
-	const ctx = buildTriggerContext(job, project, dispatch.id, (note) => {
-		decline = note;
-	});
-
-	const trigger = await registry.dispatch(ctx);
-	if (!trigger) {
-		logger.debug('Job matched no trigger — completing as a no-op', {
-			projectId: project.id,
-			source: ctx.source,
-			event: ctx.source === 'scm' ? ctx.event.kind : ctx.event.action,
-			deliveryId: job.deliveryId,
+	if (job.type === 'resolve-problem') {
+		const resolved = await resolveProblemTrigger(job, project);
+		if ('skip' in resolved) return skipResolveProblemDispatch(job, dispatch, project, resolved);
+		trigger = resolved;
+	} else {
+		const ctx = buildTriggerContext(job, project, dispatch.id, (note) => {
+			decline = note;
 		});
-		return settleNoTriggerDelivery(job, project, dispatch, decline);
+		const matched = await registry.dispatch(ctx);
+		if (!matched) {
+			logger.debug('Job matched no trigger — completing as a no-op', {
+				projectId: project.id,
+				source: ctx.source,
+				event: ctx.source === 'scm' ? ctx.event.kind : ctx.event.action,
+				deliveryId: job.deliveryId,
+			});
+			return settleNoTriggerDelivery(job, project, dispatch, decline);
+		}
+		trigger = matched;
 	}
 
 	// The pull request this phase acts on, resolved once: it is the key the PR-scoped
@@ -6367,7 +6509,14 @@ async function processClaimedDispatch(
 	//   deliberately distinct suffixed ids. A writing phase waits for the head branch;
 	//   a Review, which is pinned to a head SHA that phase is about to replace, is
 	//   dropped instead ({@link handlePullRequestInFlight}).
-	const taskClaim = await claimTaskForPhase(project, trigger, dispatch.id);
+	//
+	// Resolve problem (issue #1395) claims nothing here: it provisions no checkout and
+	// writes to no pull request, so it neither waits behind the task's phases nor
+	// holds them up — the failed run's task id it carries is not its own.
+	const taskClaim =
+		trigger.phase === 'resolve-problem'
+			? ({ claimed: true } as const)
+			: await claimTaskForPhase(project, trigger, dispatch.id);
 	if (!taskClaim.claimed) {
 		if (taskClaim.kind === 'pull-request') {
 			return handlePullRequestInFlight(dispatch, job, taskClaim.trigger, project, taskClaim.hold);
@@ -6622,6 +6771,17 @@ async function processClaimedDispatch(
 		// The phase itself logs the scannable `Phase finished - <label>` line (it
 		// carries the run's result — PR URL, verdict, …); this is just the
 		// orchestration-level echo, kept at debug so success shows one finish line.
+		// A Resolve problem run succeeds only on a `resolved` report backed by a bug
+		// report it filed (issue #1395) — read here, where the database is. Anything
+		// else throws a terminal failure carrying the summary and the actions tried,
+		// which the shared failure path records on the run and the board item.
+		if (trigger.phase === 'resolve-problem') {
+			await verifyResolveProblemOutcome({
+				runId,
+				report: result.resolveProblem,
+				agent: result.agent,
+			});
+		}
 		logger.debug('Job phase completed', {
 			projectId: project.id,
 			phase: trigger.phase,
@@ -6781,8 +6941,17 @@ async function processClaimedDispatch(
 		// left `leased`/`running`, so the woken dispatch's durable read no longer sees
 		// this one. Fully swallowed inside the promotion — a queue hiccup must never fail
 		// a settled run.
-		inFlightPhaseByTask.delete(trigger.taskId);
-		await promoteTaskInFlightWaits(project.id, trigger.taskId);
+		//
+		// Resolve problem took no task claim (see `claimTaskForPhase` above), so it has
+		// none to release — and deleting the entry would drop the real holder's. Its
+		// run-bound credential, though, is revoked at every settle, deferral included
+		// (a retry mints its own).
+		if (trigger.phase === 'resolve-problem') {
+			await revokeResolveProblemAccess(runId);
+		} else {
+			inFlightPhaseByTask.delete(trigger.taskId);
+			await promoteTaskInFlightWaits(project.id, trigger.taskId);
+		}
 		// The same move for the pull request's head branch (issue #850), placed here for
 		// the same reason: by now every settle path has left `leased`/`running`, so a
 		// woken writer's own read no longer sees this one. Only a *writing* phase can be

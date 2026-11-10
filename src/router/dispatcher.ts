@@ -57,6 +57,7 @@ import {
 	reconcileDispatchesAtStartup,
 	reconcileDispatchesPeriodically,
 } from '../dispatch/reconciler.js';
+import { mintResolveProblemAccess } from '../dispatch/resolve-problem.js';
 import {
 	recoverUnreviewedPullRequests,
 	UNREVIEWED_PR_SWEEP_INTERVAL_MS,
@@ -243,6 +244,9 @@ function prCoordinates(trigger: TriggerResult): TaskAssignmentPr | undefined {
 				// The hand-back's Review run stays here; the worker needs only the mode.
 				...(trigger.mergeCatchUp ? { catchUpOnly: true as const } : {}),
 			};
+		case 'resolve-problem':
+			// Acts on no pull request; the failed run's is in the composed prompt.
+			return undefined;
 	}
 }
 
@@ -477,6 +481,9 @@ export function adaptResultToPhaseRun(
 			// (issue #1117); absent from every run but a catch-up pass, and from an
 			// older worker's frame.
 			mergeCatchUp: result.mergeCatchUp,
+			// Feeds the Resolve problem settle (issue #1395), which checks it against the
+			// bug report the run filed; absent from every other run.
+			resolveProblem: result.resolveProblem,
 		};
 	}
 	if (result.status === 'failed') {
@@ -780,6 +787,36 @@ export async function resolveOperatorCredential(
 }
 
 /**
+ * The credentials an assignment carries. Every phase but one gets the selected
+ * worker's SCM identity (issue #765). Resolve problem (issue #1395) is the
+ * exception: it commits, pushes and comments nothing, so it needs no SCM identity —
+ * and must not wait on one, since a broken operator credential may be the very
+ * failure it was dispatched to look at. What it carries instead is the run-bound
+ * operator MCP credential minted for this run, the one per-run credential that
+ * reaches a worker (`TaskAssignment.swarmMcp`).
+ */
+async function resolveAssignmentCredentials(
+	context: DispatchPhaseContext,
+	selection: DispatchSelection,
+	timeoutMs: number,
+): Promise<{
+	operatorCredential?: string;
+	swarmMcp?: Awaited<ReturnType<typeof mintResolveProblemAccess>>;
+}> {
+	if (context.trigger.phase !== 'resolve-problem') {
+		return { operatorCredential: await resolveOperatorCredential(context.project, selection) };
+	}
+	return {
+		swarmMcp: await mintResolveProblemAccess({
+			project: context.project,
+			runId: context.runId,
+			holderUserId: selection.ownerUserId,
+			timeoutMs,
+		}),
+	};
+}
+
+/**
  * The control-plane `executePhase`: compose the assignment server-side, push it to
  * the selected worker, and await the worker's terminal result. Everything around
  * this — run-row lifecycle, dispatch settle, self-enqueue, merge automation — is
@@ -826,7 +863,11 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 	// which SCM provider the project targets (issue #765). A worker with no stored
 	// credential for that provider fails now, naming both — rather than a few seconds
 	// into the run with the provider's own generic identity error.
-	const operatorCredential = await resolveOperatorCredential(project, selection);
+	const { operatorCredential, swarmMcp } = await resolveAssignmentCredentials(
+		context,
+		selection,
+		timeoutMs,
+	);
 	const taskBranch = trigger.phase === 'implementation' ? job.taskBranch : undefined;
 	const commitSubject = await resolveAssignmentCommitSubject(project, trigger, job);
 
@@ -837,7 +878,7 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		phase: trigger.phase,
 		taskId: trigger.taskId,
 		targetBranch: resolveTargetBranch(project, trigger, taskBranch),
-		systemPrompt: composeSystemPrompt(project, trigger, customPrompt, taskBranch),
+		systemPrompt: composeSystemPrompt(project, trigger, customPrompt, taskBranch, runId),
 		customPrompt,
 		target: selection.target,
 		timeoutMs,
@@ -874,6 +915,7 @@ async function pushAndAwaitResult(context: DispatchPhaseContext): Promise<PhaseR
 		deliveredPullRequestUrl:
 			trigger.phase === 'implementation' ? job.deliveredPullRequestUrl : undefined,
 		operatorCredential,
+		swarmMcp,
 	});
 
 	// The claim already stopped any earlier attempt this dispatch's worker was lost
