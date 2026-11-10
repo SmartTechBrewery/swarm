@@ -23,8 +23,8 @@ import { z } from 'zod';
 
 import type { AgentConfig, AgentsConfig, AgentTarget } from '../../config/schema.js';
 import { findLatestOperatorAction } from '../../db/repositories/operatorActionsRepository.js';
-import type { SwarmUser } from '../../identity/schema.js';
 import { type ReorderResult, reorderTargets, restoreOrder, targetKey } from '../agent-order.js';
+import type { ToolContext } from '../tool-access.js';
 import type { SwarmCaller } from '../tool-helpers.js';
 import { registerWriteTool, type WriteToolPreview } from '../write-tool.js';
 import { AgentPhaseSchema } from './project-config.js';
@@ -142,9 +142,9 @@ async function applyOrder(caller: SwarmCaller, preview: OrderPreview) {
 	};
 }
 
-/** Register the phase-agent order tools on `server`, authorizing and auditing every call as `user`. */
-export function registerPhaseAgentTools(server: McpServer, user: SwarmUser): void {
-	registerWriteTool<typeof reorderInput, OrderPreview>(server, user, {
+/** Register the phase-agent order tools on `server`, authorizing and auditing every call as `context`'s user. */
+export function registerPhaseAgentTools(server: McpServer, context: ToolContext): void {
+	registerWriteTool<typeof reorderInput, OrderPreview>(server, context, {
 		name: REORDER_TOOL,
 		title: "Reorder a phase's agent targets",
 		description:
@@ -171,7 +171,7 @@ export function registerPhaseAgentTools(server: McpServer, user: SwarmUser): voi
 		apply: (_input, caller, preview) => applyOrder(caller, preview),
 	});
 
-	registerWriteTool<typeof phaseInput, OrderPreview>(server, user, {
+	registerWriteTool<typeof phaseInput, OrderPreview>(server, context, {
 		name: 'phase_agents_restore',
 		title: "Restore a phase's agent order",
 		description:

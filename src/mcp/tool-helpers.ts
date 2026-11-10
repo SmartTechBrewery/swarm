@@ -16,7 +16,8 @@
  * this internet-exposed surface, exactly as adding a namespace to
  * `../api/operator-router.ts` is for `/operator/trpc`.
  *
- * {@link runTool} turns a tool body's outcome into the MCP result shape: the value
+ * {@link runTool} first refuses a caller whose role ceiling is below the tool's
+ * `TOOL_ACCESS` role (`./tool-access.ts`, issue #1382) with `FORBIDDEN`, then turns a tool body's outcome into the MCP result shape: the value
  * as pretty-printed JSON text (what every client renders) plus the same value as
  * `structuredContent` when it is an object, and a refusal or failure as an
  * `isError` result rather than a JSON-RPC error, so the calling model sees the
@@ -31,6 +32,7 @@ import { createCallerFactory } from '../api/trpc.js';
 import type { SwarmUser } from '../identity/schema.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
+import { assertToolAccess, type ToolContext } from './tool-access.js';
 
 const createCaller = createCallerFactory(appRouter);
 
@@ -69,7 +71,9 @@ export function errorResult(message: string): CallToolResult {
 }
 
 /**
- * Run a tool body and map its outcome to an MCP result. A `TRPCError` is reported
+ * Run a tool body as `context`'s caller and map its outcome to an MCP result. A
+ * caller below the tool's `TOOL_ACCESS` role is refused with `FORBIDDEN` and the
+ * body never runs. A `TRPCError` is reported
  * verbatim as `<code>: <message>`, which is the same wording the dashboard shows —
  * whether it is the procedure's own refusal (`NOT_FOUND`, `FORBIDDEN`,
  * `PRECONDITION_FAILED`, …) or an internal error (`INTERNAL_SERVER_ERROR`, …), which
@@ -77,8 +81,13 @@ export function errorResult(message: string): CallToolResult {
  * never the request's bearer, which nothing here holds — and reported as its
  * described error.
  */
-export async function runTool(tool: string, body: () => Promise<unknown>): Promise<CallToolResult> {
+export async function runTool(
+	context: ToolContext,
+	tool: string,
+	body: () => Promise<unknown>,
+): Promise<CallToolResult> {
 	try {
+		assertToolAccess(tool, context.ceiling);
 		return jsonResult(await body());
 	} catch (error) {
 		return errorResult(describeToolFailure(tool, error).message);

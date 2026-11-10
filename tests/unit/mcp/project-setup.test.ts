@@ -59,7 +59,7 @@ const handlers = new Map<string, Handler>();
 const server = {
 	registerTool: (name: string, _config: unknown, handler: Handler) => handlers.set(name, handler),
 } as unknown as McpServer;
-registerProjectSetupTools(server, USER);
+registerProjectSetupTools(server, { user: USER, ceiling: 'instanceAdmin' });
 
 function call(tool: string, args: Record<string, unknown>): Promise<CallToolResult> {
 	const handler = handlers.get(tool);

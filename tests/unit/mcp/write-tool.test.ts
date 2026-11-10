@@ -21,6 +21,7 @@ vi.mock('@/lib/logger.js', async () => ({
 }));
 
 import type { SwarmUser } from '@/identity/schema.js';
+import type { ToolContext } from '@/mcp/tool-access.js';
 import { runWriteTool, type WriteToolDefinition } from '@/mcp/write-tool.js';
 
 const USER: SwarmUser = {
@@ -31,6 +32,13 @@ const USER: SwarmUser = {
 	createdAt: new Date('2026-01-01T00:00:00Z'),
 	updatedAt: new Date('2026-01-01T00:00:00Z'),
 };
+
+/**
+ * `thing_do` has no `TOOL_ACCESS` entry, so it is default-denied to everyone below
+ * an installation administrator; the framework's own behaviour is exercised at that
+ * ceiling, and the role refusal on its own below.
+ */
+const CONTEXT: ToolContext = { user: USER, ceiling: 'instanceAdmin' };
 
 const shape = { runId: z.string() };
 let preview: ReturnType<typeof vi.fn>;
@@ -62,7 +70,7 @@ beforeEach(() => {
 
 describe('runWriteTool', () => {
 	it('records the call as pending before acting, then settles it succeeded', async () => {
-		const result = await runWriteTool(definition(), USER, {
+		const result = await runWriteTool(definition(), CONTEXT, {
 			runId: 'run-1',
 			reason: 'wedged since yesterday',
 			dryRun: false,
@@ -108,7 +116,7 @@ describe('runWriteTool', () => {
 		};
 		preview.mockResolvedValue(previewed);
 
-		await runWriteTool(definition(), USER, { runId: 'run-1', reason: 'reorder', dryRun: false });
+		await runWriteTool(definition(), CONTEXT, { runId: 'run-1', reason: 'reorder', dryRun: false });
 
 		expect(apply).toHaveBeenCalledWith({ runId: 'run-1' }, expect.anything(), previewed);
 		expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
@@ -128,7 +136,7 @@ describe('runWriteTool', () => {
 			secretInputs: ['token'],
 		};
 
-		await runWriteTool(withSecret, USER, {
+		await runWriteTool(withSecret, CONTEXT, {
 			runId: 'run-1',
 			token: 'hunter2',
 			reason: 'rotate',
@@ -147,7 +155,7 @@ describe('runWriteTool', () => {
 	});
 
 	it('answers a dry run from the preview alone and never calls the write', async () => {
-		const result = await runWriteTool(definition(), USER, {
+		const result = await runWriteTool(definition(), CONTEXT, {
 			runId: 'run-1',
 			reason: 'checking first',
 			dryRun: true,
@@ -171,7 +179,7 @@ describe('runWriteTool', () => {
 		[''],
 		['   '],
 	])('refuses a blank reason %j, audited, touching nothing', async (reason) => {
-		const result = await runWriteTool(definition(), USER, {
+		const result = await runWriteTool(definition(), CONTEXT, {
 			runId: 'run-1',
 			reason,
 			dryRun: false,
@@ -189,6 +197,56 @@ describe('runWriteTool', () => {
 		});
 	});
 
+	// Issue #1382: a caller below the tool's TOOL_ACCESS role is refused after the row
+	// is written, so the refusal is audited, and before the preview, so it learns nothing.
+	it.each([
+		[
+			'an unlisted tool, default-denied',
+			definition(),
+			'projectAdmin' as const,
+			'installation administrator',
+		],
+		[
+			'a member-only tool',
+			{ ...definition(), name: 'run_reset' },
+			'contributor' as const,
+			'member role',
+		],
+	])('refuses %s to a caller below its role, audited, touching nothing', async (_, tool, ceiling, needs) => {
+		const result = await runWriteTool(
+			tool,
+			{ user: USER, ceiling },
+			{
+				runId: 'run-1',
+				reason: 'r',
+				dryRun: true,
+			},
+		);
+
+		expect(result.isError).toBe(true);
+		expect(text(result)).toMatch(/^FORBIDDEN: Tool ".+" needs /);
+		expect(text(result)).toContain(needs);
+		expect(preview).not.toHaveBeenCalled();
+		expect(apply).not.toHaveBeenCalled();
+		expect(recordOperatorAction).toHaveBeenCalledTimes(1);
+		expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
+			outcome: 'refused',
+			error: expect.stringMatching(/^FORBIDDEN: /),
+			projectId: null,
+		});
+	});
+
+	it('runs a listed tool for a caller at exactly its role', async () => {
+		const result = await runWriteTool(
+			{ ...definition(), name: 'run_reset' },
+			{ user: USER, ceiling: 'member' },
+			{ runId: 'run-1', reason: 'r', dryRun: false },
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(apply).toHaveBeenCalled();
+	});
+
 	// The preview is the authorization: a denial there must stop the write, and a dry
 	// run must not get past it either.
 	it.each([
@@ -199,7 +257,11 @@ describe('runWriteTool', () => {
 			new TRPCError({ code: 'FORBIDDEN', message: 'You do not have permission.' }),
 		);
 
-		const result = await runWriteTool(definition(), USER, { runId: 'run-1', reason: 'r', dryRun });
+		const result = await runWriteTool(definition(), CONTEXT, {
+			runId: 'run-1',
+			reason: 'r',
+			dryRun,
+		});
 
 		expect(result.isError).toBe(true);
 		expect(text(result)).toBe('FORBIDDEN: You do not have permission.');
@@ -214,7 +276,7 @@ describe('runWriteTool', () => {
 	it("audits the write's own refusal with the project the preview resolved", async () => {
 		apply.mockRejectedValue(new TRPCError({ code: 'CONFLICT', message: 'Already retrying.' }));
 
-		const result = await runWriteTool(definition(), USER, {
+		const result = await runWriteTool(definition(), CONTEXT, {
 			runId: 'run-1',
 			reason: 'r',
 			dryRun: false,
@@ -231,7 +293,7 @@ describe('runWriteTool', () => {
 	it('audits an unexpected throw as failed', async () => {
 		apply.mockRejectedValue(new Error('connection reset'));
 
-		const result = await runWriteTool(definition(), USER, {
+		const result = await runWriteTool(definition(), CONTEXT, {
 			runId: 'run-1',
 			reason: 'r',
 			dryRun: false,
@@ -256,7 +318,7 @@ describe('runWriteTool', () => {
 			}),
 		);
 
-		const result = await runWriteTool(definition(), USER, {
+		const result = await runWriteTool(definition(), CONTEXT, {
 			runId: 'run-1',
 			reason: 'r',
 			dryRun: false,
@@ -282,7 +344,7 @@ describe('runWriteTool', () => {
 			}),
 		);
 
-		const result = await runWriteTool(definition(), USER, {
+		const result = await runWriteTool(definition(), CONTEXT, {
 			runId: 'run-1',
 			reason: 'r',
 			dryRun: true,
@@ -302,7 +364,7 @@ describe('runWriteTool', () => {
 			new TRPCError({ code: 'PRECONDITION_FAILED', message: 'Not retryable.' }),
 		);
 
-		await runWriteTool(definition(), USER, { runId: 'run-1', reason: 'r', dryRun: false });
+		await runWriteTool(definition(), CONTEXT, { runId: 'run-1', reason: 'r', dryRun: false });
 
 		expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
 			outcome: 'refused',
@@ -314,7 +376,7 @@ describe('runWriteTool', () => {
 	it('does nothing at all when the audit row cannot be written', async () => {
 		recordOperatorAction.mockRejectedValue(new Error('db down'));
 
-		const result = await runWriteTool(definition(), USER, {
+		const result = await runWriteTool(definition(), CONTEXT, {
 			runId: 'run-1',
 			reason: 'r',
 			dryRun: false,
@@ -331,7 +393,7 @@ describe('runWriteTool', () => {
 	it('still returns the real result when the audit row cannot be settled', async () => {
 		settleOperatorAction.mockRejectedValue(new Error('db blip'));
 
-		const result = await runWriteTool(definition(), USER, {
+		const result = await runWriteTool(definition(), CONTEXT, {
 			runId: 'run-1',
 			reason: 'r',
 			dryRun: false,

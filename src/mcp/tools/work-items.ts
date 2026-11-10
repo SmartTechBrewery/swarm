@@ -16,7 +16,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import type { SwarmUser } from '../../identity/schema.js';
+import type { ToolContext } from '../tool-access.js';
 import { registerWriteTool } from '../write-tool.js';
 
 const closeInput = {
@@ -28,9 +28,9 @@ const closeInput = {
 	prNumber: z.number().int().positive().describe('The merged pull request number.'),
 };
 
-/** Register the work-item write tools on `server`, authorizing and auditing every call as `user`. */
-export function registerWorkItemTools(server: McpServer, user: SwarmUser): void {
-	registerWriteTool(server, user, {
+/** Register the work-item write tools on `server`, authorizing and auditing every call as `context`'s user. */
+export function registerWorkItemTools(server: McpServer, context: ToolContext): void {
+	registerWriteTool(server, context, {
 		name: 'work_item_close',
 		title: 'Close the work item behind a merged pull request',
 		description:

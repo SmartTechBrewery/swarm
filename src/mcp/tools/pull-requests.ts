@@ -12,7 +12,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import { PullRequestStatusInputSchema } from '../../api/routers/runs.js';
-import type { SwarmUser } from '../../identity/schema.js';
+import type { ToolContext } from '../tool-access.js';
 import { callerFor, runTool } from '../tool-helpers.js';
 
 /** `runs.prStatus`'s own input fields, re-used so the tool accepts exactly what it does. */
@@ -24,8 +24,8 @@ const prStatusInput = {
 	prNumber: PullRequestStatusInputSchema.shape.prNumber.describe('The pull request number.'),
 };
 
-/** Register the pull-request read tools on `server`, authorizing every call as `user`. */
-export function registerPullRequestTools(server: McpServer, user: SwarmUser): void {
+/** Register the pull-request read tools on `server`, authorizing every call as `context`'s user. */
+export function registerPullRequestTools(server: McpServer, context: ToolContext): void {
 	server.registerTool(
 		'pr_status',
 		{
@@ -41,6 +41,6 @@ export function registerPullRequestTools(server: McpServer, user: SwarmUser): vo
 			inputSchema: prStatusInput,
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
-		(input) => runTool('pr_status', () => callerFor(user).runs.prStatus(input)),
+		(input) => runTool(context, 'pr_status', () => callerFor(context.user).runs.prStatus(input)),
 	);
 }

@@ -14,7 +14,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import { ConsistencyCheckInputSchema } from '../../api/routers/runs.js';
-import type { SwarmUser } from '../../identity/schema.js';
+import type { ToolContext } from '../tool-access.js';
 import { callerFor, runTool } from '../tool-helpers.js';
 
 /** `runs.consistencyCheck`'s own input fields, re-used so the tool accepts exactly what it does. */
@@ -26,8 +26,8 @@ const consistencyCheckInput = {
 	),
 };
 
-/** Register the consistency-check tool on `server`, authorizing every call as `user`. */
-export function registerConsistencyTools(server: McpServer, user: SwarmUser): void {
+/** Register the consistency-check tool on `server`, authorizing every call as `context`'s user. */
+export function registerConsistencyTools(server: McpServer, context: ToolContext): void {
 	server.registerTool(
 		'consistency_check',
 		{
@@ -45,6 +45,9 @@ export function registerConsistencyTools(server: McpServer, user: SwarmUser): vo
 			inputSchema: consistencyCheckInput,
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
-		(input) => runTool('consistency_check', () => callerFor(user).runs.consistencyCheck(input)),
+		(input) =>
+			runTool(context, 'consistency_check', () =>
+				callerFor(context.user).runs.consistencyCheck(input),
+			),
 	);
 }

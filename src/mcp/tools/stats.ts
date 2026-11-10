@@ -10,7 +10,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import { PipelineStatsInputFields } from '../../api/routers/runs.js';
-import type { SwarmUser } from '../../identity/schema.js';
+import type { ToolContext } from '../tool-access.js';
 import { callerFor, runTool } from '../tool-helpers.js';
 
 /** `runs.stats`'s own input fields, re-used so the tool accepts exactly what it does. */
@@ -24,8 +24,8 @@ const pipelineStatsInput = {
 	),
 };
 
-/** Register the statistics tools on `server`, authorizing every call as `user`. */
-export function registerStatsTools(server: McpServer, user: SwarmUser): void {
+/** Register the statistics tools on `server`, authorizing every call as `context`'s user. */
+export function registerStatsTools(server: McpServer, context: ToolContext): void {
 	server.registerTool(
 		'pipeline_stats',
 		{
@@ -40,6 +40,6 @@ export function registerStatsTools(server: McpServer, user: SwarmUser): void {
 			inputSchema: pipelineStatsInput,
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
-		(input) => runTool('pipeline_stats', () => callerFor(user).runs.stats(input)),
+		(input) => runTool(context, 'pipeline_stats', () => callerFor(context.user).runs.stats(input)),
 	);
 }

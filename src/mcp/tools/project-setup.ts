@@ -33,10 +33,10 @@ import { z } from 'zod';
 
 import { ProjectCreateInputSchema, ProjectUpdateInputSchema } from '../../api/routers/projects.js';
 import { ProjectPmSchema } from '../../config/schema.js';
-import type { SwarmUser } from '../../identity/schema.js';
 import { PmProviderIdSchema } from '../../pm/events.js';
 import { PM_STATUS_KEYS } from '../../pm/pipeline.js';
 import { PM_TYPES, type PMType } from '../../pm/types.js';
+import type { ToolContext } from '../tool-access.js';
 import { callerFor, runTool, type SwarmCaller } from '../tool-helpers.js';
 import { registerWriteTool } from '../write-tool.js';
 
@@ -207,8 +207,8 @@ function pmProviderId(providerId: string | undefined): PMType | undefined {
 	return parsed.data;
 }
 
-/** Register the project set-up tools on `server`, authorizing (and auditing writes) as `user`. */
-export function registerProjectSetupTools(server: McpServer, user: SwarmUser): void {
+/** Register the project set-up tools on `server`, authorizing (and auditing writes) as `context`'s user. */
+export function registerProjectSetupTools(server: McpServer, context: ToolContext): void {
 	server.registerTool(
 		'project_get',
 		{
@@ -223,8 +223,8 @@ export function registerProjectSetupTools(server: McpServer, user: SwarmUser): v
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
 		({ projectId }) =>
-			runTool('project_get', async () => {
-				const caller = callerFor(user);
+			runTool(context, 'project_get', async () => {
+				const caller = callerFor(context.user);
 				const project = await caller.projects.getById({ id: projectId });
 				const [scm, pm] = await Promise.all([
 					caller.projects.credentials.list({ projectId }),
@@ -249,8 +249,8 @@ export function registerProjectSetupTools(server: McpServer, user: SwarmUser): v
 			annotations: { readOnlyHint: true, openWorldHint: true },
 		},
 		({ projectId, providerId, containerId, discoveryDraft }) =>
-			runTool('pm_board_discover', async () => {
-				const caller = callerFor(user);
+			runTool(context, 'pm_board_discover', async () => {
+				const caller = callerFor(context.user);
 				const provider = pmProviderId(providerId);
 				if (containerId) {
 					const result = await caller.pm.discoverStates({
@@ -285,10 +285,12 @@ export function registerProjectSetupTools(server: McpServer, user: SwarmUser): v
 			annotations: { readOnlyHint: true, openWorldHint: true },
 		},
 		({ projectId }) =>
-			runTool('project_readiness', () => callerFor(user).projects.readiness({ projectId })),
+			runTool(context, 'project_readiness', () =>
+				callerFor(context.user).projects.readiness({ projectId }),
+			),
 	);
 
-	registerWriteTool(server, user, {
+	registerWriteTool(server, context, {
 		name: 'project_create',
 		title: 'Create a project',
 		description:
@@ -315,7 +317,7 @@ export function registerProjectSetupTools(server: McpServer, user: SwarmUser): v
 		apply: (input, caller) => caller.projects.create(input),
 	});
 
-	registerWriteTool(server, user, {
+	registerWriteTool(server, context, {
 		name: 'project_update',
 		title: "Update a project's configuration",
 		description:
@@ -337,7 +339,7 @@ export function registerProjectSetupTools(server: McpServer, user: SwarmUser): v
 			caller.projects.update({ ...fields, id: projectId }),
 	});
 
-	registerWriteTool(server, user, {
+	registerWriteTool(server, context, {
 		name: 'pm_board_set',
 		title: "Connect a project's PM board and map its statuses",
 		description:
@@ -356,7 +358,7 @@ export function registerProjectSetupTools(server: McpServer, user: SwarmUser): v
 		apply: ({ projectId, pm }, caller) => caller.projects.update({ id: projectId, pm }),
 	});
 
-	registerWriteTool(server, user, {
+	registerWriteTool(server, context, {
 		name: 'project_credential_set',
 		title: "Set or replace a project's credential",
 		description:

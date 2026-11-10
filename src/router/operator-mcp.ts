@@ -18,19 +18,26 @@
  * resolves (unknown, expired or revoked), is answered `401` before any MCP message
  * is read.
  *
- * **Authorization: installation administrators only, for now** (issue #1362).
- * Whatever the credential, a caller {@link MAY_USE_OPERATOR_MCP} denies is answered
- * `403` before any MCP message is read. Opening the endpoint to other users is a
- * later, separate decision that needs an authorization review of every tool.
+ * **Authorization: every signed-in user, then per tool and per project** (issue
+ * #1382). Whatever the credential, a caller {@link MAY_USE_OPERATOR_MCP} denies is
+ * answered `403` before any MCP message is read — today that map admits every
+ * installation role, and the check stays so a role added later has to decide.
+ * Past it, the caller's *role ceiling* (their highest project role, or
+ * installation admin) decides which tools `tools/list` shows and which may be
+ * called (`TOOL_ACCESS`, `../mcp/tool-access.ts`), and each call is authorized per
+ * project by the dashboard procedure the tool wraps. Agent access tokens are still
+ * issued to installation administrators only (`MAY_USE_AGENT_ACCESS_TOKENS`), so a
+ * non-admin connects with their `swarm login` session.
  * **`SWARM_SINGLE_USER_MODE` is deliberately not honoured**, for the reason
  * `./operator-api.ts` gives: on an internet-reachable process it would make anyone
  * who found the URL an installation admin. Nothing in this module reads that
  * variable, and nothing should start.
  *
- * **Behind that gate, authorization is exactly the dashboard's.** Every tool calls
+ * **Behind those gates, authorization is exactly the dashboard's.** Every tool calls
  * the dashboard's own tRPC procedure as the resolved user (`../mcp/tool-helpers.ts`),
  * so a bearer caller reads exactly what the same user reads in the browser, with
- * exactly their project roles.
+ * exactly their project roles: a project they are not a member of reads as
+ * `NOT_FOUND`, and a cross-project list holds only the projects they may read.
  *
  * **Stateless Streamable HTTP.** Each `POST` builds a fresh server and transport for
  * the resolved user, answers with plain JSON (`enableJsonResponse`), and closes both
@@ -39,6 +46,7 @@
  * and no session to end (`DELETE`), so every method but `POST` is `405`.
  */
 
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import type { Hono } from 'hono';
 
@@ -53,6 +61,7 @@ import { type InstallationRole, installationRoleFor, type SwarmUser } from '../i
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { createSwarmMcpServer } from '../mcp/server.js';
+import { mcpCeilingFor } from '../mcp/tool-access.js';
 import { resolveOperatorBearer } from './operator-session.js';
 
 /** The path the operator MCP server is served at. Kept as one constant so the mount and the docs agree. */
@@ -69,14 +78,15 @@ export interface OperatorMcpDeps {
 }
 
 /**
- * Who may use the operator MCP server at all — **installation administrators
- * only, for now** (issue #1362), whichever credential they present. Total over
+ * Who may connect to the operator MCP server at all, whichever credential they
+ * present — **every signed-in user** since issue #1382, which moved the decision to
+ * each tool (`TOOL_ACCESS`, `../mcp/tool-access.ts`). Total over
  * {@link InstallationRole}, so a role added later has to take this decision rather
- * than inherit one. Widening it is the separate decision the module comment names.
+ * than inherit one.
  */
 export const MAY_USE_OPERATOR_MCP: Record<InstallationRole, boolean> = {
 	instanceAdmin: true,
-	user: false,
+	user: true,
 };
 
 /**
@@ -91,22 +101,22 @@ async function resolveBearerUser(
 }
 
 /**
- * Serve one MCP request as an already-authorized `user`: a fresh server and
- * transport, torn down once the JSON reply has settled. The mount below runs the
- * credential and role gates first; exported so the tools' own per-user
- * authorization can be exercised for any user, including roles the gate refuses
- * today.
+ * Serve one MCP request as an already-authenticated `user`: their role ceiling,
+ * read once, then a fresh server and transport, torn down once the JSON reply has
+ * settled. The mount below runs the credential and installation-role gates first;
+ * exported so the tools' own per-user authorization can be exercised directly.
  */
 export async function serveOperatorMcpRequest(
 	user: SwarmUser,
 	request: Request,
 ): Promise<Response> {
-	const server = createSwarmMcpServer(user);
-	const transport = new WebStandardStreamableHTTPServerTransport({
-		sessionIdGenerator: undefined,
-		enableJsonResponse: true,
-	});
+	let server: McpServer | undefined;
 	try {
+		server = createSwarmMcpServer({ user, ceiling: await mcpCeilingFor(user) });
+		const transport = new WebStandardStreamableHTTPServerTransport({
+			sessionIdGenerator: undefined,
+			enableJsonResponse: true,
+		});
 		await server.connect(transport);
 		return await transport.handleRequest(request);
 	} catch (error) {
@@ -118,7 +128,7 @@ export async function serveOperatorMcpRequest(
 	} finally {
 		// JSON-response mode has settled every reply by the time `handleRequest`
 		// returns, so the per-request server can be torn down here.
-		await server.close().catch(() => undefined);
+		await server?.close().catch(() => undefined);
 	}
 }
 
@@ -137,10 +147,7 @@ export function registerOperatorMcp(app: Hono, overrides: Partial<OperatorMcpDep
 			return c.json({ error: 'Unauthorized' }, 401);
 		}
 		if (!MAY_USE_OPERATOR_MCP[installationRoleFor(user)]) {
-			return c.json(
-				{ error: 'Forbidden: the MCP server is open to installation administrators only' },
-				403,
-			);
+			return c.json({ error: 'Forbidden: your installation role may not use the MCP server' }, 403);
 		}
 		if (c.req.method !== 'POST') {
 			c.header('Allow', 'POST');

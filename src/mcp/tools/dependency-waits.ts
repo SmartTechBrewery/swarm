@@ -15,16 +15,16 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 
 import { DependencyWaitsInputSchema } from '../../api/routers/runs.js';
-import type { SwarmUser } from '../../identity/schema.js';
+import type { ToolContext } from '../tool-access.js';
 import { registerWriteTool } from '../write-tool.js';
 
 const dependencyWaitsInput = {
 	projectId: DependencyWaitsInputSchema.shape.projectId.describe('The project id.'),
 };
 
-/** Register the dependency-wait tools on `server`, authorizing and auditing every call as `user`. */
-export function registerDependencyWaitTools(server: McpServer, user: SwarmUser): void {
-	registerWriteTool(server, user, {
+/** Register the dependency-wait tools on `server`, authorizing and auditing every call as `context`'s user. */
+export function registerDependencyWaitTools(server: McpServer, context: ToolContext): void {
+	registerWriteTool(server, context, {
 		name: 'dependency_waits_wake',
 		title: "Wake a project's dependency-waiting dispatches",
 		description:

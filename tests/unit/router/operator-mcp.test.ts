@@ -109,9 +109,11 @@ vi.mock('@/integrations/pm/registry.js', async () => ({
 	)),
 	requireProjectPMProvider,
 }));
-const { getMembership, listAccessibleProjectIds } = vi.hoisted(() => ({
+const { getMembership, listAccessibleProjectIds, listProjectsForUser } = vi.hoisted(() => ({
 	getMembership: vi.fn(),
 	listAccessibleProjectIds: vi.fn(),
+	// The caller's role ceiling (issue #1382) is their highest membership.
+	listProjectsForUser: vi.fn(),
 }));
 vi.mock('@/identity/membership-service.js', async () => ({
 	...(await vi.importActual<typeof import('@/identity/membership-service.js')>(
@@ -119,6 +121,7 @@ vi.mock('@/identity/membership-service.js', async () => ({
 	)),
 	getMembership,
 	listAccessibleProjectIds,
+	listProjectsForUser,
 }));
 const {
 	getActiveDispatchByRunId,
@@ -229,13 +232,14 @@ vi.mock('@/db/repositories/workerCliRateLimitsRepository.js', async () => ({
 }));
 
 import { REVIEW_VERDICT_CAP } from '@/db/repositories/reviewVerdictsRepository.js';
+import type { ProjectRole } from '@/identity/membership.js';
 import type { SwarmUser } from '@/identity/schema.js';
 import { enableLogRingBuffer, logger } from '@/lib/logger.js';
+import { TOOL_ACCESS } from '@/mcp/tool-access.js';
 import {
 	MAY_USE_OPERATOR_MCP,
 	type OperatorMcpDeps,
 	registerOperatorMcp,
-	serveOperatorMcpRequest,
 } from '@/router/operator-mcp.js';
 import {
 	createMockPmWebhookJob,
@@ -257,15 +261,42 @@ function user(id: string, identifier: string, instanceAdmin: boolean): SwarmUser
 
 const ADMIN = user('11111111-1111-4111-8111-111111111111', 'admin@example.com', true);
 const MEMBER = user('22222222-2222-4222-8222-222222222222', 'member@example.com', false);
+/**
+ * A stranger to `proj-a`, but `projectAdmin` of another project (`proj-z`): their
+ * role ceiling reaches every listed tool (issue #1382), so what they are refused on
+ * `proj-a` is the procedure's own existence-hiding `NOT_FOUND`, not the tool's role.
+ */
 const STRANGER = user('33333333-3333-4333-8333-333333333333', 'stranger@example.com', false);
 /** Holds `member` on `proj-a` — the role that may drive its runs. (`MEMBER` is a contributor.) */
 const DRIVER = user('66666666-6666-4666-8666-666666666666', 'driver@example.com', false);
+/** Holds `projectAdmin` on `proj-a`. */
+const PROJECT_ADMIN = user('99999999-9999-4999-8999-999999999999', 'padmin@example.com', false);
+/** Signed in, with no project membership at all. */
+const NOBODY = user('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'nobody@example.com', false);
 const TOKENS: Record<string, SwarmUser> = {
 	'admin-token': ADMIN,
 	'member-token': MEMBER,
 	'stranger-token': STRANGER,
 	'driver-token': DRIVER,
+	'project-admin-token': PROJECT_ADMIN,
+	'nobody-token': NOBODY,
 };
+
+/** Every project membership the fixtures hold; the membership-service mocks read it. */
+const MEMBERSHIPS: Array<{ userId: string; projectId: string; role: ProjectRole }> = [
+	{ userId: MEMBER.id, projectId: 'proj-a', role: 'contributor' },
+	{ userId: DRIVER.id, projectId: 'proj-a', role: 'member' },
+	{ userId: PROJECT_ADMIN.id, projectId: 'proj-a', role: 'projectAdmin' },
+	{ userId: STRANGER.id, projectId: 'proj-z', role: 'projectAdmin' },
+];
+
+function membershipsOf(userId: string) {
+	return MEMBERSHIPS.filter((row) => row.userId === userId).map((row, index) => ({
+		id: `m-${row.projectId}-${index}`,
+		...row,
+		createdAt: new Date(0),
+	}));
+}
 
 const RUN_ID = '44444444-4444-4444-8444-444444444444';
 const OTHER_PROJECT_RUN_ID = '55555555-5555-4555-8555-555555555555';
@@ -371,16 +402,12 @@ async function rpc(method: string, params: Record<string, unknown>, token?: stri
 }
 
 /**
- * A tool call made **behind** the endpoint's admin-only gate, as the token's user.
- * The gate refuses non-admins today (issue #1362), but each tool's own per-user
- * authorization is what a later decision to open MCP rests on, so it stays
- * exercised for members and strangers here.
+ * A tool call through the real mount as the token's user — open to every signed-in
+ * user since issue #1382, so each tool's per-tool role and the procedure's own
+ * per-project authorization are what is exercised.
  */
 async function callTool(name: string, args: Record<string, unknown>, token: string) {
-	const response = await serveOperatorMcpRequest(
-		TOKENS[token],
-		rpcRequest('tools/call', { name, arguments: args }, token),
-	);
+	const response = await rpc('tools/call', { name, arguments: args }, token);
 	expect(response.status).toBe(200);
 	const body = (await response.json()) as { result: ToolResult };
 	return body.result;
@@ -415,19 +442,16 @@ beforeEach(() => {
 	getMembership
 		.mockReset()
 		.mockImplementation(async (userId: string, projectId: string) =>
-			projectId !== 'proj-a'
-				? undefined
-				: userId === MEMBER.id
-					? { id: 'm1', userId, projectId, role: 'contributor', createdAt: new Date(0) }
-					: userId === DRIVER.id
-						? { id: 'm2', userId, projectId, role: 'member', createdAt: new Date(0) }
-						: undefined,
+			membershipsOf(userId).find((row) => row.projectId === projectId),
 		);
 	listAccessibleProjectIds
 		.mockReset()
 		.mockImplementation(async (userId: string) =>
-			userId === MEMBER.id || userId === DRIVER.id ? ['proj-a'] : [],
+			membershipsOf(userId).map((row) => row.projectId),
 		);
+	listProjectsForUser
+		.mockReset()
+		.mockImplementation(async (userId: string) => membershipsOf(userId));
 	listDashboardWorkers.mockReset().mockResolvedValue([workerRow(WORKER_ID, 'idle-box', [])]);
 	listProjectWorkerIdsInOrder.mockReset().mockResolvedValue([]);
 	listWorkerProjectCapacity.mockReset().mockResolvedValue(CAPACITY);
@@ -502,22 +526,30 @@ describe('operator MCP — the bearer gate', () => {
 		expect(resolveAgentAccessToken).not.toHaveBeenCalled();
 	});
 
-	// Issue #1362: MCP is admin-only for now, whatever the credential — opening it to
-	// other users needs an authorization review of every tool first.
+	// Issue #1382 lifted #1362's admins-only gate: whatever the credential, every
+	// signed-in user connects, and each tool decides who may use it.
 	it.each([
-		['a `swarm login` session', 'member-token'],
-		['an agent access token', 'member-agent-token'],
-		['a stranger session', 'stranger-token'],
-	])('refuses a non-admin presenting %s with 403, before any MCP handling', async (_, token) => {
+		['a contributor `swarm login` session', 'member-token', ['proj-a']],
+		['a contributor agent access token', 'member-agent-token', ['proj-a']],
+		['a session with no membership', 'nobody-token', []],
+	])('serves a non-admin presenting %s, scoped to their projects', async (_, token, projectIds) => {
 		const response = await rpc('tools/call', { name: 'runs_list', arguments: {} }, token);
 
-		expect(response.status).toBe(403);
-		expect(listRunsFromDb).not.toHaveBeenCalled();
-		expect(listAccessibleProjectIds).not.toHaveBeenCalled();
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as { result: ToolResult };
+		if (projectIds.length > 0) {
+			expect(body.result.isError).toBeUndefined();
+			expect(listRunsFromDb).toHaveBeenCalledWith(expect.objectContaining({ projectIds }));
+		} else {
+			// No membership: `runs_list` needs a contributor, so it is refused before any read.
+			expect(body.result.isError).toBe(true);
+			expect(body.result.content[0]?.text).toMatch(/^FORBIDDEN: Tool "runs_list" needs /);
+			expect(listRunsFromDb).not.toHaveBeenCalled();
+		}
 	});
 
-	it('decides MCP access per installation role, admins only', () => {
-		expect(MAY_USE_OPERATOR_MCP).toEqual({ instanceAdmin: true, user: false });
+	it('opens MCP to every installation role', () => {
+		expect(MAY_USE_OPERATOR_MCP).toEqual({ instanceAdmin: true, user: true });
 	});
 
 	// Same reasoning as `/operator/trpc`: the branch that is safe on the loopback API
@@ -625,6 +657,86 @@ describe('operator MCP — the handshake', () => {
 		expect(tools.find((tool) => tool.name === 'run_reset')?.annotations?.destructiveHint).toBe(
 			true,
 		);
+	});
+});
+
+/** The tool names `tools/list` shows the token's user. */
+async function listedTools(token: string): Promise<string[]> {
+	const response = await rpc('tools/list', {}, token);
+	expect(response.status).toBe(200);
+	const body = (await response.json()) as { result: { tools: Array<{ name: string }> } };
+	return body.result.tools.map((tool) => tool.name).sort();
+}
+
+const ALL_TOOLS = Object.keys(TOOL_ACCESS).sort();
+const CONTRIBUTOR_TOOLS = [
+	'cli_rate_limit_set',
+	'cli_rate_limits',
+	'consistency_check',
+	'control_plane_logs',
+	'dispatch_history',
+	'phase_agents_get',
+	'pipeline_snapshot',
+	'pipeline_stats',
+	'pr_status',
+	'project_create',
+	'project_get',
+	'run_get',
+	'runs_list',
+	'workers_state',
+];
+const MEMBER_TOOLS = [
+	...CONTRIBUTOR_TOOLS,
+	'dependency_waits_wake',
+	'dispatch_redispatch_now',
+	'pr_force_re_review',
+	'pr_recheck_mergeability',
+	'run_reset',
+	'work_item_close',
+].sort();
+
+describe('operator MCP — per-tool roles (issue #1382)', () => {
+	it.each([
+		['an instance admin', 'admin-token', ALL_TOOLS],
+		['a projectAdmin', 'project-admin-token', ALL_TOOLS],
+		['a member', 'driver-token', MEMBER_TOOLS],
+		['a contributor', 'member-token', CONTRIBUTOR_TOOLS],
+		['a user with no membership', 'nobody-token', ['cli_rate_limit_set', 'project_create']],
+	])('lists to %s only the tools their highest role reaches', async (_, token, expected) => {
+		expect(await listedTools(token)).toEqual(expected);
+	});
+
+	// The ceiling is the highest role on *any* project: a projectAdmin elsewhere is
+	// shown every listed tool, and the procedure still hides `proj-a` from them.
+	it('takes the highest role across projects as the ceiling', async () => {
+		expect(await listedTools('stranger-token')).toEqual(ALL_TOOLS);
+	});
+
+	it('refuses a direct call to a hidden write tool with FORBIDDEN and audits it as refused', async () => {
+		const result = await callTool('run_reset', { runId: RUN_ID, reason: 'trying' }, 'member-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toBe(
+			'FORBIDDEN: Tool "run_reset" needs at least the member role on some project, which you do not hold.',
+		);
+		expect(getRunByIdFromDb).not.toHaveBeenCalled();
+		expect(resetRun).not.toHaveBeenCalled();
+		expect(recordOperatorAction).toHaveBeenCalledWith(
+			expect.objectContaining({ tool: 'run_reset', userId: MEMBER.id, reason: 'trying' }),
+		);
+		expect(settleOperatorAction).toHaveBeenCalledWith('audit-1', {
+			outcome: 'refused',
+			error: expect.stringMatching(/^FORBIDDEN: Tool "run_reset" needs /),
+			projectId: null,
+		});
+	});
+
+	it('refuses a direct call to a hidden read tool with FORBIDDEN, reading nothing', async () => {
+		const result = await callTool('run_get', { runId: RUN_ID }, 'nobody-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^FORBIDDEN: Tool "run_get" needs /);
+		expect(getRunByIdFromDb).not.toHaveBeenCalled();
 	});
 });
 

@@ -26,8 +26,8 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import { assertInstanceAdmin, assertProjectAccess } from '../../api/authz.js';
-import type { SwarmUser } from '../../identity/schema.js';
 import { type LogRingEntry, queryLogRingBuffer } from '../../lib/logger.js';
+import type { ToolContext } from '../tool-access.js';
 import { runTool } from '../tool-helpers.js';
 
 /** The most entries one call returns. */
@@ -79,8 +79,8 @@ function capMessage(entry: LogRingEntry): LogRingEntry {
 	return { ...entry, msg: `${entry.msg.slice(0, MAX_MESSAGE_CHARS)}… [${cut} more characters]` };
 }
 
-/** Register the control-plane log read on `server`, authorizing every call as `user`. */
-export function registerLogTools(server: McpServer, user: SwarmUser): void {
+/** Register the control-plane log read on `server`, authorizing every call as `context`'s user. */
+export function registerLogTools(server: McpServer, context: ToolContext): void {
 	server.registerTool(
 		'control_plane_logs',
 		{
@@ -95,11 +95,11 @@ export function registerLogTools(server: McpServer, user: SwarmUser): void {
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},
 		({ projectId, taskId, prNumber, dispatchId, level, since, until, limit }) =>
-			runTool('control_plane_logs', async () => {
+			runTool(context, 'control_plane_logs', async () => {
 				if (projectId) {
-					await assertProjectAccess(user, projectId, 'contributor');
+					await assertProjectAccess(context.user, projectId, 'contributor');
 				} else {
-					assertInstanceAdmin(user, 'control-plane logs');
+					assertInstanceAdmin(context.user, 'control-plane logs');
 				}
 				const { entries, capacity, size, oldestTime } = queryLogRingBuffer({
 					projectId,
