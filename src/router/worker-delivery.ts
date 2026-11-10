@@ -109,6 +109,8 @@
  *     self-update, and advance the fleet rollout that was waiting for the answer.
  *   - `POST /worker/delivery/worktree-sweep-report` — record what a machine removed
  *     when it was asked to sweep its own abandoned checkouts.
+ *   - `POST /worker/delivery/checkout-discard-report` — settle a reset's request that a
+ *     machine discard the checkout it held for a run moved elsewhere (issue #1402).
  *
  * **Every project-scoped route is fenced on the dispatch it is called for** (issue
  * #1073). An assignment stamps its `dispatchId` on each call
@@ -157,6 +159,7 @@ import type { Context, Hono } from 'hono';
 
 import { findProjectRepository, scopeProjectToRepository } from '../config/project-repository.js';
 import type { ProjectConfig, ProjectRecord } from '../config/schema.js';
+import { settleCheckoutDiscard } from '../db/repositories/checkoutDiscardsRepository.js';
 import { upsertCliQuota } from '../db/repositories/cliQuotasRepository.js';
 import { type DispatchRow, getDispatchById } from '../db/repositories/dispatchesRepository.js';
 import { findProjectRecordByIdFromDb } from '../db/repositories/projectsRepository.js';
@@ -215,6 +218,7 @@ import {
 	MoveWorkItemDeliveryRequestSchema,
 	PostCommentDeliveryRequestSchema,
 	PriorReviewLedgerRequestSchema,
+	ReportCheckoutDiscardDeliveryRequestSchema,
 	ReportCliQuotaDeliveryRequestSchema,
 	ReportWorkerUpdateDeliveryRequestSchema,
 	ReportWorktreeSweepDeliveryRequestSchema,
@@ -331,6 +335,16 @@ export interface WorkerDeliveryDeps {
 	 */
 	recordWorktreeSweepReport: typeof recordWorktreeSweepReport;
 	/**
+	 * Settle a pending checkout discard with what the machine reported (issue #1402).
+	 * Scoped to the reporting worker; `false` back means nothing pending was settled.
+	 */
+	settleCheckoutDiscard: (
+		workerId: string,
+		requestId: string,
+		outcome: string,
+		detail: string | null,
+	) => Promise<boolean>;
+	/**
 	 * Move on the fleet rollout the reporting machine belongs to, if its operator has
 	 * one under way (issue #941, `./worker-rollout-advance.ts`). A report *is* the
 	 * answer the advance's first step reads off the `workers` row, so it landing here
@@ -379,6 +393,7 @@ function defaultDeps(): WorkerDeliveryDeps {
 		persistCliQuota: upsertCliQuota,
 		recordWorkerUpdateReport,
 		recordWorktreeSweepReport,
+		settleCheckoutDiscard,
 		advanceWorkerRollout,
 	};
 }
@@ -1445,6 +1460,39 @@ export async function handleReportWorkerUpdate(
 }
 
 /**
+ * Settle a reset's request that this machine discard the checkout it held for a run
+ * the reset moved elsewhere (issue #1402). Worker-scoped like the sweep report: the
+ * credential names the machine, and the settle is conditional on the request being
+ * that machine's and still pending, so a duplicate or foreign report changes nothing.
+ * Logged at `warn` when a checkout was actually discarded, since that destroyed work.
+ */
+export async function handleReportCheckoutDiscard(
+	deps: WorkerDeliveryDeps,
+	credential: string | undefined,
+	body: unknown,
+): Promise<DeliveryResult> {
+	const parsed = ReportCheckoutDiscardDeliveryRequestSchema.safeParse(body);
+	if (!parsed.success) return { status: 400, json: { reason: 'invalid delivery request' } };
+	const { requestId, outcome, detail, protocolVersion } = parsed.data;
+
+	if (protocolVersion !== TRANSPORT_PROTOCOL_VERSION)
+		return {
+			status: 400,
+			json: { reason: 'unsupported protocol version', protocolVersion: TRANSPORT_PROTOCOL_VERSION },
+		};
+
+	const authed = await authenticateWorker(deps, credential);
+	if ('status' in authed) return authed;
+
+	const recorded = await deps.settleCheckoutDiscard(authed.worker.id, requestId, outcome, detail);
+	const line = 'checkout discard: a machine reported what became of a reset run’s checkout';
+	const meta = { workerId: authed.worker.id, requestId, outcome, detail, recorded };
+	if (outcome === 'discarded' || outcome === 'failed') logger.warn(line, meta);
+	else logger.info(line, meta);
+	return { status: 200, json: { recorded } };
+}
+
+/**
  * Record what a machine removed when it was asked to sweep its own abandoned
  * worktrees (issue #955).
  *
@@ -1648,6 +1696,12 @@ export function registerWorkerDelivery(
 	app.post('/worker/delivery/worktree-sweep-report', async (c) => {
 		const credential = extractBearerCredential(c.req.header('authorization'));
 		const result = await handleReportWorktreeSweep(deps, credential, await parseBody(c));
+		return c.json(result.json, result.status);
+	});
+
+	app.post('/worker/delivery/checkout-discard-report', async (c) => {
+		const credential = extractBearerCredential(c.req.header('authorization'));
+		const result = await handleReportCheckoutDiscard(deps, credential, await parseBody(c));
 		return c.json(result.json, result.status);
 	});
 }

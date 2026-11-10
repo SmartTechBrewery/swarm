@@ -34,6 +34,14 @@ vi.mock('@/queue/cancellation.js', () => ({
 	requestRunCancellation: vi.fn(),
 }));
 
+vi.mock('@/db/repositories/checkoutDiscardsRepository.js', () => ({
+	createCheckoutDiscard: vi.fn(),
+}));
+
+vi.mock('@/queue/checkout-discards.js', () => ({
+	publishCheckoutDiscardRequest: vi.fn(),
+}));
+
 // A reset that throws part-way has to leave a line saying what it had already
 // done (issue #913), so the logger is asserted on rather than left to console.
 const { loggerInfo, loggerWarn, loggerError } = vi.hoisted(() => ({
@@ -56,6 +64,7 @@ vi.mock('@/worktree/termination-cleanup.js', () => ({
 	reconcileTerminatedWorktree: vi.fn(),
 }));
 
+import { createCheckoutDiscard } from '@/db/repositories/checkoutDiscardsRepository.js';
 import {
 	cancelClaimedDispatch,
 	type DispatchRow,
@@ -79,6 +88,7 @@ import {
 	resetRun,
 } from '@/dispatch/run-reset.js';
 import { clearRunCancellation, requestRunCancellation } from '@/queue/cancellation.js';
+import { publishCheckoutDiscardRequest } from '@/queue/checkout-discards.js';
 import type { SwarmJob } from '@/queue/jobs.js';
 import { removePendingJobById } from '@/queue/producer.js';
 import { reconcileTerminatedWorktree } from '@/worktree/termination-cleanup.js';
@@ -223,6 +233,8 @@ describe('resetRun', () => {
 		vi.mocked(markRunResetStarted).mockReset().mockResolvedValue(undefined);
 		vi.mocked(updateRunJobPayload).mockReset().mockResolvedValue(undefined);
 		vi.mocked(removePendingJobById).mockClear();
+		vi.mocked(createCheckoutDiscard).mockReset().mockResolvedValue('discard-1');
+		vi.mocked(publishCheckoutDiscardRequest).mockReset().mockResolvedValue(undefined);
 		vi.mocked(reconcileTerminatedWorktree).mockReset().mockResolvedValue({ outcome: 'removed' });
 		vi.mocked(createAndPublishDispatch)
 			.mockReset()
@@ -270,8 +282,12 @@ describe('resetRun', () => {
 			worktreeError: null,
 			recoveryCleared: true,
 			abandonedPreservedWorkerId: null,
+			abandonedCheckout: 'none',
+			abandonedCheckoutError: null,
 			dispatchId: 'dispatch-2',
 		});
+		// No preserved worker, so nothing is asked of any machine.
+		expect(createCheckoutDiscard).not.toHaveBeenCalled();
 	});
 
 	// Issue #567: reset is the *only* thing that ends a pinned wait, and it is the
@@ -288,9 +304,10 @@ describe('resetRun', () => {
 		expect(clearRunRecovery).toHaveBeenCalledWith('run-1');
 	});
 
-	it('works while the pinned machine is unreachable, since nothing asks it anything', async () => {
+	it('works while the pinned machine is unreachable, since nothing waits on it', async () => {
 		// The escape hatch has to work exactly when the machine is offline — otherwise
-		// a run pinned to a dead host would wait forever with no way out.
+		// a run pinned to a dead host would wait forever with no way out. The discard it
+		// owes that machine (issue #1402) is a durable request, not a round trip.
 		vi.mocked(getRunByIdFromDb).mockResolvedValue(
 			makeRun({ recovery: { preservedWorkerId: 'w-offline' } }),
 		);
@@ -300,6 +317,82 @@ describe('resetRun', () => {
 
 		expect(result.abandonedPreservedWorkerId).toBe('w-offline');
 		expect(result).toMatchObject({ outcome: 'restarted', dispatchId: 'dispatch-2' });
+	});
+
+	// Issue #1402, the observed shape: the checkout is preserved on worker A, the reset
+	// abandons A and the restart may route to worker B — so A is asked directly, before
+	// the replacement dispatch exists, rather than relying on the restart's intent.
+	describe('the abandoned preserved worker’s checkout', () => {
+		it('records a discard for the abandoned worker before the restart is dispatched', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({ recovery: { preservedWorkerId: 'w-a' } }),
+			);
+			vi.mocked(reconcileTerminatedWorktree).mockResolvedValue({ outcome: 'absent' });
+
+			const result = await resetRun('run-1');
+
+			expect(createCheckoutDiscard).toHaveBeenCalledWith({
+				workerId: 'w-a',
+				runId: 'run-1',
+				projectId: 'p1',
+				repository: 'SmartTechBrewery/swarm',
+				taskId: '424',
+				worktreeRoot: createMockProjectConfig({ id: 'p1' }).worktreeRoot,
+			});
+			expect(publishCheckoutDiscardRequest).toHaveBeenCalledWith('w-a');
+			// After the recovery clear (the router's superseded check reads it), before the
+			// replacement dispatch (which may route anywhere).
+			const recordedAt = vi.mocked(createCheckoutDiscard).mock.invocationCallOrder[0];
+			expect(recordedAt).toBeGreaterThan(vi.mocked(clearRunRecovery).mock.invocationCallOrder[0]);
+			expect(recordedAt).toBeLessThan(
+				vi.mocked(createAndPublishDispatch).mock.invocationCallOrder[0],
+			);
+			// The report no longer reads as "absent" alone: it says the checkout on A is
+			// pending removal there.
+			expect(result).toMatchObject({
+				outcome: 'restarted',
+				worktree: { outcome: 'absent' },
+				abandonedPreservedWorkerId: 'w-a',
+				abandonedCheckout: 'discard-requested',
+				abandonedCheckoutError: null,
+			});
+			expect(loggerInfo).toHaveBeenCalledWith(
+				'run reset complete',
+				expect.objectContaining({ abandonedCheckout: 'discard-requested' }),
+			);
+		});
+
+		it('reports a discard it could not record, and still restarts', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({ recovery: { preservedWorkerId: 'w-a' } }),
+			);
+			vi.mocked(createCheckoutDiscard).mockRejectedValue(new Error('insert failed'));
+
+			const result = await resetRun('run-1');
+
+			expect(publishCheckoutDiscardRequest).not.toHaveBeenCalled();
+			expect(result).toMatchObject({
+				outcome: 'restarted',
+				abandonedCheckout: 'not-requested',
+				abandonedCheckoutError: expect.stringContaining('insert failed'),
+			});
+		});
+
+		it('names no location it cannot vouch for when the project is gone', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({ recovery: { preservedWorkerId: 'w-a' } }),
+			);
+			vi.mocked(getProjectByIdFromDb).mockResolvedValue(undefined);
+
+			const result = await resetRun('run-1');
+
+			expect(createCheckoutDiscard).not.toHaveBeenCalled();
+			expect(result).toMatchObject({
+				outcome: 'terminated',
+				abandonedCheckout: 'not-requested',
+				abandonedCheckoutError: expect.stringContaining('no longer exists'),
+			});
+		});
 	});
 
 	it('re-dispatches with a fresh agent session and a reset rate-limit budget', async () => {
@@ -459,6 +552,7 @@ describe('resetRun', () => {
 				worktreeError: null,
 				recoveryCleared: true,
 				abandonedPreservedWorkerId: null,
+				abandonedCheckout: 'none',
 				error: expect.stringContaining('dispatch insert failed'),
 			});
 			expect(loggerInfo).not.toHaveBeenCalledWith('run reset complete', expect.anything());

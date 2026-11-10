@@ -108,6 +108,7 @@ import {
 	SUPPORTED_DB_FREE_PHASES,
 } from './assignment-execution.js';
 import { createHandshakePromotion, returnAfterFatalHandshake } from './build-verification.js';
+import { createCheckoutDiscardHandler } from './checkout-discard.js';
 import { discoverAvailableClis, parseDeclaredClisOverride } from './cli-discovery.js';
 import {
 	startWorkerQuotaReporting,
@@ -476,6 +477,18 @@ async function main(): Promise<void> {
 		// peer must not swap the install root under a daemon that is mid-removal.
 		onWorktreeSweep: createWorktreeSweepHandler({
 			repoRoots,
+			controlPlaneUrl,
+			workerCredential: credential,
+			inFlight,
+			onInFlightChange: publishBusy,
+			shutdownSignal: shutdownSignal.signal,
+		}),
+		// A reset that moved a run away from this machine asks it to discard the checkout
+		// it still holds for that run (issue #1402). Same footing as the sweep: it joins
+		// `inFlight` while it runs, and it removes only a checkout attributed to the reset
+		// run that no live phase holds.
+		onCheckoutDiscard: createCheckoutDiscardHandler({
+			checkouts,
 			controlPlaneUrl,
 			workerCredential: credential,
 			inFlight,

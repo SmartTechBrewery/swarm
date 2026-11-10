@@ -1,5 +1,5 @@
 {
-  "id": "fcc04c79-a9ac-487d-b6fd-316cc51f60e3",
+  "id": "dda1640c-6717-4f0d-82fa-59edbba69cc7",
   "prevId": "9fbf997b-3496-4c12-8ca0-4e4b9ee931bb",
   "version": "7",
   "dialect": "postgresql",
@@ -682,12 +682,6 @@
           "type": "timestamp",
           "primaryKey": false,
           "notNull": false
-        },
-        "resolves_run_id": {
-          "name": "resolves_run_id",
-          "type": "uuid",
-          "primaryKey": false,
-          "notNull": false
         }
       },
       "indexes": {
@@ -751,21 +745,6 @@
           "method": "btree",
           "with": {}
         },
-        "idx_runs_resolves_run_id": {
-          "name": "idx_runs_resolves_run_id",
-          "columns": [
-            {
-              "expression": "resolves_run_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        },
         "idx_runs_maintenance_request": {
           "name": "idx_runs_maintenance_request",
           "columns": [
@@ -816,19 +795,6 @@
           "tableTo": "users",
           "columnsFrom": [
             "worker_user_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "set null",
-          "onUpdate": "no action"
-        },
-        "runs_resolves_run_id_runs_id_fk": {
-          "name": "runs_resolves_run_id_runs_id_fk",
-          "tableFrom": "runs",
-          "tableTo": "runs",
-          "columnsFrom": [
-            "resolves_run_id"
           ],
           "columnsTo": [
             "id"
@@ -3073,7 +3039,7 @@
           "type": "jsonb",
           "primaryKey": false,
           "notNull": true,
-          "default": "'[\"planning\",\"implementation\",\"review\",\"respond-to-review\",\"respond-to-ci\",\"resolve-conflicts\",\"resolve-problem\"]'::jsonb"
+          "default": "'[\"planning\",\"implementation\",\"review\",\"respond-to-review\",\"respond-to-ci\",\"resolve-conflicts\"]'::jsonb"
         },
         "repositories": {
           "name": "repositories",
@@ -3447,7 +3413,7 @@
           "type": "jsonb",
           "primaryKey": false,
           "notNull": true,
-          "default": "'[\"planning\",\"implementation\",\"review\",\"respond-to-review\",\"respond-to-ci\",\"resolve-conflicts\",\"resolve-problem\"]'::jsonb"
+          "default": "'[\"planning\",\"implementation\",\"review\",\"respond-to-review\",\"respond-to-ci\",\"resolve-conflicts\"]'::jsonb"
         },
         "concurrency_allocation": {
           "name": "concurrency_allocation",
@@ -4032,6 +3998,136 @@
           "tableTo": "users",
           "columnsFrom": [
             "requested_by_user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.checkout_discards": {
+      "name": "checkout_discards",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "uuid",
+          "primaryKey": true,
+          "notNull": true,
+          "default": "gen_random_uuid()"
+        },
+        "worker_id": {
+          "name": "worker_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "run_id": {
+          "name": "run_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "repository": {
+          "name": "repository",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "task_id": {
+          "name": "task_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "worktree_root": {
+          "name": "worktree_root",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "requested_at": {
+          "name": "requested_at",
+          "type": "timestamp",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "settled_at": {
+          "name": "settled_at",
+          "type": "timestamp",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "outcome": {
+          "name": "outcome",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "detail": {
+          "name": "detail",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_checkout_discards_worker": {
+          "name": "idx_checkout_discards_worker",
+          "columns": [
+            {
+              "expression": "worker_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "settled_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "checkout_discards_worker_id_workers_id_fk": {
+          "name": "checkout_discards_worker_id_workers_id_fk",
+          "tableFrom": "checkout_discards",
+          "tableTo": "workers",
+          "columnsFrom": [
+            "worker_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "checkout_discards_run_id_runs_id_fk": {
+          "name": "checkout_discards_run_id_runs_id_fk",
+          "tableFrom": "checkout_discards",
+          "tableTo": "runs",
+          "columnsFrom": [
+            "run_id"
           ],
           "columnsTo": [
             "id"

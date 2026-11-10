@@ -4246,6 +4246,8 @@ describe('runsRouter', () => {
 			worktreeError: null,
 			recoveryCleared: true,
 			abandonedPreservedWorkerId: null,
+			abandonedCheckout: 'none' as const,
+			abandonedCheckoutError: null,
 			dispatchId: 'dispatch-2',
 		};
 
@@ -4278,6 +4280,8 @@ describe('runsRouter', () => {
 				worktreeError: null,
 				recoveryCleared: true,
 				abandonedPreservedWorkerId: null,
+				abandonedCheckout: 'none' as const,
+				abandonedCheckoutError: null,
 				reason: 'Reset could not restart run "run-1": its project "p1" no longer exists.',
 			};
 			vi.mocked(resetRun).mockResolvedValue(terminated);

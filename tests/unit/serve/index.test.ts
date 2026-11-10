@@ -22,6 +22,9 @@ vi.mock('@/router/worker-rollout-advance.js', () => ({
 vi.mock('@/router/worktree-sweep-dispatch.js', () => ({
 	subscribeWorktreeSweepDispatch: vi.fn(() => ({ close: vi.fn() })),
 }));
+vi.mock('@/router/checkout-discard-dispatch.js', () => ({
+	subscribeCheckoutDiscardDispatch: vi.fn(() => ({ close: vi.fn() })),
+}));
 vi.mock('@/serve/app.js', () => ({
 	createAllInOneApp: vi.fn(() => ({ app: { fetch: vi.fn() }, injectWebSocket: vi.fn() })),
 }));

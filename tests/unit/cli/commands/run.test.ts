@@ -73,6 +73,8 @@ function resetResult(overrides: Partial<RestartedResult> = {}): RestartedResult 
 		worktreeError: null,
 		recoveryCleared: true,
 		abandonedPreservedWorkerId: null,
+		abandonedCheckout: 'none',
+		abandonedCheckoutError: null,
 		dispatchId: 'dispatch-9',
 		...overrides,
 	};
@@ -116,7 +118,9 @@ describe('run command', () => {
 		expect(report).toContain('dispatch: the active dispatch was cancelled');
 		expect(report).toContain('cancellation flag: cleared');
 		expect(report).toContain('checkout: removed and its lease released');
-		expect(report).toContain('restart intent: the worker holding the checkout discards it');
+		expect(report).toContain(
+			'restart intent: the worker that runs the restart discards any checkout of this task it holds',
+		);
 		expect(report).toContain('recovery record: cleared');
 		expect(report).toContain('re-dispatched from scratch as dispatch dispatch-9');
 	});
@@ -188,6 +192,8 @@ describe('run command', () => {
 			worktreeError: null,
 			recoveryCleared: true,
 			abandonedPreservedWorkerId: null,
+			abandonedCheckout: 'none',
+			abandonedCheckoutError: null,
 			reason: 'Reset could not restart this run: it was created without a job payload.',
 		});
 

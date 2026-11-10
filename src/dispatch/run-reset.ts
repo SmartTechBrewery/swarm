@@ -81,20 +81,29 @@
  * teardown throw is logged and stepped over rather than aborting: the checkout the
  * restart actually has to clear is settled by whichever worker holds it.
  *
- * A synchronous worktree-teardown frame was considered and not taken. `sendToWorker`
- * (`src/router/worker-connections.ts`) is a **router-process-local** map and this
- * service runs in the API server, which has no request channel to the router — only
- * Redis pub/sub (`src/queue/cancellation.ts`) and BullMQ. Adding one would mean
- * inventing a cross-process request/reply mechanism plus a new frame pair purely to
- * reach a worker the replacement dispatch already reaches: worker affinity routes
- * the restart back to the host holding the checkout, which is what makes carrying
- * the intent sufficient.
+ * **That intent reaches only the worker that runs the restart — so a reset that
+ * abandons a preserved worker also asks *that* worker directly** (issue #1402). The
+ * old premise here was that worker affinity routes the restart back to the host
+ * holding the checkout; but step 4 is what *removes* that affinity (clearing
+ * `recovery.preservedWorkerId`), so the restart is free to land on another machine
+ * and the holder used to keep the run's checkout silently while this reset reported
+ * `worktree: absent`. Before the replacement dispatch is created, a reset that gives
+ * up a preserved worker therefore records a durable `checkout_discards` request for
+ * it and notifies the router (`src/queue/checkout-discards.ts`), which pushes a
+ * `checkout-discard` frame to that worker now or on its next connection
+ * (`src/router/checkout-discard-dispatch.ts`). The worker discards the checkout under
+ * the same rule step 5's intent applies, but only when its pin or lease names this
+ * run and no live phase holds it (`src/transport/checkout-discard.ts`), and reports
+ * the outcome back onto the row. It is asynchronous rather than a request/reply
+ * because the holder is often offline at reset time — that is when reset is reached
+ * for — and the report says so: {@link ResetAbandonedCheckout}.
  *
  * This module deliberately knows nothing about tRPC: the API router (and, later,
  * the CLI) are thin surfaces over it.
  */
 
 import type { ProjectConfig } from '../config/schema.js';
+import { createCheckoutDiscard } from '../db/repositories/checkoutDiscardsRepository.js';
 import {
 	cancelClaimedDispatch,
 	getActiveDispatchByRunId,
@@ -113,6 +122,7 @@ import {
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { clearRunCancellation, requestRunCancellation } from '../queue/cancellation.js';
+import { publishCheckoutDiscardRequest } from '../queue/checkout-discards.js';
 import type { SwarmJob } from '../queue/jobs.js';
 import { priorityFor, removePendingJobById } from '../queue/producer.js';
 import type { TriggerPhase } from '../triggers/types.js';
@@ -212,7 +222,27 @@ interface ResetRunSteps {
 	 * discarded, and the run keeps that as `recovery.abandonedWorkerId`.
 	 */
 	abandonedPreservedWorkerId: string | null;
+	/**
+	 * What this reset did about the checkout the abandoned preserved worker still holds
+	 * (issue #1402) — the half `worktree` above can never describe, since that one is
+	 * the control-plane host's view only.
+	 */
+	abandonedCheckout: ResetAbandonedCheckout;
+	/** Why the discard could not be requested, when `abandonedCheckout` is `'not-requested'`. */
+	abandonedCheckoutError: string | null;
 }
+
+/**
+ * The preserved worker's checkout after a reset (issue #1402):
+ *
+ * - `'none'` — the run was preserved on no worker, so there is no such checkout;
+ * - `'discard-requested'` — a durable discard was recorded for that worker. It is
+ *   pushed to the worker now if it is connected, or when it reconnects, so until then
+ *   the checkout is still **pending removal on that worker**;
+ * - `'not-requested'` — the request could not be recorded (its project is gone, or the
+ *   write failed), so the checkout is retained there until the retention sweep.
+ */
+export type ResetAbandonedCheckout = 'none' | 'discard-requested' | 'not-requested';
 
 /**
  * How the reset ended. `'restarted'` is the ordinary answer; `'terminated'` is the
@@ -392,6 +422,58 @@ async function settleLocalWorktree(
 }
 
 /**
+ * Ask the abandoned preserved worker to discard the run's checkout (issue #1402):
+ * record the durable request, then notify the router, which pushes it to that worker
+ * now or when it reconnects. Never throws — a reset never refuses — so a failure is
+ * reported as `'not-requested'` with its reason.
+ *
+ * Skipped when the project is gone: the request names the project's relative
+ * `worktreeRoot`, and guessing one would point a worker at a directory nothing
+ * vouches for. That checkout is then left for the retention sweep, and said so.
+ */
+async function requestAbandonedCheckoutDiscard(
+	run: ResetTargetRun,
+	workerId: string,
+	project: ProjectConfig | undefined,
+): Promise<Pick<ResetRunSteps, 'abandonedCheckout' | 'abandonedCheckoutError'>> {
+	if (!project) {
+		return {
+			abandonedCheckout: 'not-requested',
+			abandonedCheckoutError: `its project "${run.projectId}" no longer exists, so the checkout's location cannot be named`,
+		};
+	}
+	try {
+		const requestId = await createCheckoutDiscard({
+			workerId,
+			runId: run.id,
+			projectId: run.projectId,
+			repository: run.repository,
+			taskId: run.taskId,
+			worktreeRoot: project.worktreeRoot,
+		});
+		await publishCheckoutDiscardRequest(workerId);
+		logger.info('run reset: asked the abandoned preserved worker to discard the run’s checkout', {
+			runId: run.id,
+			projectId: run.projectId,
+			taskId: run.taskId,
+			workerId,
+			requestId,
+		});
+		return { abandonedCheckout: 'discard-requested', abandonedCheckoutError: null };
+	} catch (err) {
+		const abandonedCheckoutError = describeError(err);
+		logger.warn('run reset: could not ask the abandoned preserved worker to discard its checkout', {
+			runId: run.id,
+			projectId: run.projectId,
+			taskId: run.taskId,
+			workerId,
+			error: abandonedCheckoutError,
+		});
+		return { abandonedCheckout: 'not-requested', abandonedCheckoutError };
+	}
+}
+
+/**
  * Create the dispatch the reset restarts on, last of all the writes. Losing the
  * one-active-dispatch-per-run unique index means a concurrent reset or retry
  * already created it, which is the one refusal a reset that got this far can
@@ -515,6 +597,20 @@ async function performReset(run: ResetTargetRun, progress: ResetRunSteps): Promi
 	await clearRunRecovery(run.id);
 	progress.recoveryCleared = true;
 
+	// Before the replacement dispatch exists (issue #1402): the restart may route to any
+	// machine, so the one that held the preserved checkout is told directly. After the
+	// recovery clear on purpose — the router settles a request `superseded` when the run
+	// is preserved on that same worker again, which must read the cleared record.
+	if (progress.abandonedPreservedWorkerId !== null) {
+		const requested = await requestAbandonedCheckoutDiscard(
+			run,
+			progress.abandonedPreservedWorkerId,
+			project,
+		);
+		progress.abandonedCheckout = requested.abandonedCheckout;
+		progress.abandonedCheckoutError = requested.abandonedCheckoutError;
+	}
+
 	if (terminalReason !== null || jobPayload === null) {
 		// The second half is redundant — a null payload is already a terminal reason —
 		// but it is what narrows `jobPayload` for the restart path below.
@@ -527,6 +623,8 @@ async function performReset(run: ResetTargetRun, progress: ResetRunSteps): Promi
 			phase: run.phase,
 			agentStop: progress.agentStop,
 			dispatch: progress.dispatch,
+			abandonedPreservedWorkerId: progress.abandonedPreservedWorkerId,
+			abandonedCheckout: progress.abandonedCheckout,
 			reason,
 		});
 		return { ...progress, outcome: 'terminated', reason };
@@ -552,6 +650,8 @@ async function performReset(run: ResetTargetRun, progress: ResetRunSteps): Promi
 		worktree: progress.worktree?.outcome ?? 'not-attempted',
 		worktreeError: progress.worktreeError,
 		abandonedPreservedWorkerId: progress.abandonedPreservedWorkerId,
+		abandonedCheckout: progress.abandonedCheckout,
+		abandonedCheckoutError: progress.abandonedCheckoutError,
 		dispatchId,
 	});
 
@@ -596,6 +696,8 @@ export async function resetRun(runId: string): Promise<ResetRunResult> {
 		worktreeError: null,
 		recoveryCleared: false,
 		abandonedPreservedWorkerId: null,
+		abandonedCheckout: 'none',
+		abandonedCheckoutError: null,
 	};
 
 	try {
@@ -618,6 +720,7 @@ export async function resetRun(runId: string): Promise<ResetRunResult> {
 			worktreeError: progress.worktreeError,
 			recoveryCleared: progress.recoveryCleared,
 			abandonedPreservedWorkerId: progress.abandonedPreservedWorkerId,
+			abandonedCheckout: progress.abandonedCheckout,
 			error: describeError(err),
 		});
 		throw err;

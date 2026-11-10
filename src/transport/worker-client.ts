@@ -60,6 +60,7 @@ import type { WorkerBuild } from '../lib/build-identity.js';
 import { logger as defaultLogger } from '../lib/logger.js';
 import type { WorkerSupervision } from '../lib/worker-supervision.js';
 import {
+	type CheckoutDiscard,
 	type ControlPlaneMessage,
 	ControlPlaneMessageSchema,
 	type HandshakeRequest,
@@ -889,6 +890,14 @@ export interface WorkerTransportOptions {
 	 */
 	onWorktreeSweep?: (sweep: WorktreeSweep) => void;
 	/**
+	 * Called when the control plane pushes a `checkout-discard` frame (issue #1402) —
+	 * a reset asking this machine to discard the checkout it still holds for a run the
+	 * reset moved elsewhere. Concerns no dispatch, so no sink: its answer goes up a
+	 * delivery route (`./checkout-discard.ts`). Left undefined the frame is logged and
+	 * ignored, exactly as on a daemon predating it.
+	 */
+	onCheckoutDiscard?: (discard: CheckoutDiscard) => void;
+	/**
 	 * Called with each established session, before the stream opens — the only place
 	 * a daemon learns the `workerId` it authenticates as, since the credential does
 	 * not carry it (issue #689: the checkout lock records it so a second daemon's
@@ -1241,7 +1250,8 @@ function notifySession(
  * Route the cloud→worker *work* frames — a pushed `TaskAssignment` (ADR-003 §2),
  * the `TaskCancel` that stops one (issue #549), the `WorkerUpdate` that asks this
  * machine to move to a build (issue #933), and the `WorktreeSweep` that asks it to
- * remove its own abandoned checkouts (issue #955) — to the executor's handlers. Every
+ * remove its own abandoned checkouts (issue #955), and the `CheckoutDiscard` a reset
+ * sends the machine it moved a run away from (issue #1402) — to the executor's handlers. Every
  * handler is optional, because a session-only client keeps its lease live and runs
  * nothing: an unhandled frame is logged and ignored, never an error.
  * `heartbeat-ack` falls through with no action.
@@ -1333,6 +1343,17 @@ function routeWorkFrame(
 			return;
 		}
 		options.onWorktreeSweep(frame);
+		return;
+	}
+	if (frame.type === 'checkout-discard') {
+		// Names no dispatch either (issue #1402), so there is nothing held it could answer.
+		if (!options.onCheckoutDiscard) {
+			logger.info('ignoring checkout-discard — this client holds no checkouts', {
+				requestId: frame.requestId,
+			});
+			return;
+		}
+		options.onCheckoutDiscard(frame);
 	}
 }
 
