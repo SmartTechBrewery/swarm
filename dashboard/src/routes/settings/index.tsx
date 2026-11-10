@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { createRoute, useNavigate } from '@tanstack/react-router';
 import {
+	Bug,
 	Cpu,
 	KeyRound,
 	type LucideIcon,
@@ -13,12 +14,14 @@ import {
 } from 'lucide-react';
 import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
+import { BugReportsPanel } from '@/components/settings/bug-reports-panel.js';
 import { FleetUpdatesPanel } from '@/components/settings/fleet-updates-panel.js';
 import { InstanceCredentialsPanel } from '@/components/settings/instance-credentials-panel.js';
 import { UsersPanel } from '@/components/settings/users-panel.js';
 import { useTheme } from '@/components/theme/theme-provider.js';
 import { buttonClass } from '@/components/ui/button.js';
 import {
+	bugReportSearch,
 	resolveActiveSettingsTab,
 	type SettingsTab,
 	settingsSearchSchema,
@@ -290,7 +293,7 @@ export function AppearancePanel() {
 }
 
 /**
- * The General Settings tabs in display order, each with the icon and label it
+ * The General screen's tabs in display order, each with the icon and label it
  * renders. Ordered to match `SETTINGS_TABS` (`lib/settings-nav.ts`), which is the
  * URL vocabulary — a test asserts the two agree, so the rendered order and the
  * `?tab=` values can't drift apart. Mirrors `PROJECT_TAB_ITEMS` in
@@ -301,6 +304,7 @@ const SETTINGS_TAB_ITEMS: ReadonlyArray<{ tab: SettingsTab; label: string; icon:
 	{ tab: 'credentials', label: 'Credentials', icon: KeyRound },
 	{ tab: 'users', label: 'Users', icon: UsersRound },
 	{ tab: 'fleet', label: 'Fleet', icon: RefreshCw },
+	{ tab: 'issues', label: 'Issues', icon: Bug },
 	{ tab: 'appearance', label: 'Appearance', icon: Palette },
 ];
 
@@ -342,6 +346,20 @@ export function SettingsTabBar({
 	);
 }
 
+/**
+ * The page title. The page is **General** while the sidebar link to it reads
+ * **Settings** (issue #1390): the sidebar names the group of installation-wide
+ * screens, the heading names this one.
+ */
+export function SettingsPageTitle() {
+	return (
+		<div>
+			<h1 className="text-2xl font-semibold tracking-tight text-zinc-100">General</h1>
+			<p className="text-xs text-zinc-500 mt-1">Application-wide SWARM configuration.</p>
+		</div>
+	);
+}
+
 function SettingsRouteComponent() {
 	const queryClient = useQueryClient();
 	const navigate = useNavigate();
@@ -357,6 +375,9 @@ function SettingsRouteComponent() {
 	const activeTab = resolveActiveSettingsTab(search, viewer);
 	const goToTab = (tab: SettingsTab) => {
 		navigate({ to: '/settings', search: settingsTabSearch(tab) });
+	};
+	const goToReport = (reportId: string | undefined) => {
+		navigate({ to: '/settings', search: bugReportSearch(reportId) });
 	};
 
 	const settingsQuery = useQuery(trpc.settings.get.queryOptions());
@@ -415,8 +436,8 @@ function SettingsRouteComponent() {
 		});
 	};
 
-	// Credentials and Users each own their query and remain usable if `settings.get`
-	// fails; only the tabs that render from the settings blob wait on it.
+	// Credentials, Users and Issues each own their query and remain usable if
+	// `settings.get` fails; only the tabs that render from the settings blob wait on it.
 	const needsSettings = settingsTabNeedsAppSettings(activeTab);
 	if (needsSettings && settingsQuery.isLoading) {
 		return <div className="text-sm text-zinc-400">Loading settings…</div>;
@@ -433,11 +454,7 @@ function SettingsRouteComponent() {
 
 	return (
 		<div className="space-y-6">
-			{/* Page Title */}
-			<div>
-				<h1 className="text-2xl font-semibold tracking-tight text-zinc-100">Settings</h1>
-				<p className="text-xs text-zinc-500 mt-1">Application-wide SWARM configuration.</p>
-			</div>
+			<SettingsPageTitle />
 
 			{/* Horizontal Tab Bar */}
 			<SettingsTabBar tabs={tabs} activeTab={activeTab} onSelect={goToTab} />
@@ -461,6 +478,10 @@ function SettingsRouteComponent() {
 			{activeTab === 'users' && <UsersPanel />}
 
 			{activeTab === 'fleet' && <FleetUpdatesPanel settings={settings ?? FALLBACK_SETTINGS} />}
+
+			{activeTab === 'issues' && (
+				<BugReportsPanel selectedReportId={search.report} onSelectReport={goToReport} />
+			)}
 
 			{activeTab === 'appearance' && <AppearancePanel />}
 		</div>

@@ -10,7 +10,16 @@ vi.mock('@/components/theme/theme-provider.js', () => ({
 }));
 
 import { SETTINGS_TABS, visibleSettingsTabs } from '@/lib/settings-nav.js';
-import { AppearancePanel, SettingsTabBar } from './index.js';
+import { AppearancePanel, SettingsPageTitle, SettingsTabBar } from './index.js';
+
+describe('SettingsPageTitle', () => {
+	// The sidebar link reads "Settings"; the page it opens is "General" (issue #1390).
+	it('reads General', () => {
+		render(<SettingsPageTitle />);
+
+		expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('General');
+	});
+});
 
 describe('SettingsTabBar', () => {
 	it('renders the tabs in SETTINGS_TABS order for an instance administrator', () => {
@@ -23,12 +32,19 @@ describe('SettingsTabBar', () => {
 		);
 
 		const labels = screen.getAllByRole('button').map((button) => button.textContent);
-		expect(labels).toEqual(['Agent Defaults', 'Credentials', 'Users', 'Fleet', 'Appearance']);
+		expect(labels).toEqual([
+			'Agent Defaults',
+			'Credentials',
+			'Users',
+			'Fleet',
+			'Issues',
+			'Appearance',
+		]);
 		// The rendered order and the `?tab=` vocabulary must not drift apart.
 		expect(labels).toHaveLength(SETTINGS_TABS.length);
 	});
 
-	it('offers no admin-only tab to a non-administrator (issues #666, #769, #1151, #1284)', () => {
+	it('offers no admin-only tab to a non-administrator (issues #666, #769, #1151, #1284, #1390)', () => {
 		render(
 			<SettingsTabBar
 				tabs={visibleSettingsTabs({ instanceAdmin: false })}
@@ -38,7 +54,7 @@ describe('SettingsTabBar', () => {
 		);
 
 		const labels = screen.getAllByRole('button').map((button) => button.textContent);
-		expect(labels).toEqual(['Appearance']);
+		expect(labels).toEqual(['Issues', 'Appearance']);
 	});
 
 	it('selects the tab that was clicked', () => {
