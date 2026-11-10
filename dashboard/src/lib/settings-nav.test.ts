@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+	bugReportSearch,
 	resolveActiveSettingsTab,
 	settingsSearchSchema,
 	settingsTabNeedsAppSettings,
@@ -26,6 +27,21 @@ describe('settingsSearchSchema', () => {
 	it('strips unknown params', () => {
 		expect(settingsSearchSchema.parse({ tab: 'agents', extra: 'x' })).toEqual({ tab: 'agents' });
 	});
+
+	it('parses the bug report the Issues tab shows (issue #1390)', () => {
+		const report = '00000000-0000-4000-8000-000000000001';
+		expect(settingsSearchSchema.parse({ tab: 'issues', report })).toEqual({
+			tab: 'issues',
+			report,
+		});
+	});
+
+	it('drops a malformed report id rather than throwing', () => {
+		expect(settingsSearchSchema.parse({ tab: 'issues', report: 'nope' })).toEqual({
+			tab: 'issues',
+			report: undefined,
+		});
+	});
 });
 
 describe('visibleSettingsTabs', () => {
@@ -35,16 +51,17 @@ describe('visibleSettingsTabs', () => {
 			'credentials',
 			'users',
 			'fleet',
+			'issues',
 			'appearance',
 		]);
 	});
 
 	it('hides Agent Defaults, Credentials, Users and Fleet from a non-administrator', () => {
-		expect(visibleSettingsTabs(NON_ADMIN)).toEqual(['appearance']);
+		expect(visibleSettingsTabs(NON_ADMIN)).toEqual(['issues', 'appearance']);
 	});
 
 	it('treats an unresolved viewer as a non-administrator', () => {
-		expect(visibleSettingsTabs(undefined)).toEqual(['appearance']);
+		expect(visibleSettingsTabs(undefined)).toEqual(['issues', 'appearance']);
 	});
 });
 
@@ -99,6 +116,12 @@ describe('resolveActiveSettingsTab', () => {
 		expect(resolveActiveSettingsTab({ tab: 'fleet' }, ADMIN)).toBe('fleet');
 	});
 
+	// Every signed-in user sees Issues; `bugReports.list` scopes what it lists (issue #1390).
+	it('honors ?tab=issues for a non-administrator, not degrading it to the fallback', () => {
+		expect(resolveActiveSettingsTab({ tab: 'issues' }, NON_ADMIN)).toBe('issues');
+		expect(resolveActiveSettingsTab({ tab: 'issues' }, ADMIN)).toBe('issues');
+	});
+
 	it('treats an unresolved viewer as a non-administrator, so the section never flashes', () => {
 		expect(resolveActiveSettingsTab({ tab: 'agents' })).toBe('appearance');
 		expect(resolveActiveSettingsTab({})).toBe('appearance');
@@ -112,11 +135,19 @@ describe('settingsTabNeedsAppSettings', () => {
 		expect(settingsTabNeedsAppSettings('appearance')).toBe(true);
 		expect(settingsTabNeedsAppSettings('credentials')).toBe(false);
 		expect(settingsTabNeedsAppSettings('users')).toBe(false);
+		expect(settingsTabNeedsAppSettings('issues')).toBe(false);
 	});
 });
 
 describe('settingsTabSearch', () => {
 	it('builds search state for a tab', () => {
 		expect(settingsTabSearch('appearance')).toEqual({ tab: 'appearance' });
+	});
+});
+
+describe('bugReportSearch', () => {
+	it('opens a report on the Issues tab, or returns to its list', () => {
+		expect(bugReportSearch('r1')).toEqual({ tab: 'issues', report: 'r1' });
+		expect(bugReportSearch(undefined)).toEqual({ tab: 'issues' });
 	});
 });

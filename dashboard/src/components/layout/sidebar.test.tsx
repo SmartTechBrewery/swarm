@@ -99,7 +99,7 @@ describe('Sidebar navigation', () => {
 		const entries = [...(container.querySelector('nav')?.querySelectorAll('a') ?? [])].map(
 			(link) => link.textContent,
 		);
-		expect(entries).toEqual(['Runs', 'Workers', 'Alpha', 'General']);
+		expect(entries).toEqual(['Runs', 'Workers', 'Alpha', 'Settings']);
 	});
 });
 

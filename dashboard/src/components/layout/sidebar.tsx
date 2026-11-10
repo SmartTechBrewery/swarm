@@ -170,7 +170,7 @@ export function Sidebar() {
 						}
 					>
 						<Settings className="h-4 w-4" />
-						General
+						Settings
 					</Link>
 
 					{/* CLI Quota is deliberately not linked here (issue #1229): the page is

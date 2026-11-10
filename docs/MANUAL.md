@@ -1648,7 +1648,8 @@ lapsed, `docker compose restart app` logs a fresh one.
   then enter each project's credentials on its Source Control and Project
   Management tabs. A project needs a reviewer credential to be created: type
   it into the dialog's reviewer field, or record one installation-wide default
-  for every new project in General Settings → Credentials. The roles each provider needs are in
+  for every new project on the Credentials tab of the **General** page (sidebar
+  **Settings**). The roles each provider needs are in
   [`docs/configuration.md`](./configuration.md).
 - **Point webhooks at the domain.** GitHub delivers to
   `https://<your domain>/github/webhook`; the other providers to
@@ -1771,11 +1772,24 @@ instance administrator sees), and every occurrence of it, each naming the run,
 dispatch, pull request or task it was seen on. Reports are triaged through the
 statuses `new`, `confirmed`, `environmental` (the cause lies outside SWARM),
 `duplicate`, `ticketed` (it became a GitHub issue, which is filed outside SWARM and
-then linked), `resolved` and `dismissed`. For now they are read and written
-through the operator MCP server's `bug_report*` tools, by anyone with `member` on
-the project (`contributor` to read), and by an agent holding a scoped agent
-credential, which may file reports and add occurrences but not triage them; the
-dashboard view is not there yet. See [`docs/mcp.md`](./mcp.md#bug-reports).
+then linked), `resolved` and `dismissed`. They are written through the operator
+MCP server's `bug_report*` tools, by anyone with `member` on the project
+(`contributor` to read), and by an agent holding a scoped agent credential, which
+may file reports and add occurrences but not triage them. See
+[`docs/mcp.md`](./mcp.md#bug-reports).
+
+**The Issues tab shows them in the dashboard** (issue #1390). It is on the
+**General** page, which the sidebar's **Settings** link opens (`/settings?tab=issues`),
+and every signed-in user sees it: it lists the reports of the projects you can
+read, plus installation-wide ones if you are an installation admin. It starts on
+the open reports (`new`, `confirmed`, `environmental`, `ticketed`); the chips above
+the list switch to **All** or to one status. Each row shows the title, status,
+project (**Installation** for an installation-wide report), how many times it was
+seen, when it was first and last seen, and the GitHub issue once it is ticketed.
+Selecting a report opens its detail, with a link of its own
+(`/settings?tab=issues&report=<id>`): the description, who filed it and from which
+agent run, the report it duplicates, the GitHub issue, and every occurrence, each
+with a link to its run. The tab is read-only — filing and triage stay with MCP.
 
 For a terminal recognised response stall, SWARM labels a task as **likely scope
 exceeded** only when it also observed substantial progress and the most recent

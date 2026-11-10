@@ -17,7 +17,7 @@ const INPUT_CLASS =
 	'block w-full px-3 py-2 text-sm bg-zinc-900 border border-zinc-700 rounded text-zinc-100 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-violet-500 focus:border-violet-500 font-mono transition-shadow disabled:opacity-50 disabled:cursor-not-allowed';
 
 /**
- * The General Settings → **Credentials** tab (issue #769): one write-only masked-secret
+ * The General screen's **Credentials** tab (issue #769): one write-only masked-secret
  * field per `(SCM provider, role)` pair a provider declares eligible for an
  * instance-level default, adapted from `components/projects/credentials-panel.tsx`'s
  * `CredentialField` (the masked-secret pattern, `ai/DESIGN_SYSTEM.md` §4).

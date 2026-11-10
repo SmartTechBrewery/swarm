@@ -21,7 +21,7 @@ const ERROR_BANNER_CLASS =
 	'p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded';
 
 /**
- * The General Settings → **Users** tab (issue #1151): the dashboard face of the
+ * The General screen's **Users** tab (issue #1151): the dashboard face of the
  * `users` router (`src/api/routers/users.ts`), so an installation admin can add a
  * colleague, reset a forgotten password, and grant or revoke installation admin
  * without a shell. `swarm users` stays the shell alternative.

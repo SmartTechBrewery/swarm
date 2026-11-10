@@ -1,12 +1,20 @@
 import { z } from 'zod';
 
 /**
- * The tabs on the General Settings screen, in display order (issue #250 added
- * `appearance`, issue #769 `credentials`, issue #1151 `users`, issue #1284 `fleet`). The administrator-only
- * tabs stay together and `appearance` — every viewer's tab, and the fallback — stays
- * last.
+ * The tabs on the General screen (`/settings`, the sidebar's **Settings** link), in
+ * display order (issue #250 added `appearance`, issue #769 `credentials`, issue #1151
+ * `users`, issue #1284 `fleet`, issue #1390 `issues`). The administrator-only tabs stay
+ * together, then the tabs every viewer sees: `issues` (SWARM's own bug reports) and
+ * `appearance` — the fallback — which stays last.
  */
-export const SETTINGS_TABS = ['agents', 'credentials', 'users', 'fleet', 'appearance'] as const;
+export const SETTINGS_TABS = [
+	'agents',
+	'credentials',
+	'users',
+	'fleet',
+	'issues',
+	'appearance',
+] as const;
 
 export type SettingsTab = (typeof SETTINGS_TABS)[number];
 
@@ -42,6 +50,11 @@ export interface SettingsViewer {
  * - `fleet` (issue #1284) is visibility on top of enforcement of the one key it edits:
  *   `settings.update` refuses a non-administrator's change to
  *   `workers.followInstallationVersion` with `FORBIDDEN` (`src/api/routers/settings.ts`).
+ *
+ * `issues` (issue #1390) is deliberately **not** here: every signed-in user sees it,
+ * and `bugReports.list` scopes what it shows — the viewer's own projects' reports,
+ * plus installation-wide ones for an instance administrator only
+ * (`src/api/routers/bugReports.ts`).
  */
 const INSTANCE_ADMIN_ONLY_TABS: readonly SettingsTab[] = [
 	'agents',
@@ -65,6 +78,11 @@ const FALLBACK_SETTINGS_TAB: SettingsTab = 'appearance';
  */
 export const settingsSearchSchema = z.object({
 	tab: z.enum(SETTINGS_TABS).optional().catch(undefined),
+	/**
+	 * The bug report the Issues tab shows in detail (issue #1390), so a report is
+	 * linkable as `?tab=issues&report=<id>`. A malformed id degrades to none.
+	 */
+	report: z.string().uuid().optional().catch(undefined),
 });
 
 export type SettingsSearch = z.infer<typeof settingsSearchSchema>;
@@ -93,13 +111,19 @@ export function resolveActiveSettingsTab(
  * Whether a tab renders from the `settings.get` blob, so the screen waits on that
  * query (and shows its error) before rendering it. Agent Defaults reads `agents`, Fleet
  * reads `workers`, and both it and Appearance merge their update onto the whole blob;
- * Credentials and Users each own their query and stay usable when `settings.get` fails.
+ * Credentials, Users and Issues each own their query and stay usable when `settings.get`
+ * fails.
  */
 export function settingsTabNeedsAppSettings(tab: SettingsTab): boolean {
 	return tab === 'agents' || tab === 'fleet' || tab === 'appearance';
 }
 
-/** Search state for switching to a tab. */
+/** Search state for switching to a tab — which drops any open bug report. */
 export function settingsTabSearch(tab: SettingsTab): SettingsSearch {
 	return { tab };
+}
+
+/** Search state for the Issues tab showing `reportId` in detail, or the list alone. */
+export function bugReportSearch(reportId: string | undefined): SettingsSearch {
+	return reportId === undefined ? { tab: 'issues' } : { tab: 'issues', report: reportId };
 }
