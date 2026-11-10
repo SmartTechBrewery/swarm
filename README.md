@@ -117,7 +117,9 @@ registration and approval, and each of your own workers' live CLI quota.
 An optional seventh, **Resolve problem** (off unless a project turns it on), runs
 an agent against one *failed run* with SWARM's own operator MCP tools and no
 checkout: it diagnoses, tries SWARM's recovery tools within a write cap, and files
-a bug report; it never changes code ([docs/pipeline.md](docs/pipeline.md#pipeline-phases)).
+a bug report; it never changes code. It starts by itself once a run has been
+failed for ten minutes with nothing picking it up, at most once per failed run
+([docs/MANUAL.md](docs/MANUAL.md#the-resolve-problem-phase)).
 
 All six run on any worker, over the same transport — which machine a worker
 happens to be is not a factor. One deliberate exception: a phase *continuing*

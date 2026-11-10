@@ -28,6 +28,7 @@ import {
 	isNotNull,
 	isNull,
 	lt,
+	lte,
 	ne,
 	notExists,
 	notInArray,
@@ -35,6 +36,7 @@ import {
 	type SQL,
 	sql,
 } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
 import type { AgentCli } from '../../harness/agent-cli.js';
 import type { AgentUsage } from '../../harness/usage.js';
 import { isRestartingUpdateStatus } from '../../identity/worker-update-rollout.js';
@@ -2790,4 +2792,108 @@ export async function listResolveProblemAttempts(
 		.from(runs)
 		.where(eq(runs.resolvesRunId, failedRunId))
 		.orderBy(desc(runs.startedAt));
+}
+
+/**
+ * Failed pipeline runs that nothing has picked up since they settled — the
+ * candidates the Resolve problem trigger dispatches an attempt for (issue #1396,
+ * `../../dispatch/resolve-problem-trigger.ts`, which owns the delay and the
+ * project opt-in). A run is returned only while all of these hold:
+ *
+ *  - it is `kind = 'pipeline'`, `status = 'failed'` — never `deferred`/`checkpointed`,
+ *    which retry by themselves — and not itself a Resolve problem run;
+ *  - it completed in `[since, settledBefore]`, and its project is in `projectIds`;
+ *  - it has recovered in no way of its own: no `next_retry_at` still ahead, no
+ *    non-terminal dispatch for the run, and no Reset ever begun on it
+ *    (`reset_started_at`) — a Reset is an operator's hand on the run, and the window
+ *    between its stamp and its replacement dispatch must not be raced;
+ *  - its task or pull request was not picked up: no non-terminal dispatch and no
+ *    run started after it for the same `(repository, task)` or `(repository, PR)`.
+ *    Resolve problem dispatches and runs do not count;
+ *  - no Resolve problem attempt exists for it — a run linked by `resolves_run_id`,
+ *    or a dispatch already holding its `resolve-problem:<runId>` dedup key (one
+ *    whose claim declined to run left no run behind, and re-offering it every pass
+ *    would only meet the dedup conflict again).
+ *
+ * `projectIds` is the scope; an empty one is answered without a query.
+ */
+export async function listUnrecoveredFailedRuns(options: {
+	projectIds: readonly string[];
+	settledBefore: Date;
+	since: Date;
+}): Promise<PipelineRunRow[]> {
+	const { projectIds, settledBefore, since } = options;
+	if (projectIds.length === 0) return [];
+	const db = getDb();
+	const activeStates = ['pending', 'leased', 'running', 'retry-scheduled'];
+	const sameTaskOrPr = (taskId: AnyColumn, repository: AnyColumn, prNumber: AnyColumn): SQL =>
+		and(
+			or(isNull(repository), eq(repository, runs.repository)),
+			or(eq(taskId, runs.taskId), and(isNotNull(runs.prNumber), eq(prNumber, runs.prNumber))),
+		) as SQL;
+
+	const activeDispatchForRun = db
+		.select({ id: dispatches.id })
+		.from(dispatches)
+		.where(and(eq(dispatches.runId, runs.id), inArray(dispatches.state, activeStates)));
+	const activeDispatchForTask = db
+		.select({ id: dispatches.id })
+		.from(dispatches)
+		.where(
+			and(
+				eq(dispatches.projectId, runs.projectId),
+				inArray(dispatches.state, activeStates),
+				or(isNull(dispatches.phase), ne(dispatches.phase, RESOLVE_PROBLEM_PHASE)),
+				sameTaskOrPr(dispatches.taskId, dispatches.repository, dispatches.prNumber),
+			),
+		);
+	const newer = alias(runs, 'newer_run');
+	const newerRunForTask = db
+		.select({ id: newer.id })
+		.from(newer)
+		.where(
+			and(
+				eq(newer.projectId, runs.projectId),
+				eq(newer.kind, PIPELINE_RUN_KIND),
+				ne(newer.id, runs.id),
+				ne(newer.phase, RESOLVE_PROBLEM_PHASE),
+				gt(newer.startedAt, runs.startedAt),
+				sameTaskOrPr(newer.taskId, newer.repository, newer.prNumber),
+			),
+		);
+	const attempt = alias(runs, 'resolve_problem_attempt');
+	const existingAttemptRun = db
+		.select({ id: attempt.id })
+		.from(attempt)
+		.where(eq(attempt.resolvesRunId, runs.id));
+	const existingAttemptDispatch = db
+		.select({ id: dispatches.id })
+		.from(dispatches)
+		// `resolveProblemDedupKey` (`../../dispatch/resolve-problem.ts`), spelled in SQL.
+		.where(eq(dispatches.dedupKey, sql`'resolve-problem:' || ${runs.id}::text`));
+
+	const rows = await db
+		.select()
+		.from(runs)
+		.where(
+			and(
+				eq(runs.kind, PIPELINE_RUN_KIND),
+				eq(runs.status, 'failed'),
+				ne(runs.phase, RESOLVE_PROBLEM_PHASE),
+				inArray(runs.projectId, [...projectIds]),
+				isNotNull(runs.repository),
+				isNotNull(runs.taskId),
+				gte(runs.completedAt, since),
+				lte(runs.completedAt, settledBefore),
+				or(isNull(runs.nextRetryAt), lte(runs.nextRetryAt, sql`now()`)),
+				isNull(runs.resetStartedAt),
+				notExists(activeDispatchForRun),
+				notExists(activeDispatchForTask),
+				notExists(newerRunForTask),
+				notExists(existingAttemptRun),
+				notExists(existingAttemptDispatch),
+			),
+		)
+		.orderBy(asc(runs.completedAt), asc(runs.id));
+	return rows.filter(isPipelineRun);
 }

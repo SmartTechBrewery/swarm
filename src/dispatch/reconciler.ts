@@ -11,6 +11,10 @@
  *    dispatches at startup and on every periodic pass — the periodic pass only
  *    once the run's dispatches have settled for {@link ORPHAN_SETTLE_GRACE_MS},
  *    and never for a run an active #1049 recheck backs (issue #1210);
+ *  - unrecovered failures: a run left `failed` for ten minutes, with nothing
+ *    picking it or its task up, gets one Resolve problem attempt in a project
+ *    that turned the phase on (issue #1396, `./resolve-problem-trigger.ts`) —
+ *    periodic pass only;
  *  - legacy shapes: Redis pending-continuation entries and the retired
  *    merge-follow-up queue are imported as durable dispatches once, at startup.
  *
@@ -53,6 +57,7 @@ import { priorityFor } from '../queue/producer.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import { mergeDispatchDedupKey } from '../worker/merge-automation.js';
 import { publishDispatchWakeUp } from './dispatcher.js';
+import { dispatchResolveProblemForFailedRuns } from './resolve-problem-trigger.js';
 import { awaitsReviewRecheck } from './review-recheck-wait.js';
 import { promoteAllWipWaits } from './wip-limit.js';
 
@@ -496,7 +501,9 @@ export async function reconcileDispatchesAtStartup(): Promise<void> {
  * deferred runs left without a dispatch (issue #1210), re-publish any wake-up a
  * crash window lost, and nudge tickets waiting on a repository's WIP limit
  * (issue #1185) whose slot-release wake-up went missing, which also picks up an
- * operator raising that limit.
+ * operator raising that limit. Last, dispatch Resolve problem for failed runs
+ * nothing picked up (issue #1396) — after the repairs above, so a retry they
+ * re-queued in this pass already counts as picking the run up.
  *
  * The orphan backfill runs after the lease reclaim but with the settle grace, so
  * a run whose lease was reclaimed in this pass (a fresh `updated_at`) is picked
@@ -523,6 +530,8 @@ export async function reconcileDispatchesPeriodically(): Promise<void> {
 				wakeUpsRepublished: republished,
 			});
 		}
+		// Never throws, and logs its own outcome.
+		await dispatchResolveProblemForFailedRuns();
 	} catch (err) {
 		logger.error('dispatch-reconciler: periodic reconciliation failed (continuing)', {
 			error: describeError(err),
