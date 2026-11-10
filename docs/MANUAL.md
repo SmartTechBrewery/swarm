@@ -17,6 +17,7 @@ their own subjects; this manual is the operator's path through them.
 - [The worker](#the-worker)
 - [One process, one port (all-in-one control plane)](#one-process-one-port-all-in-one-control-plane)
 - [Running on a VPS behind Caddy](#running-on-a-vps-behind-caddy)
+- [The Resolve problem phase](#the-resolve-problem-phase)
 - [Failure diagnosis](#failure-diagnosis)
 - [Common commands](#common-commands)
 - [Configuration](#configuration)
@@ -1754,6 +1755,96 @@ kept out of the default set by a profile, so it neither starts nor binds a port.
   docker compose exec -T postgres pg_restore -U swarm -d swarm --clean --if-exists < swarm-<date>.dump
   docker compose start app
   ```
+
+## The Resolve problem phase
+
+**Resolve problem** is an optional phase that tries to unblock a failed run by
+itself (issues #1384–#1396). An agent diagnoses the failure with SWARM's own
+operator MCP tools, tries SWARM's recovery tools within hard limits, and files a
+bug report. It never changes code. The phase reference is
+[`docs/pipeline.md`](./pipeline.md#pipeline-phases).
+
+**When it starts.** A periodic control-plane sweep, run with the dispatch
+reconciler's pass (`src/dispatch/resolve-problem-trigger.ts`), dispatches one
+attempt for a run when all of these hold:
+
+- the run is a pipeline run whose status is `failed`, and it settled **at least
+  10 minutes ago** and less than 24 hours ago. `deferred`, `checkpointed` and
+  every other state that retries by itself never qualify;
+- its project has the phase turned on;
+- the run has not recovered by itself: no retry or continuation of it is
+  scheduled or running, and nobody has reset it;
+- nothing else picked up its task or pull request: no other dispatch is waiting
+  or running for them, and no newer run was started on them. Resolve problem's
+  own dispatches and runs do not count;
+- the run is not itself a Resolve problem run, and it has no attempt yet.
+
+So every failed run gets at most one attempt, and a failed attempt never starts
+another. The ten minutes are fixed (`RESOLVE_PROBLEM_DELAY_MS`), not a setting.
+The dispatch is deduplicated on the failed run (`resolve-problem:<failedRunId>`),
+so two sweeps running at once create one.
+
+**Turning it on.** The phase is **off by default**. Turn it on with the
+**Enabled** toggle on the Resolve problem screen of the project's **Agents** tab,
+or set `pipeline.resolveProblem.enabled: true` in `swarm.config.json` and run
+`swarm config apply`. A dispatch reaching a project with it off is skipped.
+
+**Agent settings.** The same phase screen sets the ordered CLI/model `targets`,
+the `timeoutMs` (the installation's default agent timeout, 30 minutes unless
+`SWARM_AGENT_TIMEOUT_MS` changes it) and an optional custom `prompt`, which is
+added after SWARM's own instructions (`agents.resolveProblem`). **Write actions
+per run** is the cap on its real writes (`pipeline.resolveProblem.maxWriteActions`,
+5 by default, at most 50). Antigravity cannot attach an MCP server, so the phase is
+never routed to it. See [`docs/configuration.md`](./configuration.md).
+
+**The SWARM MCP server it needs.** The agent reaches SWARM through the operator
+MCP endpoint, `/operator/mcp` on `WEBHOOK_CALLBACK_BASE_URL` (or the worker's
+`SWARM_CONTROL_PLANE_URL` when that is unset). Before the agent starts, the worker
+checks that the server answers and offers the tools the phase needs: `run_get`,
+`runs_list`, `dispatch_history`, `run_reset`, `bug_reports_list`,
+`bug_report_create` and `bug_report_add_occurrence`. If the server is unreachable,
+refuses the credential or lacks a tool, the run fails at once with `SWARM operator
+MCP unreachable: <reason>` and is not retried.
+
+**The run-bound credential.** The control plane mints a credential for that one
+run when it builds the assignment:
+
+- it is held by the owner of the worker that runs the attempt;
+- it is valid for the phase timeout plus ten minutes, and revoked when the run
+  settles, whatever the outcome;
+- it reaches only the run's project and only the read, recovery and bug-report
+  tools ([`docs/mcp.md`](./mcp.md#run-bound-agent-credentials)).
+
+It is the one per-run credential that is sent to a worker.
+
+**Guardrails.** The agent runs in an empty scratch directory with no checkout,
+so it cannot change code. The server enforces, on every real (not dry-run) write:
+
+- **the write cap**: at most `maxWriteActions` real write calls per run;
+- **dry run first**: a real call needs an earlier successful dry run of the same
+  tool on the same target;
+- **no repeat**: the same tool is never applied twice to the same target in one
+  run.
+
+All three count every attempt of the run, so a deferred attempt that is retried
+keeps its budget. The prompt also tells the agent never to edit, push to, approve
+or merge a pull request, and never to undo a safety stop SWARM placed on purpose,
+such as the review-verdict cap, an exhausted merge retry or a user's termination.
+It reports those instead.
+
+**Bug reports.** Whatever it finds, the agent records it as a
+[bug report](#failure-diagnosis): it adds an occurrence to an existing report of
+the same problem, or files a new one, naming the failed run and its own run. It
+files a cause outside SWARM, such as the network, a CLI quota, Docker or a
+machine, with status `environmental`. SWARM checks the database for that
+occurrence: a run that filed none fails.
+
+**Escalation.** The attempt succeeds only when the agent reports `resolved` and
+SWARM finds the bug-report occurrence it filed. Anything else fails the attempt.
+The failure carries the agent's summary and every action it tried, and is posted
+on the failed run's board card (or its pull request), so a person picks it up
+from there. The failed run's detail page lists its attempts, and the attempt's
+page links back to the run it was resolving.
 
 ## Failure diagnosis
 

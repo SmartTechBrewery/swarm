@@ -6,8 +6,9 @@
  * failedRunId }`, `../queue/jobs.ts`). This module schedules one, turns a claimed
  * one into the phase's inputs by reading that run, mints and revokes the
  * run-bound credential the agent reaches SWARM with, and decides — by reading the
- * bug report the run had to file — whether the attempt succeeded. Nothing
- * schedules one automatically yet; phase 5 of the parent task adds that trigger.
+ * bug report the run had to file — whether the attempt succeeded. What schedules
+ * one automatically is the periodic sweep in `./resolve-problem-trigger.ts`
+ * (issue #1396).
  */
 
 import {
