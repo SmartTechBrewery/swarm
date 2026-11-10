@@ -115,6 +115,15 @@ import {
 	toRepositoryEntries,
 	toRepositoryForms,
 } from '@/lib/project-repository.js';
+import {
+	DEFAULT_RESOLVE_PROBLEM_MAX_WRITE_ACTIONS,
+	isMaxWriteActionsDirty,
+	maxWriteActionsInputToSync,
+	parseMaxWriteActionsInput,
+	RESOLVE_PROBLEM_MAX_WRITE_ACTIONS_LIMIT,
+	toMaxWriteActionsInput,
+	toMaxWriteActionsPatch,
+} from '@/lib/resolve-problem.js';
 import { trpc, trpcClient } from '@/lib/trpc.js';
 import type {
 	AgentConfig,
@@ -195,16 +204,24 @@ const PHASE_LABELS: Record<
 		code: 'resolveConflicts',
 		description: 'Resolves merge conflicts',
 	},
+	resolveProblem: {
+		label: 'Resolve problem',
+		code: 'resolveProblem',
+		description: 'Unblocks a failed run that did not recover by itself',
+	},
 };
 
 /**
  * Optional one-line explanation shown under a phase's detail heading. Most phases
  * need none; `implementationUnplanned` is a dispatch-time variant, so it clarifies
- * when its config actually applies.
+ * when its config actually applies, and `resolveProblem` (issue #1384) is the one
+ * optional phase that is off by default.
  */
 const PHASE_DESCRIPTIONS: Partial<Record<(typeof PHASES)[number], string>> = {
 	implementationUnplanned:
 		'Used only when Implementation was not preceded by a Planning run for this item; otherwise the Implementation configuration applies.',
+	resolveProblem:
+		"Off unless enabled. Runs 10 minutes after a run fails and nothing has picked its work up again. The agent can only use SWARM's operator MCP tools and never changes code.",
 };
 
 /**
@@ -750,9 +767,65 @@ interface PhaseSettingsDetailProps extends TargetHandlers {
 	 */
 	verifyPlan?: boolean;
 	handleVerifyPlanChange?: (enabled: boolean) => void;
+	/**
+	 * Resolve problem's "Write actions per run" text, or `undefined` for every other
+	 * phase — the cap is that phase's alone (issue #1384).
+	 */
+	maxWriteActionsInput?: string;
+	handleMaxWriteActionsChange?: (value: string) => void;
 	handleTimeoutChange: (phase: keyof AgentsConfig, value: string) => void;
 	handlePromptChange: (phase: keyof AgentsConfig, value: string) => void;
 	onBack: () => void;
+}
+
+/**
+ * Resolve problem's **Write actions per run** field (issue #1384), or nothing for a
+ * phase without the cap (`input === undefined`). Unlike the toggles it is an edit
+ * Save Changes owns, like the timeout beside it; blank means the default.
+ */
+export function PhaseWriteCapField({
+	phase,
+	input,
+	isPending,
+	onChange,
+}: {
+	phase: (typeof PHASES)[number];
+	input?: string;
+	isPending: boolean;
+	onChange?: (value: string) => void;
+}) {
+	if (input === undefined) return null;
+	const parsed = parseMaxWriteActionsInput(input);
+	const error = parsed.ok ? undefined : parsed.error;
+	return (
+		<div>
+			<label htmlFor={`${phase}-max-write-actions`} className={LABEL_CLASS}>
+				Write actions per run
+			</label>
+			<input
+				id={`${phase}-max-write-actions`}
+				type="number"
+				min="1"
+				max={RESOLVE_PROBLEM_MAX_WRITE_ACTIONS_LIMIT}
+				step="1"
+				inputMode="numeric"
+				value={input}
+				onChange={(e) => onChange?.(e.target.value)}
+				disabled={isPending}
+				placeholder={`${DEFAULT_RESOLVE_PROBLEM_MAX_WRITE_ACTIONS} (default)`}
+				aria-invalid={error ? true : undefined}
+				className={`${FIELD_CLASS} font-mono`}
+			/>
+			{error ? (
+				<p className="text-xs text-red-400 mt-1">{error}</p>
+			) : (
+				<p className="text-xs text-zinc-500 mt-1">
+					The most real (not dry-run) SWARM MCP write calls one run may make. Leave it blank for the
+					default.
+				</p>
+			)}
+		</div>
+	);
 }
 
 /**
@@ -1078,6 +1151,8 @@ export function PhaseSettingsDetail({
 	handleAutoAdvanceChange,
 	verifyPlan,
 	handleVerifyPlanChange,
+	maxWriteActionsInput,
+	handleMaxWriteActionsChange,
 	handleTargetChange,
 	handleAddTarget,
 	handleRemoveTarget,
@@ -1210,6 +1285,12 @@ export function PhaseSettingsDetail({
 							className={`${FIELD_CLASS} font-mono`}
 						/>
 					</div>
+					<PhaseWriteCapField
+						phase={phase}
+						input={maxWriteActionsInput}
+						isPending={isPending}
+						onChange={handleMaxWriteActionsChange}
+					/>
 				</div>
 			</div>
 
@@ -1345,6 +1426,9 @@ interface AgentConfigurationFormProps extends TargetHandlers {
 	handleEnabledChange: (phase: PipelineTogglePhase, enabled: boolean) => void;
 	handleAutoAdvanceChange: (phase: PipelineAutoAdvancePhase, enabled: boolean) => void;
 	handleVerifyPlanChange: (enabled: boolean) => void;
+	/** Resolve problem's write-cap field text (issue #1384); saved by Save Changes. */
+	maxWriteActionsInput: string;
+	handleMaxWriteActionsChange: (value: string) => void;
 	handleTimeoutChange: (phase: keyof AgentsConfig, value: string) => void;
 	handlePromptChange: (phase: keyof AgentsConfig, value: string) => void;
 	handleSubmit: (e: React.FormEvent) => void;
@@ -1400,6 +1484,8 @@ export function AgentConfigurationForm({
 	handleEnabledChange,
 	handleAutoAdvanceChange,
 	handleVerifyPlanChange,
+	maxWriteActionsInput,
+	handleMaxWriteActionsChange,
 	handleTargetChange,
 	handleAddTarget,
 	handleRemoveTarget,
@@ -1452,6 +1538,10 @@ export function AgentConfigurationForm({
 						selectedAutoAdvancePhase ? pipelineAutoAdvance[selectedAutoAdvancePhase] : undefined
 					}
 					verifyPlan={selectedPhase === 'planning' ? verifyPlan : undefined}
+					maxWriteActionsInput={
+						selectedPhase === 'resolveProblem' ? maxWriteActionsInput : undefined
+					}
+					handleMaxWriteActionsChange={handleMaxWriteActionsChange}
 					handleEnabledChange={handleEnabledChange}
 					handleAutoAdvanceChange={handleAutoAdvanceChange}
 					handleVerifyPlanChange={handleVerifyPlanChange}
@@ -1830,6 +1920,9 @@ export function useToggleAutoSave({
 			patch.respondToReview = { enabled };
 		} else if (phase === 'respondToCi') {
 			patch.respondToCi = { enabled };
+		} else if (phase === 'resolveProblem') {
+			// Merged server-side, so the stored `maxWriteActions` survives the flip.
+			patch.resolveProblem = { enabled };
 		}
 
 		persist(toggleSaveKey(phase, 'enabled'), patch, () => setPipelineEnabled(prev));
@@ -1961,8 +2054,9 @@ export function toGeneralSettingsUpdate(
  * `maxContinuations: null` clears the budget back to its default — the wire is plain
  * JSON, so an unset key could never say so (issue #1259).
  */
-export type PipelinePatch = Omit<PipelineConfig, 'maxContinuations'> & {
+export type PipelinePatch = Omit<PipelineConfig, 'maxContinuations' | 'resolveProblem'> & {
 	maxContinuations?: number | null;
+	resolveProblem?: { enabled?: boolean; maxWriteActions?: number | null };
 };
 
 /**
@@ -2130,6 +2224,7 @@ function ProjectDetailRouteComponent() {
 	const [verifyPlan, setVerifyPlan] = useState(() => toVerifyPlanForm(undefined));
 	const [skipRespondToReviewOnMinors, setSkipRespondToReviewOnMinors] = useState(true);
 	const [maxContinuationsInput, setMaxContinuationsInput] = useState('');
+	const [maxWriteActionsInput, setMaxWriteActionsInput] = useState('');
 	const [boardMapping, setBoardMapping] = useState<BoardMappingForm>(() =>
 		toBoardMappingForm(undefined),
 	);
@@ -2187,6 +2282,15 @@ function ProjectDetailRouteComponent() {
 		if (changed.agents) {
 			setAgents(normalizeAgentsForDisplay(project.agents ?? {}));
 		}
+
+		// Re-seeded only when the stored cap itself moved, so flipping the Resolve problem
+		// toggle (a `pipeline` write) keeps an unsaved cap edit on the same screen.
+		const syncedCap = maxWriteActionsInputToSync(
+			lastSyncedProjectRef.current?.pipeline,
+			project.pipeline,
+			lastSyncedProjectRef.current === undefined,
+		);
+		setMaxWriteActionsInput((current) => syncedCap ?? current);
 
 		if (changed.pipeline) {
 			setPipelineEnabled(toPipelineEnabledForm(project.pipeline));
@@ -2296,8 +2400,14 @@ function ProjectDetailRouteComponent() {
 	const dirtyAgentPhases = useMemo(() => {
 		if (!project) return [];
 		const projectAgents = project.agents ?? {};
-		return PHASES.filter((phase) => isPhaseConfigDirty(agents[phase], projectAgents[phase]));
-	}, [project, agents]);
+		return PHASES.filter(
+			(phase) =>
+				isPhaseConfigDirty(agents[phase], projectAgents[phase]) ||
+				// Resolve problem's write cap is saved by the same Save Changes (issue #1384).
+				(phase === 'resolveProblem' &&
+					isMaxWriteActionsDirty(maxWriteActionsInput, project.pipeline)),
+		);
+	}, [project, agents, maxWriteActionsInput]);
 
 	const isAgentsDirty = useMemo(() => {
 		if (!project) return false;
@@ -2315,8 +2425,9 @@ function ProjectDetailRouteComponent() {
 	const hasAgentValidationError = useMemo(
 		() =>
 			anyCustomPromptError(PHASES.map((phase) => agents[phase]?.prompt)) ||
-			PHASES.some((phase) => hasDuplicateCli(agents[phase]?.targets ?? [])),
-		[agents],
+			PHASES.some((phase) => hasDuplicateCli(agents[phase]?.targets ?? [])) ||
+			!parseMaxWriteActionsInput(maxWriteActionsInput).ok,
+		[agents, maxWriteActionsInput],
 	);
 
 	// Raw text, not the parsed budget: an invalid entry is still an edit Reset must undo.
@@ -2408,8 +2519,14 @@ function ProjectDetailRouteComponent() {
 			// Resets only the non-toggle edits the Save Changes button owns; the
 			// toggles auto-save and already reflect the stored state (issue #369).
 			setAgents(normalizeAgentsForDisplay(project.agents ?? {}));
+			setMaxWriteActionsInput(toMaxWriteActionsInput(project.pipeline));
 			updateMutation.reset();
 		}
+	};
+
+	const handleMaxWriteActionsChange = (value: string) => {
+		setMaxWriteActionsInput(value);
+		updateMutation.reset();
 	};
 
 	const handleAgentsSubmit = (e: React.FormEvent) => {
@@ -2423,10 +2540,13 @@ function ProjectDetailRouteComponent() {
 		const finalAgents = cleanAgentsConfig(agents);
 		// Only `agents` — the Enabled/Auto-advance toggles persist immediately via
 		// `useToggleAutoSave`, so Save Changes must not re-send (or stomp) their state
-		// (issue #369).
+		// (issue #369). The one pipeline value it carries is Resolve problem's write cap,
+		// as a merged patch naming that field alone, and only when it changed.
+		const capPatch = toMaxWriteActionsPatch(maxWriteActionsInput, project?.pipeline);
 		updateMutation.mutate({
 			id: projectId,
 			agents: finalAgents,
+			...(capPatch && { pipeline: capPatch }),
 		});
 	};
 
@@ -2682,6 +2802,8 @@ function ProjectDetailRouteComponent() {
 						handleEnabledChange={handleEnabledChange}
 						handleAutoAdvanceChange={handleAutoAdvanceChange}
 						handleVerifyPlanChange={handleVerifyPlanChange}
+						maxWriteActionsInput={maxWriteActionsInput}
+						handleMaxWriteActionsChange={handleMaxWriteActionsChange}
 						handleTargetChange={handleTargetChange}
 						handleAddTarget={handleAddTarget}
 						handleRemoveTarget={handleRemoveTarget}
