@@ -3632,6 +3632,7 @@ describe('processJob', () => {
 				repositories?: string[];
 				drainingSince?: Date | null;
 				rateLimitedClis?: Map<AgentCli, Date>;
+				lastDispatchedAt?: Date | null;
 			} = {},
 		): WorkerDispatchCandidate {
 			const capabilities = overrides.capabilities ?? ['claude'];
@@ -3665,6 +3666,7 @@ describe('processJob', () => {
 					allowedPhases: [...DEFAULT_ENROLLMENT_ALLOWED_PHASES],
 					concurrencyAllocation: 1,
 					orderIndex: 0,
+					lastDispatchedAt: overrides.lastDispatchedAt ?? null,
 					sharingConsent: overrides.sharingConsent ?? true,
 					createdAt: new Date('2026-01-01T00:00:00Z'),
 					updatedAt: new Date('2026-01-01T00:00:00Z'),
@@ -4080,8 +4082,10 @@ describe('processJob', () => {
 					);
 
 					expect(outcome.status).toBe('phase-succeeded');
+					// Resuming on the preserved machine is not a new task, so it does not
+					// advance the "Shuffle workers" rotation (issue #1416).
 					expect(claimWorkerForDispatch).toHaveBeenCalledWith(
-						expect.objectContaining({ selectedWorkerId: 'w-a' }),
+						expect.objectContaining({ selectedWorkerId: 'w-a', countsAsRotationTurn: false }),
 					);
 					// The re-bind keeps the sticky pin, so a later wait still knows the machine.
 					expect(resetRunBindings[0].recovery).toMatchObject({ state: 'recovered' });
@@ -4658,6 +4662,32 @@ describe('processJob', () => {
 
 			expect(claimWorkerForDispatch).toHaveBeenCalledWith(
 				expect.objectContaining({ selectedWorkerId: workerId }),
+			);
+		});
+
+		// Issue #1416: `pipeline.shuffleWorkers` prefers the least recently dispatched
+		// eligible worker over the configured order, and every fresh claim is a turn.
+		it.each([
+			[true, 'w-fresh'],
+			[false, 'w-first'],
+			[undefined, 'w-first'],
+		] as const)('routes with shuffleWorkers=%s to %s', async (shuffleWorkers, workerId) => {
+			projectLookup = () =>
+				createMockProjectConfig({ pipeline: { shuffleWorkers } }) as ProjectConfig;
+			listProjectDispatchCandidates.mockResolvedValue([
+				candidate('w-first', { lastDispatchedAt: new Date('2026-11-01T10:00:00Z') }),
+				candidate('w-fresh', { lastDispatchedAt: null }),
+			]);
+
+			await processJob(
+				createMockPmWebhookJob(),
+				registryReturning(planningTrigger(createMockWorkItem({ statusId: '61e4505c' }))),
+				undefined,
+				executionIdentity(workerId),
+			);
+
+			expect(claimWorkerForDispatch).toHaveBeenCalledWith(
+				expect.objectContaining({ selectedWorkerId: workerId, countsAsRotationTurn: true }),
 			);
 		});
 

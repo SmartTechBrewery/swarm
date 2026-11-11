@@ -61,7 +61,11 @@ import { workers } from './workers.js';
  * whole project of them, and two concurrent enrollments can compute the same
  * append position. A new row appends (`max(order_index) + 1` for the project) so
  * enrolling a machine never lands it mid-order; a reorder rewrites that project's
- * positions to a dense `0..n-1`. `sharing_consent` defaults to `false` (a fresh
+ * positions to a dense `0..n-1`. `last_dispatched_at` (issue #1416) records when
+ * this worker last claimed a phase run for the project — nullable, `NULL` meaning
+ * never — and is read only when the project turns on `pipeline.shuffleWorkers`,
+ * which prefers the least recently dispatched eligible worker over the configured
+ * order. `sharing_consent` defaults to `false` (a fresh
  * enrollment is never routable until the owner opts in), so revoking consent is
  * the owner's explicit lever for flipping the routability predicate
  * (`isRoutable`).
@@ -112,6 +116,13 @@ export const workerProjectEnrollments = pgTable(
 		 * duplicates are legal.
 		 */
 		orderIndex: integer('order_index').notNull().default(DEFAULT_ENROLLMENT_ORDER_INDEX),
+		/**
+		 * When this worker last claimed a phase run for this project (issue #1416),
+		 * stamped by `claimWorkerForDispatch`. `NULL` means never. Read only by the
+		 * dispatch gate's "Shuffle workers" rotation (`pipeline.shuffleWorkers`); see
+		 * the table doc-comment.
+		 */
+		lastDispatchedAt: timestamp('last_dispatched_at'),
 		/** Owner-controlled, revocable; defaults false so a fresh enrollment is not routable until the owner opts in. */
 		sharingConsent: boolean('sharing_consent').notNull().default(false),
 		createdAt: timestamp('created_at').notNull().defaultNow(),

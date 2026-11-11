@@ -123,6 +123,7 @@ function enrollment(overrides: Partial<WorkerEnrollment> = {}): WorkerEnrollment
 		allowedPhases: ['review'],
 		concurrencyAllocation: 1,
 		orderIndex: 0,
+		lastDispatchedAt: null,
 		sharingConsent: true,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),

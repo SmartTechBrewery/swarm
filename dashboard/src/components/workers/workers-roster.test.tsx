@@ -20,6 +20,8 @@ const {
 	startFleetUpdateForInstallationMutate,
 	requestUpdateForProjectMutate,
 	reorderMutate,
+	projectGetByIdQueryFn,
+	projectUpdateMutate,
 	navigate,
 } = vi.hoisted(() => ({
 	workersListQueryFn: vi.fn(),
@@ -39,6 +41,10 @@ const {
 	// Issue #1010 — the project-scoped selection over that same fan-out.
 	requestUpdateForProjectMutate: vi.fn(),
 	reorderMutate: vi.fn(),
+	// Issue #1416 — the project record the Shuffle workers checkbox reads, and the
+	// pipeline patch it writes.
+	projectGetByIdQueryFn: vi.fn(),
+	projectUpdateMutate: vi.fn(),
 	navigate: vi.fn(),
 }));
 
@@ -76,6 +82,14 @@ vi.mock('@/lib/trpc.js', () => ({
 			list: {
 				queryOptions: () => ({ queryKey: ['projects.list'], queryFn: projectsListQueryFn }),
 			},
+			// The global roster passes `skipToken` (a symbol) and must issue no read.
+			getById: {
+				queryOptions: (input: { id: string } | symbol) => ({
+					queryKey: ['projects.getById', input],
+					queryFn: () => projectGetByIdQueryFn(input),
+					enabled: typeof input !== 'symbol',
+				}),
+			},
 			// The table's **Enrolled** column asks this per visible project (issue #1035)
 			// to decide whether the status switch is actionable. Left pending here, which
 			// is the fail-closed reading — this suite is about the roster around the
@@ -99,6 +113,9 @@ vi.mock('@/lib/trpc.js', () => ({
 			requestUpdateForInstallation: { mutate: requestUpdateForInstallationMutate },
 			startFleetUpdateForInstallation: { mutate: startFleetUpdateForInstallationMutate },
 			requestUpdateForProject: { mutate: requestUpdateForProjectMutate },
+		},
+		projects: {
+			update: { mutate: projectUpdateMutate },
 		},
 	},
 }));
@@ -166,10 +183,18 @@ beforeEach(() => {
 		startFleetUpdateForInstallationMutate,
 		requestUpdateForProjectMutate,
 		reorderMutate,
+		projectGetByIdQueryFn,
+		projectUpdateMutate,
 		navigate,
 	]) {
 		m.mockReset();
 	}
+	// A project that never touched the setting — the default every existing project
+	// reads as (issue #1416).
+	projectGetByIdQueryFn.mockImplementation(async (input: { id: string }) => ({
+		id: input.id,
+		pipeline: {},
+	}));
 	workersQueryOptions.mockReturnValue({
 		queryKey: ['workers.list'],
 		queryFn: workersListQueryFn,
@@ -343,6 +368,101 @@ describe('WorkersRoster reorder controls (issue #750 phase 2)', () => {
 				.slice(1)
 				.map((row) => row.querySelector('td > div')?.textContent),
 		).toEqual(['ada-laptop', 'grace-box']);
+	});
+});
+
+describe('WorkersRoster Shuffle workers (issue #1416)', () => {
+	const PAIR = [makeWorker(), makeWorker({ workerId: 'worker-2', displayName: 'grace-box' })];
+	const shuffleBox = () => screen.findByRole('checkbox', { name: 'Shuffle workers' });
+
+	it('shows the checkbox unchecked by default on a project tab', async () => {
+		workersListQueryFn.mockResolvedValue(PAIR);
+		renderRoster(<WorkersRoster projectId="proj-a" canAdminister />);
+
+		const box = (await shuffleBox()) as HTMLInputElement;
+		await vi.waitFor(() => expect(box.disabled).toBe(false));
+		expect(box.checked).toBe(false);
+		expect(projectGetByIdQueryFn).toHaveBeenCalledWith({ id: 'proj-a' });
+	});
+
+	it('offers no checkbox on the global screen', async () => {
+		workersListQueryFn.mockResolvedValue(PAIR);
+		renderRoster(<WorkersRoster canAdminister />);
+
+		await screen.findByText('ada-laptop');
+		expect(screen.queryByRole('checkbox', { name: 'Shuffle workers' })).toBeNull();
+		expect(projectGetByIdQueryFn).not.toHaveBeenCalled();
+	});
+
+	it('hides the reorder arrows while the stored setting is on', async () => {
+		workersListQueryFn.mockResolvedValue(PAIR);
+		projectGetByIdQueryFn.mockResolvedValue({ id: 'proj-a', pipeline: { shuffleWorkers: true } });
+		renderRoster(<WorkersRoster projectId="proj-a" canAdminister />);
+
+		const box = (await shuffleBox()) as HTMLInputElement;
+		await vi.waitFor(() => expect(box.checked).toBe(true));
+		expect(screen.queryByRole('button', { name: /^Move / })).toBeNull();
+	});
+
+	it('saves a check, hides the arrows, and brings them back with the order intact on uncheck', async () => {
+		workersListQueryFn.mockResolvedValue(PAIR);
+		projectUpdateMutate.mockImplementation(
+			async (input: { id: string; pipeline: { shuffleWorkers: boolean } }) => ({
+				id: input.id,
+				pipeline: { shuffleWorkers: input.pipeline.shuffleWorkers },
+			}),
+		);
+		renderRoster(<WorkersRoster projectId="proj-a" canAdminister />);
+		expect(await screen.findByRole('button', { name: 'Move grace-box up' })).toBeDefined();
+
+		fireEvent.click(await shuffleBox());
+
+		await vi.waitFor(() => expect(screen.queryByRole('button', { name: /^Move / })).toBeNull());
+		expect(projectUpdateMutate).toHaveBeenCalledWith({
+			id: 'proj-a',
+			pipeline: { shuffleWorkers: true },
+		});
+		expect(((await shuffleBox()) as HTMLInputElement).checked).toBe(true);
+
+		fireEvent.click(await shuffleBox());
+
+		expect(await screen.findByRole('button', { name: 'Move grace-box up' })).toBeDefined();
+		expect(projectUpdateMutate).toHaveBeenLastCalledWith({
+			id: 'proj-a',
+			pipeline: { shuffleWorkers: false },
+		});
+		// Toggling never touched the stored order.
+		expect(reorderMutate).not.toHaveBeenCalled();
+		expect(
+			screen
+				.getAllByRole('row')
+				.slice(1)
+				.map((row) => row.querySelector('td > div')?.textContent),
+		).toEqual(['ada-laptop', 'grace-box']);
+	});
+
+	it('falls back to the stored value and says why when the save is refused', async () => {
+		workersListQueryFn.mockResolvedValue(PAIR);
+		projectUpdateMutate.mockRejectedValue(new Error('Only a project administrator may do that.'));
+		renderRoster(<WorkersRoster projectId="proj-a" canAdminister />);
+		const box = (await shuffleBox()) as HTMLInputElement;
+		await vi.waitFor(() => expect(box.disabled).toBe(false));
+
+		fireEvent.click(box);
+
+		expect(await screen.findByText('Only a project administrator may do that.')).toBeDefined();
+		expect(box.checked).toBe(false);
+		expect(screen.getByRole('button', { name: 'Move grace-box up' })).toBeDefined();
+	});
+
+	it('shows a member the setting without letting them change it', async () => {
+		workersListQueryFn.mockResolvedValue(PAIR);
+		projectGetByIdQueryFn.mockResolvedValue({ id: 'proj-a', pipeline: { shuffleWorkers: true } });
+		renderRoster(<WorkersRoster projectId="proj-a" />);
+
+		const box = (await shuffleBox()) as HTMLInputElement;
+		await vi.waitFor(() => expect(box.checked).toBe(true));
+		expect(box.disabled).toBe(true);
 	});
 });
 

@@ -293,6 +293,7 @@ function makeEnrollment(overrides: Partial<WorkerEnrollment> = {}): WorkerEnroll
 		allowedPhases: [...ALL_TRIGGER_PHASES],
 		concurrencyAllocation: 1,
 		orderIndex: 0,
+		lastDispatchedAt: null,
 		sharingConsent: false,
 		createdAt: new Date(0),
 		updatedAt: new Date(0),

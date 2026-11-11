@@ -193,6 +193,12 @@ export const WorkerEnrollmentSchema = z.object({
 	concurrencyAllocation: ConcurrencyAllocationSchema,
 	/** This worker's rank within its project's order (issue #750) — see {@link EnrollmentOrderIndexSchema}. */
 	orderIndex: EnrollmentOrderIndexSchema,
+	/**
+	 * When this worker last claimed a phase run for the project (issue #1416), or
+	 * `null` if it never has. Read only by the `pipeline.shuffleWorkers` rotation
+	 * (`src/worker/worker-rotation.ts`).
+	 */
+	lastDispatchedAt: z.date().nullable(),
 	sharingConsent: z.boolean(),
 	createdAt: z.date(),
 	updatedAt: z.date(),

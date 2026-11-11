@@ -60,7 +60,10 @@ import {
 	recordRunPreservedWorker,
 } from '../../../src/db/repositories/runsRepository.js';
 import { createUser } from '../../../src/db/repositories/usersRepository.js';
-import { createEnrollment } from '../../../src/db/repositories/workerEnrollmentsRepository.js';
+import {
+	createEnrollment,
+	getEnrollment,
+} from '../../../src/db/repositories/workerEnrollmentsRepository.js';
 import { acquireLease } from '../../../src/db/repositories/workerSessionsRepository.js';
 import {
 	createWorker,
@@ -1145,6 +1148,73 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			expect(await getWorkerDispatchClaimState(worker.id, PROJECT_ID)).toEqual({
 				activeRuns: 0,
 				currentRunId: null,
+			});
+		});
+
+		// Issue #1416: the "Shuffle workers" rotation's durable record. Stamped by a
+		// successful claim only, never by a refused one, and not by a continuation
+		// pinned to its preserved checkout — and never mistaken for an enrollment edit.
+		describe('the rotation record (issue #1416)', () => {
+			function claimInput(
+				worker: { id: string },
+				session: { id: string; fencingToken: number },
+				dispatch: DispatchRow,
+			) {
+				return {
+					dispatchId: dispatch.id,
+					dispatchLeaseOwner: dispatch.leaseOwner ?? '',
+					projectId: PROJECT_ID,
+					selectedWorkerId: worker.id,
+					executionWorkerId: worker.id,
+					workerSessionId: session.id,
+					workerFencingToken: session.fencingToken,
+					cli: 'claude' as AgentCli,
+					heartbeatTtlMs: 60_000,
+				};
+			}
+
+			it('records when the worker took a phase run, leaving the enrollment’s updatedAt alone', async () => {
+				const { worker, session } = await seedFederatedWorker(1, 'rotation-stamp');
+				const before = await getEnrollment(worker.id, PROJECT_ID);
+				expect(before?.lastDispatchedAt).toBeNull();
+				const dispatch = await leasedDispatch('host-rotation:1');
+
+				const startedAt = Date.now();
+				const result = await claimWorkerForDispatch(claimInput(worker, session, dispatch));
+
+				expect(result).toMatchObject({ claimed: true });
+				const after = await getEnrollment(worker.id, PROJECT_ID);
+				expect(after?.lastDispatchedAt?.getTime()).toBeGreaterThanOrEqual(startedAt - 1000);
+				expect(after?.updatedAt).toEqual(before?.updatedAt);
+			});
+
+			it('records nothing for a continuation pinned to its preserved checkout', async () => {
+				const { worker, session } = await seedFederatedWorker(1, 'rotation-pinned');
+				const dispatch = await leasedDispatch('host-rotation:2');
+
+				const result = await claimWorkerForDispatch({
+					...claimInput(worker, session, dispatch),
+					countsAsRotationTurn: false,
+				});
+
+				expect(result).toMatchObject({ claimed: true });
+				expect((await getEnrollment(worker.id, PROJECT_ID))?.lastDispatchedAt).toBeNull();
+			});
+
+			it('records nothing when the claim is refused', async () => {
+				const { worker, session } = await seedFederatedWorker(1, 'rotation-refused');
+				const busy = await leasedDispatch('host-rotation:3');
+				await claimWorkerForDispatch({
+					...claimInput(worker, session, busy),
+					countsAsRotationTurn: false,
+				});
+				const refused = await leasedDispatch('host-rotation:4');
+
+				expect(await claimWorkerForDispatch(claimInput(worker, session, refused))).toEqual({
+					claimed: false,
+					reason: 'worker-unavailable',
+				});
+				expect((await getEnrollment(worker.id, PROJECT_ID))?.lastDispatchedAt).toBeNull();
 			});
 		});
 
