@@ -240,6 +240,11 @@ export class GitWorktreeManager {
 		await this.runtime.claim(this.project.id, taskId);
 	}
 
+	/** See {@link WorktreeRuntime.awaitOwnRunRelease} (issue #1421). */
+	async awaitOwnRunRelease(taskId: string): Promise<void> {
+		await this.runtime.awaitOwnRunRelease?.(this.project.id, taskId);
+	}
+
 	async releaseLease(taskId: string): Promise<void> {
 		await this.runtime.release(this.project.id, taskId);
 	}
@@ -355,6 +360,9 @@ export class GitWorktreeManager {
 		}
 
 		const path = this.worktreePath(taskId);
+		// A lease this same run still holds through another owner here (issue #1421)
+		// is about to be released; wait for it rather than reading it as a collision.
+		await this.awaitOwnRunRelease(taskId);
 		// Read before the lease gate (issue #1140): claiming or taking over the lease
 		// rewrites its owner and clears this run's own pin, erasing the evidence.
 		const ownRun =

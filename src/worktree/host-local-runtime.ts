@@ -54,6 +54,7 @@ import {
 	writeFileSync,
 } from 'node:fs';
 import { resolve } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { z } from 'zod';
 // Shared with the daemon's own checkout lock (`./checkout-lock.ts`, issue #689) so
 // "is that owner still alive" has one definition on this host, TTLs apart.
@@ -137,6 +138,48 @@ export interface HostLocalWorktreeRuntimeOptions {
 	 * aborted phase preserves the checkout for the pinned retry instead of removing it.
 	 */
 	preserveOnCancel?: () => boolean;
+	/**
+	 * How long {@link WorktreeRuntime.awaitOwnRunRelease} waits for another owner of
+	 * this same run to release the lease, and how often it looks. Injected in tests.
+	 */
+	ownRunReleaseWaitMs?: number;
+	ownRunReleasePollMs?: number;
+}
+
+/**
+ * The owner id prefix a reset's checkout discard (`../transport/checkout-discard.ts`,
+ * issue #1402) writes its lease under — shared so a waiting attempt can name it.
+ */
+export const CHECKOUT_DISCARD_OWNER_PREFIX = 'checkout-discard:';
+
+/**
+ * How long an attempt waits for its own run's other lease holder on this host
+ * (issue #1421). A reset's discard holds the lease across one `git worktree remove`,
+ * which takes seconds even for a large checkout; two minutes leaves room for a slow
+ * disk while staying far below a phase's own budget.
+ */
+const OWN_RUN_RELEASE_WAIT_MS = 2 * 60 * 1000;
+const OWN_RUN_RELEASE_POLL_MS = 500;
+
+/**
+ * The lease is still held on this host by another owner of the **same run** after
+ * the bounded wait (issue #1421) — the discard of the run's abandoned checkout that
+ * Reset & restart requested, or an earlier attempt still finishing. Deliberately not
+ * a {@link BlockedRecoveryError}: nothing here protects another run's work, so the
+ * attempt defers and is retried rather than settling the run terminally.
+ */
+export class OwnRunLeaseHeldError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'OwnRunLeaseHeldError';
+	}
+}
+
+/** The lease holder as an operator reads it in {@link OwnRunLeaseHeldError}'s message. */
+function describeOwnRunHolder(ownerId: string): string {
+	return ownerId.startsWith(CHECKOUT_DISCARD_OWNER_PREFIX)
+		? "the removal of this run's abandoned checkout that Reset & restart requested"
+		: `an earlier attempt of this run (dispatch ${ownerId})`;
 }
 
 function stateKey(projectId: string, taskId: string): string {
@@ -405,6 +448,34 @@ export function createHostLocalWorktreeRuntime(
 		},
 		async clearPreservation(projectId, taskId) {
 			rmSync(paths(projectId, taskId).pin, { force: true });
+		},
+		async awaitOwnRunRelease(projectId, taskId) {
+			// Only a run can have "its own" other holder; a run-less owner key is unique.
+			if (options.runId === undefined) return;
+			const waitMs = options.ownRunReleaseWaitMs ?? OWN_RUN_RELEASE_WAIT_MS;
+			const pollMs = options.ownRunReleasePollMs ?? OWN_RUN_RELEASE_POLL_MS;
+			const deadline = Date.now() + waitMs;
+			for (;;) {
+				const current = readJson(paths(projectId, taskId).owner, LocalLeaseSchema);
+				// Free, unreadable, ours already, another run's, or gone: the ordinary
+				// claim/provision gates decide, exactly as before.
+				if (
+					!current ||
+					current.ownerId === options.ownerId ||
+					current.ownerKey !== ownerKey ||
+					!ownerIsLive(current)
+				) {
+					return;
+				}
+				if (Date.now() >= deadline || options.shutdownSignal?.aborted) {
+					throw new OwnRunLeaseHeldError(
+						`Worktree for task '${taskId}' is still held on this host by ${describeOwnRunHolder(current.ownerId)} ` +
+							`after waiting ${Math.round(waitMs / 1000)}s for it to be released. ` +
+							"It is this run's own checkout, not another run's, so the attempt is retried automatically.",
+					);
+				}
+				await sleep(pollMs);
+			}
 		},
 	};
 

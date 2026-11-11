@@ -31,6 +31,14 @@ export interface WorktreeRuntime {
 	preserve(projectId: string, taskId: string, runId?: string): Promise<void>;
 	/** Drop host-local preservation metadata once no checkout remains to protect. */
 	clearPreservation(projectId: string, taskId: string): Promise<void>;
+	/**
+	 * Wait, bounded, while another owner of this **same run** on this host holds the
+	 * task's lease — a reset's discard of the run's abandoned checkout racing the
+	 * restarted attempt on the same worker (issue #1421) — and throw a deferrable
+	 * error if it is still held afterwards. Returns at once for any other state.
+	 * Host-local only: the store-backed lease records no run, so it has no such holder.
+	 */
+	awaitOwnRunRelease?(projectId: string, taskId: string): Promise<void>;
 }
 
 /**
