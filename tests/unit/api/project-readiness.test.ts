@@ -106,7 +106,11 @@ function mappedProject(
 }
 
 function candidate(
-	overrides: { connected?: boolean; clis?: string[] } = {},
+	overrides: {
+		connected?: boolean;
+		clis?: string[];
+		ownerPrivilege?: WorkerDispatchCandidate['ownerPrivilege'];
+	} = {},
 ): WorkerDispatchCandidate {
 	return {
 		worker: {
@@ -126,6 +130,7 @@ function candidate(
 		},
 		availability: { connected: overrides.connected ?? true, activeRuns: 1 },
 		rateLimitedClis: new Map(),
+		ownerPrivilege: overrides.ownerPrivilege ?? 'projectAdmin',
 	} as unknown as WorkerDispatchCandidate;
 }
 
@@ -278,6 +283,36 @@ describe('checkProjectReadiness', () => {
 		expect(itemsOf(noCli, 'workers').find((item) => item.item === 'phase planning')?.status).toBe(
 			'ok',
 		);
+	});
+
+	// Issue #1419: Resolve problem runs only on a worker owned by a project or
+	// installation administrator, and readiness says so in plain words.
+	it('does not count a member-owned worker as serving Resolve problem', async () => {
+		const project = () => mappedProject({ pipeline: { resolveProblem: { enabled: true } } });
+		const phaseItem = (report: Awaited<ReturnType<typeof checkProjectReadiness>>, phase: string) =>
+			itemsOf(report, 'workers').find((item) => item.item === `phase ${phase}`);
+
+		const memberOwned = await checkProjectReadiness(
+			project(),
+			deps({
+				listCandidates: vi.fn().mockResolvedValue([candidate({ ownerPrivilege: 'none' })]),
+			}),
+		);
+		expect(phaseItem(memberOwned, 'resolve-problem')).toMatchObject({
+			status: 'missing',
+			detail: expect.stringContaining(
+				'laptop: owner is not a project or installation administrator (Resolve problem needs one)',
+			),
+		});
+		expect(phaseItem(memberOwned, 'implementation')?.status).toBe('ok');
+
+		const instanceOwned = await checkProjectReadiness(
+			project(),
+			deps({
+				listCandidates: vi.fn().mockResolvedValue([candidate({ ownerPrivilege: 'instanceAdmin' })]),
+			}),
+		);
+		expect(phaseItem(instanceOwned, 'resolve-problem')?.status).toBe('ok');
 	});
 
 	it('reports a project with no enrolled worker and one with no projectAdmin', async () => {

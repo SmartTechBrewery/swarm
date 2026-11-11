@@ -33,7 +33,7 @@
  *   worker + enrollment + resolved availability, in the project's configured
  *   worker order (issue #750) — the deterministic sequence the scheduler selects
  *   by, which on a project nobody has reordered is still enrollment-creation
- *   order.
+ *   order — each carrying its owner's privilege on the project (issue #1419).
  * - `listProjectWorkerIdsInOrder(projectId)` — that same order as bare worker
  *   ids, for a caller that already holds the rows and only needs to sort them.
  *
@@ -69,6 +69,7 @@ import {
 	getActiveWorkerClaims,
 	getWorkerDispatchClaimState,
 } from '../db/repositories/dispatchesRepository.js';
+import { listMembersForProject } from '../db/repositories/projectMembersRepository.js';
 import { findProjectRecordByIdFromDb } from '../db/repositories/projectsRepository.js';
 import { getRunByIdFromDb, isPipelineRun } from '../db/repositories/runsRepository.js';
 import { getUserById } from '../db/repositories/usersRepository.js';
@@ -362,7 +363,24 @@ export interface WorkerDispatchCandidate {
 	 * same reason. Empty for a machine cooling on nothing, which is the ordinary case.
 	 */
 	rateLimitedClis: ReadonlyMap<AgentCli, Date>;
+	/**
+	 * How much authority the worker's **owner** holds on this project (issue #1419) —
+	 * a fifth DB-resolved signal, carried here for the same reason as the two above.
+	 * The Resolve problem phase routes on it, because its agent's SWARM tools act
+	 * with the owner's rights; every other phase ignores it. Required rather than
+	 * optional, like {@link rateLimitedClis}, so no fixture or caller can forget it.
+	 */
+	ownerPrivilege: WorkerOwnerPrivilege;
 }
+
+/**
+ * How much authority a worker's owner holds on the candidate's project (issue
+ * #1419): an installation administrator, a project administrator of that project
+ * (and not an installation administrator), or neither — a `member`, a
+ * `contributor`, someone with no membership at all, or an owner whose user row is
+ * gone.
+ */
+export type WorkerOwnerPrivilege = 'instanceAdmin' | 'projectAdmin' | 'none';
 
 /**
  * Every worker enrolled in `projectId`, in the scheduler's **deterministic
@@ -389,14 +407,21 @@ export interface WorkerDispatchCandidate {
  * resolved in **one batched read** before the loop rather than as a fourth
  * per-worker query — and still filtering nothing: a cooling machine is a candidate
  * the predicate refuses for a named reason, not one this listing hides.
+ *
+ * And each carries its owner's privilege on the project (issue #1419): one
+ * membership read for the project, plus one user read per **distinct** owner
+ * (several machines of one owner cost one read). Nothing is filtered on it here
+ * either — only the gate decides which phase cares.
  */
 export async function listProjectDispatchCandidates(
 	projectId: string,
 ): Promise<WorkerDispatchCandidate[]> {
 	const enrollments = await listEnrollmentsForProject(projectId);
+	if (enrollments.length === 0) return [];
 	const rateLimits = await listActiveWorkerCliRateLimits(
 		enrollments.map((enrollment) => enrollment.workerId),
 	);
+	const ownerPrivilegeOf = await ownerPrivilegeResolver(projectId);
 	const candidates: WorkerDispatchCandidate[] = [];
 	for (const enrollment of enrollments) {
 		const worker = await getWorkerById(enrollment.workerId);
@@ -407,9 +432,40 @@ export async function listProjectDispatchCandidates(
 			enrollment,
 			availability: { connected, activeRuns },
 			rateLimitedClis: rateLimits.get(worker.id) ?? new Map<AgentCli, Date>(),
+			ownerPrivilege: await ownerPrivilegeOf(worker.ownerUserId),
 		});
 	}
 	return candidates;
+}
+
+/**
+ * A memoised `ownerUserId → WorkerOwnerPrivilege` lookup for one project (issue
+ * #1419). An installation administrator outranks any membership role, so the user
+ * row is consulted first; otherwise only a `projectAdmin` membership counts.
+ */
+async function ownerPrivilegeResolver(
+	projectId: string,
+): Promise<(ownerUserId: string) => Promise<WorkerOwnerPrivilege>> {
+	const roles = new Map(
+		(await listMembersForProject(projectId)).map((membership) => [
+			membership.userId,
+			membership.role,
+		]),
+	);
+	const resolved = new Map<string, Promise<WorkerOwnerPrivilege>>();
+	return (ownerUserId) => {
+		let privilege = resolved.get(ownerUserId);
+		if (!privilege) {
+			privilege = (async (): Promise<WorkerOwnerPrivilege> => {
+				const user = await getUserById(ownerUserId);
+				if (!user) return 'none';
+				if (user.instanceAdmin) return 'instanceAdmin';
+				return roles.get(ownerUserId) === 'projectAdmin' ? 'projectAdmin' : 'none';
+			})();
+			resolved.set(ownerUserId, privilege);
+		}
+		return privilege;
+	};
 }
 
 /**

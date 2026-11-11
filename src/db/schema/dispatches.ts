@@ -74,7 +74,9 @@ export const dispatches = pgTable(
 		 * `mergeability` (the provider has not computed it yet), `read-failed` (a
 		 * re-check retrying a read that never answered), `worker-eligibility`,
 		 * `worker-authorization`, `worker-rate-limited` (every candidate machine has
-		 * hit its usage limit on this phase's CLIs — issue #988),
+		 * hit its usage limit on this phase's CLIs — issue #988), `admin-worker`
+		 * (Resolve problem waiting for a worker owned by a project or installation
+		 * administrator — issue #1419),
 		 * `preserved-worker`, `task-in-flight` (a later phase
 		 * of a task whose earlier phase is still executing — issue #759 — or an
 		 * Implementation behind a Planning dispatch it must not overtake, queued or

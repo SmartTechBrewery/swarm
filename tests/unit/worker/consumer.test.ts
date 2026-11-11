@@ -3674,6 +3674,7 @@ describe('processJob', () => {
 				availability: { connected: true, activeRuns: overrides.activeRuns ?? 0 },
 				// Cooling on nothing (issue #981) — the regression bar for every case here.
 				rateLimitedClis: overrides.rateLimitedClis ?? new Map(),
+				ownerPrivilege: 'projectAdmin',
 			};
 		}
 
@@ -10788,6 +10789,55 @@ describe('processJob', () => {
 			expect(input.jobPayload).toMatchObject({ type: 'resolve-problem', runId: 'run-1' });
 			expect((input.jobPayload as { resumeSession?: boolean }).resumeSession).toBeFalsy();
 			expect(revokeRunBoundAgentTokens).toHaveBeenCalledWith('run-1');
+		});
+
+		// Issue #1419: both owner-privilege refusals record their own wait reason, so the
+		// Queue says the run waits for an administrator's worker.
+		it('records an owner-privilege refusal as an admin-worker wait', async () => {
+			const workerOwnedBy = (
+				id: string,
+				ownerPrivilege: WorkerDispatchCandidate['ownerPrivilege'],
+				activeRuns = 0,
+			) =>
+				({
+					worker: {
+						id,
+						ownerUserId: `owner-${id}`,
+						displayName: `worker-${id}`,
+						capabilities: ['claude'],
+						supportedPhases: [...DEFAULT_WORKER_SUPPORTED_PHASES],
+						repositories: [],
+						drainingSince: null,
+					},
+					enrollment: {
+						status: 'active',
+						sharingConsent: true,
+						allowedClis: ['claude'],
+						allowedPhases: [...DEFAULT_ENROLLMENT_ALLOWED_PHASES],
+						concurrencyAllocation: 1,
+						lastDispatchedAt: null,
+					},
+					availability: { connected: true, activeRuns },
+					rateLimitedClis: new Map(),
+					ownerPrivilege,
+				}) as unknown as WorkerDispatchCandidate;
+			async function waitReasonFor(candidates: WorkerDispatchCandidate[]) {
+				scheduleDispatchRetry.mockClear();
+				listProjectDispatchCandidates.mockResolvedValue(candidates);
+				const outcome = await processJob(RESOLVE_JOB, registryReturning(null));
+				expect(outcome).toMatchObject({ status: 'phase-deferred', workerEligibilityRecheck: true });
+				const [, input] = scheduleDispatchRetry.mock.calls[0] as [string, Record<string, unknown>];
+				return input.waitReason;
+			}
+
+			expect(await waitReasonFor([workerOwnedBy('w-member', 'none')])).toBe('admin-worker');
+			expect(
+				await waitReasonFor([
+					workerOwnedBy('w-instance', 'instanceAdmin', 1),
+					workerOwnedBy('w-project', 'projectAdmin'),
+				]),
+			).toBe('admin-worker');
+			expect(phaseCalls).toEqual([]);
 		});
 
 		it('skips, running nothing, when the failed run is no longer failed', async () => {

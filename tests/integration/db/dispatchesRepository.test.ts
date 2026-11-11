@@ -2318,6 +2318,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 				| 'worker-eligibility'
 				| 'worker-authorization'
 				| 'worker-rate-limited'
+				| 'admin-worker'
 				| 'preserved-worker',
 			overrides: { projectId?: string; runId?: string; availableAt?: Date } = {},
 		): Promise<DispatchRow> {
@@ -2436,6 +2437,22 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			// intent it carries is untouched, exactly as for `worker-eligibility`.
 			expect(promoted?.attempt).toBe(waiting.attempt);
 			expect(promoted?.jobPayload).toEqual(waiting.jobPayload);
+		});
+
+		// Issue #1419: Resolve problem's wait for an administrator's worker is cleared by
+		// a qualifying machine enrolling, connecting or freeing a slot — so it is woken
+		// like the other roster-wide waits, at both gates.
+		it('wakes an admin-worker wait for a routably-enrolled machine, at both promotion gates', async () => {
+			const workerId = await seedEnrolledWorker('admin-owned');
+			const waiting = await deferredDispatch('admin-worker');
+
+			expect((await listAvailabilityWaitsForWorker(workerId)).map((row) => row.id)).toEqual([
+				waiting.id,
+			]);
+
+			const promoted = await promoteDispatchToImmediateWake(waiting.id, waiting.wakeSeq);
+			expect(promoted?.waitReason).toBe('admin-worker');
+			expect(promoted?.availableAt.getTime()).toBeLessThanOrEqual(Date.now());
 		});
 
 		// The scoping rule is the eligibility wait's, not a looser one: a cooling

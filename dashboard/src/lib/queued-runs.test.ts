@@ -114,6 +114,17 @@ describe('queuedWaitReasonLabel', () => {
 		);
 	});
 
+	// Issue #1419: Resolve problem waits for an administrator's worker, which a free
+	// member-owned machine does not end — so it must not read as "no worker free".
+	it('names whose worker Resolve problem is waiting for', () => {
+		expect(queuedWaitReasonLabel('admin-worker')).toBe(
+			'waiting for a worker owned by a project or installation administrator',
+		);
+		expect(queuedWaitReasonLabel('admin-worker')).not.toBe(
+			queuedWaitReasonLabel('worker-eligibility'),
+		);
+	});
+
 	// Issue #1075: an automatic retry after the run's worker dropped off and never came
 	// back — a timed wait, so it names what happened rather than a machine to wait for.
 	it('names the lost connection for an automatic transport-loss retry', () => {

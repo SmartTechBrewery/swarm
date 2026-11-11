@@ -213,6 +213,19 @@ export type DispatchWaitReason =
 	 */
 	| 'worker-rate-limited'
 	/**
+	 * The same gate refused a **Resolve problem** dispatch on its owner-privilege
+	 * rule (issue #1419): no permitted worker is owned by a project administrator of
+	 * the project or an installation administrator, or the installation-admin-owned
+	 * worker it prefers is connected but has no free slot and is being waited for.
+	 * Split out of `worker-eligibility` so the Queue says *which* workers it waits
+	 * for, since a free member-owned machine does not end it.
+	 *
+	 * Promoted like an availability wait: a qualifying machine enrolling, connecting
+	 * or freeing a slot is exactly what clears it. A role grant is picked up by the
+	 * next timed re-check. Same cadence, attempt counter, and budget as the rest.
+	 */
+	| 'admin-worker'
+	/**
 	 * A continuation is waiting for the one machine that holds its preserved
 	 * checkout (issue #567). Distinct from `worker-eligibility` on purpose: that
 	 * reason means "no capable worker", while this one means the capable workers
@@ -2276,6 +2289,10 @@ export async function listRunnableDispatchesForPool(
  * cooling simply re-refuses, token-free — the same cost every other availability
  * promotion already accepts.
  *
+ * `admin-worker` (issue #1419) is present on the same reasoning: it too is an
+ * aggregate over the project's workers, and a qualifying machine enrolling,
+ * connecting or freeing a slot is what clears it.
+ *
  * **Both readers must derive from this one const.** The candidate listing
  * ({@link listAvailabilityWaitsForWorker}) and the conditional re-date
  * ({@link promoteDispatchToImmediateWake}) gate independently, and the promotion
@@ -2304,6 +2321,7 @@ export async function listRunnableDispatchesForPool(
 export const PROMOTABLE_AVAILABILITY_WAIT_REASONS = [
 	'worker-eligibility',
 	'worker-rate-limited',
+	'admin-worker',
 	'preserved-worker',
 	'merge-queue',
 	'recheck',
@@ -2312,7 +2330,7 @@ export const PROMOTABLE_AVAILABILITY_WAIT_REASONS = [
 
 /**
  * The subset of {@link PROMOTABLE_AVAILABILITY_WAIT_REASONS} offered by **project
- * enrollment** rather than by a recorded machine — the two aggregate refusals the
+ * enrollment** rather than by a recorded machine — the aggregate refusals the
  * dispatch gate records when no candidate could take the work right now.
  * `preserved-worker` is excluded because it is keyed on the pinned machine
  * instead (see {@link listAvailabilityWaitsForWorker}).
@@ -2320,6 +2338,7 @@ export const PROMOTABLE_AVAILABILITY_WAIT_REASONS = [
 const ROUTABLE_ENROLLMENT_WAIT_REASONS = [
 	'worker-eligibility',
 	'worker-rate-limited',
+	'admin-worker',
 ] as const satisfies readonly DispatchWaitReason[];
 
 /**
@@ -2327,7 +2346,8 @@ const ROUTABLE_ENROLLMENT_WAIT_REASONS = [
  * start (issue #610) — the candidate set for an early wake-up, keyed on the two
  * different things the waits are actually waiting for:
  *
- * - `worker-eligibility` and `worker-rate-limited` — any dispatch in a project
+ * - `worker-eligibility`, `worker-rate-limited` and `admin-worker` (issue #1419) —
+ *   any dispatch in a project
  *   this worker is **routable** enrolled in (`isRoutable`: an active enrollment
  *   with its owner's sharing consent). Deliberately no narrower: the row records a
  *   category, not the roster walk behind it, and re-deriving affinity or target

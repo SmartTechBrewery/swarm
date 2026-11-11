@@ -28,6 +28,13 @@ const { getWorkerById, listAllWorkers, listWorkersForOwner } = vi.hoisted(() => 
 	listWorkersForOwner: vi.fn(),
 }));
 const { getUserById } = vi.hoisted(() => ({ getUserById: vi.fn() }));
+// The project's memberships, read once per candidate listing to resolve each owner's
+// privilege (issue #1419) — nobody is a member unless a case says so.
+const { listMembersForProject } = vi.hoisted(() => ({
+	listMembersForProject: vi.fn<(projectId: string) => Promise<{ userId: string; role: string }[]>>(
+		async () => [],
+	),
+}));
 const { findProjectRecordByIdFromDb } = vi.hoisted(() => ({
 	findProjectRecordByIdFromDb: vi.fn(),
 }));
@@ -61,6 +68,7 @@ vi.mock('@/db/repositories/workersRepository.js', () => ({
 	listWorkersForOwner,
 }));
 vi.mock('@/db/repositories/usersRepository.js', () => ({ getUserById }));
+vi.mock('@/db/repositories/projectMembersRepository.js', () => ({ listMembersForProject }));
 vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	findProjectRecordByIdFromDb,
 }));
@@ -1512,6 +1520,70 @@ describe('the project worker order (issue #750)', () => {
 		expect(candidates[0]?.rateLimitedClis.get('claude')).toEqual(resetAt);
 		// A machine with no record reads as an empty map, never `undefined`.
 		expect(candidates[1]?.rateLimitedClis.size).toBe(0);
+	});
+
+	// Issue #1419: the owner's privilege on the project, which Resolve problem routes on.
+	describe('listProjectDispatchCandidates resolves each owner’s privilege', () => {
+		const THIRD_WORKER_ID = '77777777-7777-4777-8777-777777777777';
+		const ADMIN_OWNER = '33333333-3333-4333-8333-333333333333';
+
+		async function privilegeFor(
+			user: SwarmUser | undefined,
+			role?: 'projectAdmin' | 'member' | 'contributor',
+		) {
+			listEnrollmentsForProject.mockResolvedValue([makeEnrollment()]);
+			getWorkerById.mockResolvedValue(makeWorker());
+			getLiveSessionForWorker.mockResolvedValue(undefined);
+			getUserById.mockResolvedValue(user);
+			listMembersForProject.mockResolvedValue(role ? [{ userId: OWNER_ID, role }] : []);
+			const [candidate] = await listProjectDispatchCandidates('proj-a');
+			return candidate?.ownerPrivilege;
+		}
+
+		it('an installation administrator, member or not', async () => {
+			expect(await privilegeFor(makeOwner({ instanceAdmin: true }))).toBe('instanceAdmin');
+			expect(await privilegeFor(makeOwner({ instanceAdmin: true }), 'member')).toBe(
+				'instanceAdmin',
+			);
+		});
+
+		it('a project administrator of this project', async () => {
+			expect(await privilegeFor(makeOwner(), 'projectAdmin')).toBe('projectAdmin');
+			expect(listMembersForProject).toHaveBeenCalledWith('proj-a');
+		});
+
+		it('nobody else — a member, a contributor, no membership, or an unknown user', async () => {
+			expect(await privilegeFor(makeOwner(), 'member')).toBe('none');
+			expect(await privilegeFor(makeOwner(), 'contributor')).toBe('none');
+			expect(await privilegeFor(makeOwner())).toBe('none');
+			expect(await privilegeFor(undefined, 'projectAdmin')).toBe('none');
+		});
+
+		it('reads each distinct owner once', async () => {
+			listEnrollmentsForProject.mockResolvedValue([
+				makeEnrollment({ id: 'e1', workerId: WORKER_ID }),
+				makeEnrollment({ id: 'e2', workerId: SECOND_WORKER_ID }),
+				makeEnrollment({ id: 'e3', workerId: THIRD_WORKER_ID }),
+			]);
+			getWorkerById.mockImplementation(async (id: string) =>
+				makeWorker({ id, ownerUserId: id === THIRD_WORKER_ID ? ADMIN_OWNER : OWNER_ID }),
+			);
+			getLiveSessionForWorker.mockResolvedValue(undefined);
+			getUserById.mockImplementation(async (id: string) =>
+				makeOwner({ id, instanceAdmin: id === ADMIN_OWNER }),
+			);
+			listMembersForProject.mockResolvedValue([{ userId: OWNER_ID, role: 'projectAdmin' }]);
+
+			const candidates = await listProjectDispatchCandidates('proj-a');
+
+			expect(candidates.map((candidate) => candidate.ownerPrivilege)).toEqual([
+				'projectAdmin',
+				'projectAdmin',
+				'instanceAdmin',
+			]);
+			expect(getUserById).toHaveBeenCalledTimes(2);
+			expect(listMembersForProject).toHaveBeenCalledTimes(1);
+		});
 	});
 
 	it('moveProjectWorkerOrder delegates the move and returns the new order', async () => {
