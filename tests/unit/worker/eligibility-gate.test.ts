@@ -67,6 +67,8 @@ function makeCandidate(
 		activeRuns?: number;
 		/** Live CLI cool-downs (issue #981) — empty unless a case is about one. */
 		rateLimitedClis?: ReadonlyMap<AgentCli, Date>;
+		/** The owner's privilege on the project (issue #1419) — a project admin unless a case says otherwise. */
+		ownerPrivilege?: WorkerDispatchCandidate['ownerPrivilege'];
 	} = {},
 ): WorkerDispatchCandidate {
 	return {
@@ -119,6 +121,7 @@ function makeCandidate(
 		// Cooling on nothing (issue #981), which is what every case that says nothing
 		// about a usage limit assumes.
 		rateLimitedClis: overrides.rateLimitedClis ?? new Map(),
+		ownerPrivilege: overrides.ownerPrivilege ?? 'projectAdmin',
 	};
 }
 
@@ -211,6 +214,10 @@ describe('isAvailabilityRefusal', () => {
 		// lapses there by itself, so time alone really does clear this — unlike
 		// `worker-draining` below, which a human reverses.
 		'cli-rate-limited',
+		// Issue #1419: aggregates over the roster that a qualifying machine enrolling,
+		// connecting or freeing a slot clears.
+		'admin-owned-worker-required',
+		'instance-admin-worker-busy',
 	];
 	/** Nothing a connecting machine can change — a human must act. */
 	const AUTHORIZATION: readonly DispatchIneligibilityReason[] = [
@@ -1980,6 +1987,200 @@ describe('evaluateDispatchEligibility', () => {
 				reason: 'assignee-worker-unavailable',
 			});
 		});
+	});
+});
+
+// Issue #1419 — Resolve problem's agent acts with the selected worker's *owner*'s
+// rights, so only a worker owned by a project or installation administrator may take
+// it, installation-admin-owned workers first — and a busy one is waited for.
+describe('Resolve problem routes by owner privilege (issue #1419)', () => {
+	const RESOLVE = { phase: 'resolve-problem', targets: [{ cli: 'claude' }] } as const;
+	const resolveInput = (overrides: Partial<DispatchGateInput> = {}) =>
+		gateInput({ ...RESOLVE, targets: [...RESOLVE.targets], ...overrides });
+
+	beforeEach(() => {
+		listProjectDispatchCandidates.mockReset();
+		resolveAssignedUser.mockReset();
+		resolveAssignedUser.mockResolvedValue(undefined);
+	});
+
+	it('never selects a worker whose owner is below the floor, however early it sits', async () => {
+		listProjectDispatchCandidates.mockResolvedValue([
+			makeCandidate('w-member', { ownerPrivilege: 'none' }),
+			makeCandidate('w-admin', { ownerPrivilege: 'projectAdmin' }),
+		]);
+
+		expect(await evaluateDispatchEligibility(resolveInput())).toMatchObject({
+			status: 'selected',
+			selection: { workerId: 'w-admin' },
+		});
+	});
+
+	it('waits with its own reason when no worker meets the floor', async () => {
+		listProjectDispatchCandidates.mockResolvedValue([
+			makeCandidate('w-member', { ownerPrivilege: 'none' }),
+			makeCandidate('w-contributor', { ownerPrivilege: 'none' }),
+		]);
+
+		const decision = await evaluateDispatchEligibility(resolveInput());
+
+		expect(decision).toMatchObject({ status: 'ineligible', reason: 'admin-owned-worker-required' });
+		if (decision.status !== 'ineligible') throw new Error('unreachable');
+		expect(decision.message).toContain('project administrator');
+		expect(decision.message).toContain('installation administrator');
+		expect(decision.message).toContain('2 enrolled workers owned by other members were');
+	});
+
+	it('prefers an installation-admin-owned worker over an earlier project-admin-owned one', async () => {
+		listProjectDispatchCandidates.mockResolvedValue([
+			makeCandidate('w-project', { ownerPrivilege: 'projectAdmin' }),
+			makeCandidate('w-instance', { ownerPrivilege: 'instanceAdmin' }),
+		]);
+
+		expect(await evaluateDispatchEligibility(resolveInput())).toMatchObject({
+			status: 'selected',
+			selection: { workerId: 'w-instance' },
+		});
+	});
+
+	it('prefers it with "Shuffle workers" too, whatever the rotation says', async () => {
+		listProjectDispatchCandidates.mockResolvedValue([
+			makeCandidate('w-project', {
+				ownerPrivilege: 'projectAdmin',
+				enrollment: { lastDispatchedAt: null },
+			}),
+			makeCandidate('w-instance', {
+				ownerPrivilege: 'instanceAdmin',
+				enrollment: { lastDispatchedAt: new Date('2026-11-01T00:00:00Z') },
+			}),
+		]);
+
+		expect(await evaluateDispatchEligibility(resolveInput({ shuffleWorkers: true }))).toMatchObject(
+			{ status: 'selected', selection: { workerId: 'w-instance' } },
+		);
+	});
+
+	it('waits for a busy installation-admin-owned worker instead of a free project-admin one', async () => {
+		listProjectDispatchCandidates.mockResolvedValue([
+			makeCandidate('w-instance', { ownerPrivilege: 'instanceAdmin', activeRuns: 1 }),
+			makeCandidate('w-project', { ownerPrivilege: 'projectAdmin' }),
+		]);
+
+		const decision = await evaluateDispatchEligibility(resolveInput());
+
+		expect(decision).toMatchObject({ status: 'ineligible', reason: 'instance-admin-worker-busy' });
+		if (decision.status !== 'ineligible') throw new Error('unreachable');
+		expect(decision.message).toContain("worker 'worker-w-instance'");
+
+		// It frees a slot: the run starts there.
+		listProjectDispatchCandidates.mockResolvedValue([
+			makeCandidate('w-instance', { ownerPrivilege: 'instanceAdmin', activeRuns: 0 }),
+			makeCandidate('w-project', { ownerPrivilege: 'projectAdmin' }),
+		]);
+		expect(await evaluateDispatchEligibility(resolveInput())).toMatchObject({
+			status: 'selected',
+			selection: { workerId: 'w-instance' },
+		});
+	});
+
+	describe('falls back to a project-admin-owned worker when no installation-admin one can serve it', () => {
+		const fallbacks: [string, Parameters<typeof makeCandidate>[1]][] = [
+			['offline', { connected: false }],
+			['draining', { drainingSince: new Date('2026-11-01T00:00:00Z') }],
+			['holding another repository', { repositories: [OTHER_REPOSITORY] }],
+			['not declaring the phase', { supportedPhases: ['implementation'] }],
+			['not permitted the phase', { enrollment: { allowedPhases: ['implementation'] } }],
+			[
+				'without an MCP-capable CLI',
+				{ capabilities: ['antigravity'], enrollment: { allowedClis: ['antigravity'] } },
+			],
+			[
+				'cooling on its only CLI',
+				{ rateLimitedClis: new Map([['claude', new Date('2026-11-01T12:00:00Z')]]) },
+			],
+		];
+		for (const [label, overrides] of fallbacks) {
+			it(`when it is ${label} — even at full capacity`, async () => {
+				listProjectDispatchCandidates.mockResolvedValue([
+					makeCandidate('w-instance', {
+						ownerPrivilege: 'instanceAdmin',
+						activeRuns: 1,
+						...overrides,
+					}),
+					makeCandidate('w-project', { ownerPrivilege: 'projectAdmin' }),
+				]);
+
+				expect(await evaluateDispatchEligibility(resolveInput())).toMatchObject({
+					status: 'selected',
+					selection: { workerId: 'w-project' },
+				});
+			});
+		}
+
+		it('when its transport is not connected to this router', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-instance', { ownerPrivilege: 'instanceAdmin', activeRuns: 1 }),
+				makeCandidate('w-project', { ownerPrivilege: 'projectAdmin' }),
+			]);
+
+			expect(
+				await evaluateDispatchEligibility(resolveInput(), {
+					isWorkerConnected: (id) => id !== 'w-instance',
+				}),
+			).toMatchObject({ status: 'selected', selection: { workerId: 'w-project' } });
+		});
+	});
+
+	it('keeps configured order, and the rotation, within a tier', async () => {
+		listProjectDispatchCandidates.mockResolvedValue([
+			makeCandidate('w-first', {
+				ownerPrivilege: 'projectAdmin',
+				enrollment: { lastDispatchedAt: new Date('2026-11-01T00:00:00Z') },
+			}),
+			makeCandidate('w-second', {
+				ownerPrivilege: 'projectAdmin',
+				enrollment: { lastDispatchedAt: null },
+			}),
+		]);
+
+		expect(await evaluateDispatchEligibility(resolveInput())).toMatchObject({
+			selection: { workerId: 'w-first' },
+		});
+		expect(await evaluateDispatchEligibility(resolveInput({ shuffleWorkers: true }))).toMatchObject(
+			{ selection: { workerId: 'w-second' } },
+		);
+	});
+
+	it('still applies every other rule on top, and says who was not considered', async () => {
+		listProjectDispatchCandidates.mockResolvedValue([
+			makeCandidate('w-member', { ownerPrivilege: 'none' }),
+			makeCandidate('w-admin', {
+				ownerPrivilege: 'projectAdmin',
+				enrollment: { sharingConsent: false },
+			}),
+		]);
+
+		const decision = await evaluateDispatchEligibility(resolveInput());
+
+		expect(decision).toMatchObject({ status: 'ineligible', reason: 'missing-consent' });
+		if (decision.status !== 'ineligible') throw new Error('unreachable');
+		expect(decision.message).toContain(
+			'1 enrolled worker owned by another member was not considered for Resolve problem',
+		);
+	});
+
+	it('leaves every other phase’s selection unchanged', async () => {
+		for (const phase of ALL_TRIGGER_PHASES.filter((p) => p !== 'resolve-problem')) {
+			listProjectDispatchCandidates.mockResolvedValue([
+				makeCandidate('w-member', { ownerPrivilege: 'none' }),
+				makeCandidate('w-instance', { ownerPrivilege: 'instanceAdmin' }),
+			]);
+
+			expect(await evaluateDispatchEligibility(gateInput({ phase })), phase).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-member' },
+			});
+		}
 	});
 });
 

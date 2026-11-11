@@ -1817,6 +1817,39 @@ per run** is the cap on its real writes (`pipeline.resolveProblem.maxWriteAction
 5 by default, at most 50). Antigravity cannot attach an MCP server, so the phase is
 never routed to it. See [`docs/configuration.md`](./configuration.md).
 
+**Which worker runs it.** The agent's SWARM tools act with the rights of the
+worker's **owner**, so the phase routes on who owns the machine (issue #1419). No
+other phase does this.
+
+- **The floor.** Only a worker owned by a project administrator of the run's
+  project, or by an installation administrator, may run it. A worker owned by a
+  `member` or `contributor` is never selected, however free it is.
+- **Installation administrators first.** A worker owned by an installation
+  administrator is chosen over one owned by a project administrator, whatever the
+  configured worker order says.
+- **Worth waiting for.** If such a worker is connected and could run the phase but
+  every slot is taken, the run waits for it rather than going to a free project
+  administrator's worker.
+- **Falling back.** A project administrator's worker takes the run only when no
+  installation administrator's worker can serve it at all: none is enrolled, or
+  each is offline, draining, without a checkout of the repository, not declaring
+  or not permitted the phase, without a suitable (MCP-capable) CLI, or cooling on
+  it after a usage limit.
+- **Order within a tier.** The configured worker order, or "Shuffle workers",
+  still decides between workers of the same tier, and every other eligibility rule
+  still applies.
+- **While it waits.** The Queue shows "waiting for a worker owned by a project or
+  installation administrator". The run's own text names the floor, or the busy
+  worker it waits for. The wait uses the ordinary gate re-check budget, and a
+  qualifying worker connecting or freeing a slot wakes it at once. **Project
+  readiness** reports the phase as missing when no worker meets the floor, and
+  names each worker whose owner is not an administrator.
+
+Today both tiers get the same tool reach on the run's project. An installation
+administrator's run credential is still limited to that project and to the same
+tools (see below). The preference keeps the run with the most privileged owner,
+whose authority does not depend on a project membership.
+
 **The SWARM MCP server it needs.** The agent reaches SWARM through the operator
 MCP endpoint, `/operator/mcp` on `WEBHOOK_CALLBACK_BASE_URL` (or the worker's
 `SWARM_CONTROL_PLANE_URL` when that is unset). Before the agent starts, the worker
@@ -1829,7 +1862,9 @@ MCP unreachable: <reason>` and is not retried.
 **The run-bound credential.** The control plane mints a credential for that one
 run when it builds the assignment:
 
-- it is held by the owner of the worker that runs the attempt;
+- it is held by the owner of the worker that runs the attempt, who is always a
+  project administrator of the run's project or an installation administrator
+  (see "Which worker runs it" above);
 - it is valid for the phase timeout plus ten minutes, and revoked when the run
   settles, whatever the outcome;
 - it reaches only the run's project and only the read, recovery and bug-report

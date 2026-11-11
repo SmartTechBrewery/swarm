@@ -450,8 +450,21 @@ async function checkWorkers(project: ProjectRecord, deps: ReadinessDeps): Promis
 		const clis = [...new Set(targets.map((target) => target.cli ?? PHASE_DEFAULT_CLI[phase]))];
 		const unserved: string[] = [];
 		const reasons = new Set<string>();
+		// Resolve problem runs only on a worker owned by a project or installation
+		// administrator (issue #1419), so a capable member-owned machine does not serve
+		// it — and the reason says so in plain words rather than as a predicate code.
+		const capable =
+			phase === 'resolve-problem'
+				? candidates.filter((candidate) => {
+						if (candidate.ownerPrivilege !== 'none') return true;
+						reasons.add(
+							`${candidate.worker.displayName}: owner is not a project or installation administrator (Resolve problem needs one)`,
+						);
+						return false;
+					})
+				: candidates;
 		for (const { repo } of project.repositories) {
-			const served = candidates.some((candidate) =>
+			const served = capable.some((candidate) =>
 				targets.some((target) => {
 					const verdict = evaluateWorkerEligibility({
 						worker: candidate.worker,

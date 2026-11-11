@@ -173,6 +173,7 @@ export const queuedWaitReasonSchema = z.enum([
 	'worker-eligibility',
 	'worker-authorization',
 	'worker-rate-limited',
+	'admin-worker',
 	'preserved-worker',
 	'task-in-flight',
 	'pr-in-flight',

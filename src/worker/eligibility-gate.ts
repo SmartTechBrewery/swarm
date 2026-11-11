@@ -63,6 +63,20 @@
  * silently falls back to `targets[0]` — a target no worker can run is skipped,
  * and exhausting the list yields a structured reason, not a blind dispatch.
  *
+ * **Resolve problem is tier-first, then target-priority-first** (issue #1419). Its
+ * agent's SWARM tools act with the selected worker's *owner*'s rights (the run-bound
+ * credential is minted for that owner), so only a worker owned by a project
+ * administrator of the dispatch's project, or by an installation administrator, may
+ * take it (`admin-owned-worker-required` otherwise). Among those, the
+ * installation-admin-owned workers are walked first — the whole target walk above,
+ * run on that tier alone — and a busy one (connected and able to run the phase, every
+ * slot taken) is *waited for* (`instance-admin-worker-busy`) rather than passed for a
+ * free project-admin-owned worker. Only when no installation-admin-owned worker can
+ * serve the run at all — none enrolled, or each refused for a reason a freed slot
+ * would not fix — does the walk move to the project-admin tier. Target priority, the
+ * configured order or rotation, the pass-over preference and the pool all still
+ * apply, *within* the tier being walked. No other phase reads the owner's privilege.
+ *
  * **A project can trade that fixed order for a rotation** (`pipeline.shuffleWorkers`,
  * issue #1416, {@link DispatchGateInput.shuffleWorkers}). The roster is then walked
  * least recently dispatched first (`./worker-rotation.ts`) instead of in the
@@ -147,6 +161,12 @@ import { orderForRotation } from './worker-rotation.js';
  *   of *which* machine its checkout is on (issue #954). Distinct from the reason
  *   above in the only way that matters: there, the machine is known and merely
  *   unavailable, so waiting works; here, nothing can name it, so waiting cannot.
+ * - `admin-owned-worker-required` — a Resolve problem dispatch, and no permitted
+ *   worker is owned by a project administrator of this project or an installation
+ *   administrator (issue #1419).
+ * - `instance-admin-worker-busy` — a Resolve problem dispatch whose
+ *   installation-admin-owned worker could take it but has no free slot, so it waits
+ *   for that worker rather than going to a project administrator's (issue #1419).
  *
  * Structural reasons stay per-worker so the message names the thing an operator
  * must fix.
@@ -160,7 +180,9 @@ export type DispatchIneligibilityReason =
 	| IneligibilityReason
 	| 'assignee-worker-unavailable'
 	| 'preserved-worker-unavailable'
-	| 'preserved-worker-unknown';
+	| 'preserved-worker-unknown'
+	| 'admin-owned-worker-required'
+	| 'instance-admin-worker-busy';
 
 /** The worker + target a gated dispatch resolved to. */
 export interface DispatchSelection {
@@ -559,6 +581,12 @@ const AVAILABILITY_REFUSAL: Record<DispatchIneligibilityReason, boolean> = {
 	// `workerEligibilityRecheckAttempt` allowance ends in an actionable terminal
 	// failure rather than a permanent wait.
 	'preserved-worker-unknown': false,
+	// Both are verdicts over the set of workers (issue #1419), on the same reasoning
+	// as `cli-rate-limited`: a machine enrolling, connecting or freeing a slot is
+	// exactly the event that can clear them, so a reconnect should wake the row. A
+	// role grant is picked up by the next timed re-check.
+	'admin-owned-worker-required': true,
+	'instance-admin-worker-busy': true,
 };
 
 /** Every reason the gate can refuse with — the domain of {@link isAvailabilityRefusal}. */
@@ -600,7 +628,35 @@ function ineligibilityMessage(
 		 * Absent when no candidate reported `cli-rate-limited`.
 		 */
 		coolingUntil?: Date;
+		/**
+		 * Resolve problem only (issue #1419): the installation-admin-owned worker the
+		 * dispatch is waiting for, for `instance-admin-worker-busy`.
+		 */
+		waitingForWorker?: string;
+		/**
+		 * Resolve problem only (issue #1419): how many permitted workers were left out
+		 * because their owner is below the floor, so a free member-owned machine does
+		 * not make "no worker free" read as wrong.
+		 */
+		notConsideredCount?: number;
 	},
+): string {
+	const message = ineligibilityMessageBody(reason, context);
+	const skipped = context.notConsideredCount ?? 0;
+	if (skipped === 0 || reason === 'admin-owned-worker-required') return message;
+	return `${message} (${describeNotConsidered(skipped)} not considered for Resolve problem.)`;
+}
+
+/** "1 enrolled worker owned by another member was" / "N enrolled workers owned by other members were". */
+function describeNotConsidered(count: number): string {
+	return count === 1
+		? '1 enrolled worker owned by another member was'
+		: `${count} enrolled workers owned by other members were`;
+}
+
+function ineligibilityMessageBody(
+	reason: DispatchIneligibilityReason,
+	context: Parameters<typeof ineligibilityMessage>[1],
 ): string {
 	const owner = context.assignee
 		? `assignee '${context.assignee}'`
@@ -666,6 +722,13 @@ function ineligibilityMessage(
 		// CLI, or the enrollment.
 		case 'repository-mismatch':
 			return `No enrolled worker for ${owner} holds a checkout of '${context.repository}' — every available machine holds checkouts of other repositories only. Give a worker a checkout of that repository (SWARM_WORKER_REPO_ROOT takes several, separated by ':') or enroll one that already holds it — this work waits until one does.`;
+		// Phase-specific by construction (issue #1419): only Resolve problem refuses with
+		// either. The first names the floor and the two ways to meet it; the second names
+		// the machine it waits for and says plainly that nothing is wrong.
+		case 'admin-owned-worker-required':
+			return `Resolve problem runs only on a worker whose owner is a project administrator of '${context.projectId}' or an installation administrator — the agent's SWARM tools act with that owner's rights. No enrolled worker here has such an owner (${describeNotConsidered(context.notConsideredCount ?? 0)} not considered). Enroll a worker owned by a project or installation administrator, or make an existing worker's owner a project administrator — this work waits until one is available.`;
+		case 'instance-admin-worker-busy':
+			return `Resolve problem prefers workers owned by an installation administrator, and worker '${context.waitingForWorker ?? 'unknown'}' is one — it is connected and can run this phase but every slot is taken. Waiting for it rather than using a project administrator's worker; nothing needs fixing.`;
 	}
 }
 
@@ -874,6 +937,186 @@ async function selectEligibleWorker(
 }
 
 /**
+ * What one walk of the phase's targets over a roster came to: the worker it
+ * selected, or every reason the roster's candidates were refused for plus the
+ * soonest cool-down among them (issue #981).
+ */
+type TargetWalkOutcome =
+	| { selection: DispatchSelection }
+	| { reported: Set<IneligibilityReason>; coolingUntil?: Date };
+
+/**
+ * Walk `input.targets` in priority order over `roster` (already pinned, affinity- and
+ * — for Resolve problem — tier-narrowed) and take, for the first target any of them
+ * can run, an eligible worker: the pass-over preference (issues #1018, #1075) and the
+ * pool (issue #533) choose between them. Pool contention is still judged against the
+ * whole project's `candidates`, never just `roster`.
+ */
+async function walkTargets(
+	roster: WorkerDispatchCandidate[],
+	context: {
+		input: DispatchGateInput;
+		options: DispatchGateOptions;
+		candidates: WorkerDispatchCandidate[];
+		availabilityOf: (candidate: WorkerDispatchCandidate) => WorkerAvailability;
+		assigned: { user: { id: string } } | undefined;
+		pinned: DispatchGateInput['preservedWorker'];
+	},
+): Promise<TargetWalkOutcome> {
+	const { input, options, candidates, availabilityOf, assigned, pinned } = context;
+	const reported = new Set<IneligibilityReason>();
+	// The soonest instant any cool-down refusal lapses (issue #981), so an aggregated
+	// `cli-rate-limited` message can say when the work actually resumes rather than
+	// only that it is waiting. Soonest rather than latest: the first record to lapse
+	// is the first re-check that can select somebody.
+	let coolingUntil: Date | undefined;
+	for (const [targetIndex, target] of input.targets.entries()) {
+		const eligible: WorkerDispatchCandidate[] = [];
+		for (const candidate of roster) {
+			const verdict = evaluateWorkerEligibility({
+				worker: candidate.worker,
+				enrollment: candidate.enrollment,
+				availability: availabilityOf(candidate),
+				target,
+				phaseDefaultCli: input.phaseDefaultCli,
+				phase: input.phase,
+				repository: input.repository,
+				rateLimitedClis: candidate.rateLimitedClis,
+			});
+			if (verdict.eligible) {
+				eligible.push(candidate);
+				continue;
+			}
+			reported.add(verdict.reason);
+			if (verdict.reason === 'cli-rate-limited') {
+				coolingUntil = earlierCoolDown(
+					coolingUntil,
+					candidate.rateLimitedClis.get(resolveTargetCli(target, input.phaseDefaultCli)),
+				);
+			}
+		}
+		// Pass over a machine that already failed to obtain this run's commit (issue
+		// #1018) or lost its transport under it (issue #1075), while somebody else can
+		// take the phase. Applied here rather than to
+		// `permitted` above so the fallback means what the acceptance criterion says —
+		// "while another *eligible* worker exists" — and so a list that covers every
+		// eligible machine simply evaporates, leaving the ordinary first-eligible pick
+		// and the ordinary retry budget to bound it.
+		const eligibleAfterPassOver = preferWorkersNotPassedOver(eligible, input.passedOverWorkerIds);
+		const [firstEligible, ...alternatives] = eligibleAfterPassOver;
+		if (!firstEligible) continue;
+		const chosen = await selectEligibleWorker(
+			[firstEligible, ...alternatives],
+			input,
+			options,
+			candidates,
+			availabilityOf,
+		);
+		return {
+			selection: {
+				workerId: chosen.worker.id,
+				workerName: chosen.worker.displayName,
+				ownerUserId: chosen.worker.ownerUserId,
+				assignedUserId: assigned?.user.id,
+				target,
+				targetIndex,
+				cli: resolveTargetCli(target, input.phaseDefaultCli),
+				skippedClis: input.targets
+					.slice(0, targetIndex)
+					.map((skipped) => resolveTargetCli(skipped, input.phaseDefaultCli)),
+				pinnedToPreservedWorker: pinned !== undefined,
+			},
+		};
+	}
+	return { reported, coolingUntil };
+}
+
+/**
+ * Whether an installation-admin-owned candidate is **busy but able** to run this
+ * Resolve problem dispatch (issue #1419): connected, and accepted by the predicate
+ * for some target once its slots are imagined free. The predicate judges enrollment,
+ * consent and drain before capacity and the repository, phase, CLI and cool-down
+ * after it, so every refusal a freed slot would not fix still shows — which is what
+ * makes such a worker one the dispatch waits for rather than falls back from.
+ */
+function isBusyButAble(
+	candidate: WorkerDispatchCandidate,
+	input: DispatchGateInput,
+	availabilityOf: (candidate: WorkerDispatchCandidate) => WorkerAvailability,
+): boolean {
+	if (!availabilityOf(candidate).connected) return false;
+	return input.targets.some(
+		(target) =>
+			evaluateWorkerEligibility({
+				worker: candidate.worker,
+				enrollment: candidate.enrollment,
+				availability: { connected: true, activeRuns: 0 },
+				target,
+				phaseDefaultCli: input.phaseDefaultCli,
+				phase: input.phase,
+				repository: input.repository,
+				rateLimitedClis: candidate.rateLimitedClis,
+			}).eligible,
+	);
+}
+
+/**
+ * Resolve problem's tier-first walk (issue #1419): the floor, then the
+ * installation-admin-owned tier, the wait for a busy one of those, and only then the
+ * project-admin-owned tier. Both tiers keep candidate order, so the configured order
+ * or the rotation still decides within each. Answers either a refusal of its own or
+ * the walk's outcome — a selection, or both tiers' refusals merged for the caller's
+ * ordinary aggregation. Sets `notConsideredCount` on `messageContext` so every
+ * refusal message can say who was left out.
+ */
+async function walkByOwnerPrivilege(
+	permitted: WorkerDispatchCandidate[],
+	context: {
+		walk: (roster: WorkerDispatchCandidate[]) => Promise<TargetWalkOutcome>;
+		input: DispatchGateInput;
+		availabilityOf: (candidate: WorkerDispatchCandidate) => WorkerAvailability;
+		pinned: DispatchGateInput['preservedWorker'];
+		messageContext: Parameters<typeof ineligibilityMessage>[1];
+	},
+): Promise<TargetWalkOutcome | Extract<GateDecision, { status: 'ineligible' }>> {
+	const { walk, input, availabilityOf, pinned, messageContext } = context;
+	const admins = permitted.filter((c) => c.ownerPrivilege !== 'none');
+	messageContext.notConsideredCount = permitted.length - admins.length;
+	if (admins.length === 0) {
+		return {
+			status: 'ineligible',
+			reason: 'admin-owned-worker-required',
+			message: ineligibilityMessage('admin-owned-worker-required', messageContext),
+		};
+	}
+	const instanceTier = admins.filter((c) => c.ownerPrivilege === 'instanceAdmin');
+	const projectTier = admins.filter((c) => c.ownerPrivilege === 'projectAdmin');
+	const fromInstanceTier = await walk(instanceTier);
+	if ('selection' in fromInstanceTier) return fromInstanceTier;
+	// A pinned continuation already waits for its one machine, on #567's own unbounded
+	// terms, so it never takes this bounded wait instead.
+	const busy = pinned
+		? undefined
+		: instanceTier.find((c) => isBusyButAble(c, input, availabilityOf));
+	if (busy) {
+		return {
+			status: 'ineligible',
+			reason: 'instance-admin-worker-busy',
+			message: ineligibilityMessage('instance-admin-worker-busy', {
+				...messageContext,
+				waitingForWorker: busy.worker.displayName,
+			}),
+		};
+	}
+	const fromProjectTier = await walk(projectTier);
+	if ('selection' in fromProjectTier) return fromProjectTier;
+	return {
+		reported: new Set([...fromInstanceTier.reported, ...fromProjectTier.reported]),
+		coolingUntil: earlierCoolDown(fromInstanceTier.coolingUntil, fromProjectTier.coolingUntil),
+	};
+}
+
+/**
  * Decide whether — and where — this dispatch may run. Reads only; it never
  * mutates an enrollment, session, or run, and it is safe to call again on every
  * retry (which is exactly how revocation between attempts takes effect).
@@ -975,71 +1218,25 @@ export async function evaluateDispatchEligibility(
 	// stops at the first target any worker can run.
 	const availabilityOf = (candidate: WorkerDispatchCandidate): WorkerAvailability =>
 		resolveAvailability(candidate, options.isWorkerConnected);
-	const reported = new Set<IneligibilityReason>();
-	// The soonest instant any cool-down refusal lapses (issue #981), so an aggregated
-	// `cli-rate-limited` message can say when the work actually resumes rather than
-	// only that it is waiting. Soonest rather than latest: the first record to lapse
-	// is the first re-check that can select somebody.
-	let coolingUntil: Date | undefined;
-	for (const [targetIndex, target] of input.targets.entries()) {
-		const eligible: WorkerDispatchCandidate[] = [];
-		for (const candidate of permitted) {
-			const verdict = evaluateWorkerEligibility({
-				worker: candidate.worker,
-				enrollment: candidate.enrollment,
-				availability: availabilityOf(candidate),
-				target,
-				phaseDefaultCli: input.phaseDefaultCli,
-				phase: input.phase,
-				repository: input.repository,
-				rateLimitedClis: candidate.rateLimitedClis,
-			});
-			if (verdict.eligible) {
-				eligible.push(candidate);
-				continue;
-			}
-			reported.add(verdict.reason);
-			if (verdict.reason === 'cli-rate-limited') {
-				coolingUntil = earlierCoolDown(
-					coolingUntil,
-					candidate.rateLimitedClis.get(resolveTargetCli(target, input.phaseDefaultCli)),
-				);
-			}
-		}
-		// Pass over a machine that already failed to obtain this run's commit (issue
-		// #1018) or lost its transport under it (issue #1075), while somebody else can
-		// take the phase. Applied here rather than to
-		// `permitted` above so the fallback means what the acceptance criterion says —
-		// "while another *eligible* worker exists" — and so a list that covers every
-		// eligible machine simply evaporates, leaving the ordinary first-eligible pick
-		// and the ordinary retry budget to bound it.
-		const eligibleAfterPassOver = preferWorkersNotPassedOver(eligible, input.passedOverWorkerIds);
-		const [firstEligible, ...alternatives] = eligibleAfterPassOver;
-		if (!firstEligible) continue;
-		const chosen = await selectEligibleWorker(
-			[firstEligible, ...alternatives],
-			input,
-			options,
-			candidates,
-			availabilityOf,
-		);
-		return {
-			status: 'selected',
-			selection: {
-				workerId: chosen.worker.id,
-				workerName: chosen.worker.displayName,
-				ownerUserId: chosen.worker.ownerUserId,
-				assignedUserId: assigned?.user.id,
-				target,
-				targetIndex,
-				cli: resolveTargetCli(target, input.phaseDefaultCli),
-				skippedClis: input.targets
-					.slice(0, targetIndex)
-					.map((skipped) => resolveTargetCli(skipped, input.phaseDefaultCli)),
-				pinnedToPreservedWorker: pinned !== undefined,
-			},
-		};
-	}
+	const walk = (roster: WorkerDispatchCandidate[]) =>
+		walkTargets(roster, { input, options, candidates, availabilityOf, assigned, pinned });
+
+	// Resolve problem routes by the owner's privilege on the project (issue #1419) —
+	// see the module comment. Applied after the pin and affinity narrowing, so it only
+	// ever narrows further. Every other phase walks the permitted set as it always has.
+	const outcome =
+		input.phase === 'resolve-problem'
+			? await walkByOwnerPrivilege(permitted, {
+					walk,
+					input,
+					availabilityOf,
+					pinned,
+					messageContext,
+				})
+			: await walk(permitted);
+	if ('status' in outcome) return outcome;
+	if ('selection' in outcome) return { status: 'selected', selection: outcome.selection };
+	const { reported, coolingUntil } = outcome;
 
 	// An assignee whose own workers are merely busy/offline is the scheduler-level
 	// verdict, not a per-worker one: the work waits for *that user's* worker. A pin

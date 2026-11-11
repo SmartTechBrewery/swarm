@@ -171,7 +171,9 @@ the server enforces on its write tools.
   `agentAccessTokens.list`.
 - **Where it travels.** The Resolve problem phase
   ([pipeline.md](pipeline.md#pipeline-phases)) mints one when the control plane
-  builds the run's assignment: held by the selected worker's owner, capped at
+  builds the run's assignment: held by the selected worker's owner — always a
+  project administrator of the run's project or an installation administrator,
+  since the phase is routed only to such workers (issue #1419) — capped at
   `pipeline.resolveProblem.maxWriteActions`, valid for the phase timeout plus ten
   minutes. It is sent to the worker on the assignment with the `/operator/mcp`
   address, and revoked at every settle. It is the **one per-run credential that

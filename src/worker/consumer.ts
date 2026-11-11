@@ -1668,6 +1668,12 @@ function deferralWaitReason(
 		// only the second is helped by looking at the fleet. The row is the only place
 		// that difference survives.
 		if (reason === 'cli-rate-limited') return 'worker-rate-limited';
+		// Resolve problem's owner-privilege rule (issue #1419): its own wait reason, so
+		// the Queue can say it waits for an administrator's worker, which a free
+		// member-owned machine does not end.
+		if (reason === 'admin-owned-worker-required' || reason === 'instance-admin-worker-busy') {
+			return 'admin-worker';
+		}
 		return reason && !isAvailabilityRefusal(reason) ? 'worker-authorization' : 'worker-eligibility';
 	}
 	return waitReasonForDeferral(outcome.failureKind);

@@ -103,6 +103,10 @@ const QUEUED_WAIT_REASON_LABELS: Record<QueuedWaitReason, string> = {
 	// the wait ends when the first allowance refills. Which machine is cooling on which
 	// CLI is the Workers screen's to say.
 	'worker-rate-limited': 'waiting for a usage limit to reset',
+	// Resolve problem's owner-privilege rule (issue #1419): a free worker owned by a
+	// member does not end this wait, so the label names whose worker it needs. Which
+	// machine it waits for, when it waits for a busy one, is the run's own text.
+	'admin-worker': 'waiting for a worker owned by a project or installation administrator',
 	// Deliberately names the *machine* rather than "a worker": every other worker in
 	// the project may be free and it changes nothing, because this dispatch continues
 	// work preserved on one specific machine (issue #567).
