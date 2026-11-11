@@ -134,6 +134,7 @@ export const TOOL_ACCESS: Readonly<Record<string, ToolAccess>> = {
 	// Administering a project's configuration and credentials — `canAdministerProject`.
 	phase_agents_reorder: { minRole: 'projectAdmin', scope: 'project', agentScoped: false },
 	phase_agents_restore: { minRole: 'projectAdmin', scope: 'project', agentScoped: false },
+	phase_agents_set: { minRole: 'projectAdmin', scope: 'project', agentScoped: false },
 	project_update: { minRole: 'projectAdmin', scope: 'project', agentScoped: false },
 	pm_board_set: { minRole: 'projectAdmin', scope: 'project', agentScoped: false },
 	project_credential_set: { minRole: 'projectAdmin', scope: 'project', agentScoped: false },
@@ -142,6 +143,9 @@ export const TOOL_ACCESS: Readonly<Record<string, ToolAccess>> = {
 	cli_rate_limit_set: { minRole: 'signedIn', scope: 'worker-owner', agentScoped: false },
 	// A worker's owner, or an instance admin, may retire it (issue #1413).
 	worker_remove: { minRole: 'signedIn', scope: 'worker-owner', agentScoped: false },
+	// The agent model catalog (issue #1415): code, not a project's data, so any
+	// signed-in user may read it — as anyone may create a project and choose models.
+	agent_models_list: { minRole: 'signedIn', scope: 'none', agentScoped: true },
 	// The New Project dialog is open to any signed-in user; the creator becomes its admin.
 	project_create: { minRole: 'signedIn', scope: 'none', agentScoped: false },
 	// SWARM's own bug reports (issue #1383): read at `contributor`, written at `member`
