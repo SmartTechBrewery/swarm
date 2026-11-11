@@ -31,7 +31,10 @@ import type { ProjectConfig } from '../config/schema.js';
 import { describeError } from '../lib/errors.js';
 import { logger as defaultLogger } from '../lib/logger.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
-import { createHostLocalWorktreeRuntime } from '../worktree/host-local-runtime.js';
+import {
+	CHECKOUT_DISCARD_OWNER_PREFIX,
+	createHostLocalWorktreeRuntime,
+} from '../worktree/host-local-runtime.js';
 import { postDelivery } from './delivery-client.js';
 import {
 	type CheckoutDiscard,
@@ -95,7 +98,7 @@ export interface CheckoutDiscardHandlerOptions {
  * as — one definition, because the two must match for the registration to protect it.
  */
 function discardOwnerId(): string {
-	return `checkout-discard:${process.pid}`;
+	return `${CHECKOUT_DISCARD_OWNER_PREFIX}${process.pid}`;
 }
 
 /**

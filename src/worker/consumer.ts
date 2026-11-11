@@ -5310,6 +5310,10 @@ function isDeferrableAgentRunError(err: AgentRunError): boolean {
 		// A provider outage a federated worker classified (issue #1274) — the rebuilt
 		// twin of the `isProviderUnavailableFailure` branch there.
 		kind === 'provider-unavailable' ||
+		// A worktree lease a federated worker found still held by the run's *own* other
+		// owner on its host after waiting for it (issue #1421, `OwnRunLeaseHeldError`) —
+		// never a protected checkout, which stays a terminal `BlockedRecoveryError`.
+		kind === 'worktree-exists' ||
 		// A failure type that used to be terminal and is now retried automatically after
 		// its own delay (issue #1075) — a lost worker transport, today.
 		// `deferAgentRunError` applies its own bound.
@@ -5337,7 +5341,9 @@ function isDeferrableAgentRunError(err: AgentRunError): boolean {
  * worktree collision is deliberately NOT deferrable (issue #367): provisioning already
  * reclaimed the checkout if it was safe, so a surviving collision is a protected
  * checkout raised as a terminal `BlockedRecoveryError` — re-deferring it would just
- * loop on the same protected worktree.
+ * loop on the same protected worktree. The one collision that does defer is a lease
+ * still held by the run's own other owner on a federated worker (issue #1421), which
+ * reaches here already rebuilt as a `worktree-exists` {@link AgentRunError}.
  */
 function deferrableFailureOf(err: unknown): DeferrableFailure | undefined {
 	if (err instanceof AgentRunError) {

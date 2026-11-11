@@ -177,6 +177,7 @@ function stubWorktrees(path: string) {
 		),
 		isClean: vi.fn(async () => true),
 		hasUnpushedWork: vi.fn(async () => false),
+		awaitOwnRunRelease: vi.fn(async () => {}),
 		isLeased: vi.fn(async (taskId: string) => isWorktreeLeasedMock('project-1', taskId)),
 		claimLease: vi.fn(async (taskId: string) => claimWorktreeLeaseMock('project-1', taskId)),
 		releaseLease: vi.fn(async (taskId: string) => releaseWorktreeLeaseMock('project-1', taskId)),
@@ -422,6 +423,31 @@ describe('executeRecoveryGate — Tier 1 behaviour is unchanged (regression)', (
 
 	afterEach(() => {
 		for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+	});
+
+	// Issue #1421: a reset routed back to the worker that preserved the run races that
+	// worker's own discard of the checkout. The gate waits the discard out *before* it
+	// reads anything, so it sees the checkout gone and starts fresh rather than
+	// contending for the discard's lease.
+	it("'discard' waits out the run's own lease holder before inspecting the checkout", async () => {
+		const path = preservedCheckout();
+		const worktrees = stubWorktrees(path);
+		worktrees.awaitOwnRunRelease.mockImplementation(async () => {
+			rmSync(path, { recursive: true, force: true });
+		});
+
+		await expect(
+			executeRecoveryGate(
+				worktrees as unknown as GitWorktreeManager,
+				'19',
+				'discard',
+				undefined,
+				'implementation',
+				'issue-19',
+			),
+		).resolves.toEqual({ reuseHandle: null });
+		expect(worktrees.awaitOwnRunRelease).toHaveBeenCalledWith('19');
+		expect(worktrees.claimLease).not.toHaveBeenCalled();
 	});
 
 	it("'resume' adopts the checkout on a session id and never consults the checkpoint", async () => {

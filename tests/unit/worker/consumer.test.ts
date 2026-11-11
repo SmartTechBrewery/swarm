@@ -5687,6 +5687,28 @@ describe('processJob', () => {
 		});
 	});
 
+	// Issue #1421. A federated worker reports a lease its run's own other owner still
+	// held (a reset's discard of the run's checkout on that machine) as a deferred
+	// `worktree-exists` frame, which the dispatcher rebuilds as this error. It used to
+	// arrive as `live-leased` and settle the run `failed` with no retry.
+	it("defers a worker's own-run lease collision on the worktree-collision reason", async () => {
+		phaseImpl = async () => {
+			throw new AgentRunError("Worktree for task '2196-conflicts' is still held", {
+				kind: 'worktree-exists',
+			});
+		};
+		scheduleDispatchRetry.mockClear();
+
+		const outcome = await processJob(
+			createMockScmWebhookJob({ rateLimitRetryAttempt: 0 }),
+			registryReturning(RESOLVE_CONFLICTS_TRIGGER),
+		);
+
+		expect(outcome.status).toBe('phase-deferred');
+		const [, input] = scheduleDispatchRetry.mock.calls.at(-1) as [string, Record<string, unknown>];
+		expect(input.waitReason).toBe('worktree-exists');
+	});
+
 	// Issue #1401. The branch phases fail on the same broken fetch in two shapes: the
 	// checkout cannot resolve the PR branch at all (Resolve-conflicts on
 	// `under-control-platform`), or the agent's own sync with origin fails and it stops

@@ -319,6 +319,11 @@ export async function executeRecoveryGate(
 	branch: string,
 ): Promise<{ reuseHandle: WorktreeHandle | null; checkpoint?: Checkpoint }> {
 	const path = worktrees.worktreePath(taskId);
+	// Before anything is read (issue #1421): a reset routed back to the worker that
+	// preserved this run's checkout races that worker's own discard of it, which holds
+	// the lease for the length of a `git worktree remove`. Waiting it out lets the
+	// checks below see the state the discard leaves rather than its lease.
+	await worktrees.awaitOwnRunRelease(taskId);
 	const exists = existsSync(path);
 
 	if (!exists) {
