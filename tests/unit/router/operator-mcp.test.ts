@@ -666,6 +666,7 @@ describe('operator MCP — the handshake', () => {
 			'dispatch_redispatch_now',
 			'phase_agents_reorder',
 			'phase_agents_restore',
+			'phase_agents_set',
 			'pr_force_re_review',
 			'pr_recheck_mergeability',
 			'run_reset',
@@ -678,6 +679,7 @@ describe('operator MCP — the handshake', () => {
 		];
 
 		expect(tools.map((tool) => tool.name).sort()).toEqual([
+			'agent_models_list',
 			'bug_report_add_occurrence',
 			'bug_report_create',
 			'bug_report_get',
@@ -693,6 +695,7 @@ describe('operator MCP — the handshake', () => {
 			'phase_agents_get',
 			'phase_agents_reorder',
 			'phase_agents_restore',
+			'phase_agents_set',
 			'pipeline_snapshot',
 			'pipeline_stats',
 			'pm_board_discover',
@@ -739,6 +742,7 @@ async function listedTools(token: string): Promise<string[]> {
 
 const ALL_TOOLS = Object.keys(TOOL_ACCESS).sort();
 const CONTRIBUTOR_TOOLS = [
+	'agent_models_list',
 	'bug_report_get',
 	'bug_reports_list',
 	'cli_rate_limit_set',
@@ -779,7 +783,7 @@ describe('operator MCP — per-tool roles (issue #1382)', () => {
 		[
 			'a user with no membership',
 			'nobody-token',
-			['cli_rate_limit_set', 'project_create', 'worker_remove'],
+			['agent_models_list', 'cli_rate_limit_set', 'project_create', 'worker_remove'],
 		],
 	])('lists to %s only the tools their highest role reaches', async (_, token, expected) => {
 		expect(await listedTools(token)).toEqual(expected);
@@ -821,6 +825,7 @@ describe('operator MCP — per-tool roles (issue #1382)', () => {
 
 /** Every tool a scoped agent credential is shown: the read tools plus the recovery allowlist. */
 const SCOPED_AGENT_TOOLS = [
+	'agent_models_list',
 	'bug_report_add_occurrence',
 	'bug_report_create',
 	'bug_report_get',
@@ -916,6 +921,7 @@ describe('operator MCP — a scoped agent credential (issue #1385)', () => {
 		],
 		['work_item_close', { projectId: 'proj-a', repository: 'acme/widgets', prNumber: 7 }],
 		['phase_agents_reorder', { projectId: 'proj-a', phase: 'review', order: ['claude'] }],
+		['phase_agents_set', { projectId: 'proj-a', phase: 'review', targets: [{ cli: 'claude' }] }],
 		['cli_rate_limit_set', { workerId: WORKER_ID, cli: 'claude', until: '2026-12-01T00:00:00Z' }],
 		['worker_remove', { workerId: WORKER_ID }],
 	])('is refused %s with FORBIDDEN, audited as refused', async (tool, args) => {
@@ -1667,6 +1673,40 @@ describe('operator MCP — phase_agents_get', () => {
 
 		expect(result.isError).toBe(true);
 		expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
+	});
+});
+
+describe('operator MCP — agent_models_list', () => {
+	it('lists every CLI with its default model and each model’s reasoning levels, to any signed-in user', async () => {
+		const result = await callTool('agent_models_list', {}, 'nobody-token');
+
+		expect(result.isError).toBeUndefined();
+		const { clis } = result.structuredContent as {
+			clis: Array<{
+				cli: string;
+				defaultModel: string;
+				models: Array<{ id: string; reasoningChoices: string[]; defaultReasoning: unknown }>;
+			}>;
+		};
+		expect(clis.map((entry) => entry.cli)).toEqual(['claude', 'antigravity', 'codex']);
+		const claude = clis.find((entry) => entry.cli === 'claude');
+		expect(claude?.defaultModel).toBe('sonnet');
+		expect(claude?.models).toContainEqual({
+			id: 'opus',
+			label: 'Opus',
+			reasoningChoices: ['low', 'medium', 'high', 'xhigh', 'max'],
+			defaultReasoning: 'high',
+		});
+		// No launch detail rides along — only what a target may name.
+		const antigravity = clis.find((entry) => entry.cli === 'antigravity');
+		for (const model of antigravity?.models ?? []) {
+			expect(Object.keys(model).sort()).toEqual([
+				'defaultReasoning',
+				'id',
+				'label',
+				'reasoningChoices',
+			]);
+		}
 	});
 });
 
@@ -2575,7 +2615,7 @@ describe('operator MCP — phase_agents_reorder and phase_agents_restore', () =>
 		);
 
 		expect(result.isError).toBeUndefined();
-		expect(findLatestOperatorAction).toHaveBeenCalledExactlyOnceWith({
+		expect(findLatestOperatorAction).toHaveBeenCalledWith({
 			tool: 'phase_agents_reorder',
 			projectId: 'proj-a',
 			target: 'proj-a/resolveConflicts',
@@ -2639,6 +2679,40 @@ describe('operator MCP — phase_agents_reorder and phase_agents_restore', () =>
 		expect(lastSettle()).toMatchObject({ outcome: 'refused', projectId: null });
 	});
 
+	it('refuses to restore once phase_agents_set set the targets after the reorder', async () => {
+		storeTargets([CLAUDE, CODEX]);
+		findLatestOperatorAction.mockImplementation(async ({ tool }: { tool: string }) =>
+			tool === 'phase_agents_reorder'
+				? {
+						id: 'audit-reorder',
+						detail: { previous: [CODEX, CLAUDE], next: [CODEX, CLAUDE] },
+						startedAt: new Date('2026-11-06T10:00:00Z'),
+					}
+				: {
+						id: 'audit-set',
+						detail: { previous: [CODEX, CLAUDE], next: [CLAUDE, CODEX] },
+						startedAt: new Date('2026-11-06T11:00:00Z'),
+					},
+		);
+
+		const result = await callTool(
+			'phase_agents_restore',
+			{ projectId: 'proj-a', phase: 'resolveConflicts', reason: 'codex has reset' },
+			'admin-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(
+			/^PRECONDITION_FAILED: .*set by `phase_agents_set` \(audit audit-set\) after/,
+		);
+		expect(findLatestOperatorAction).toHaveBeenCalledWith({
+			tool: 'phase_agents_set',
+			projectId: 'proj-a',
+			target: 'proj-a/resolveConflicts',
+		});
+		expect(upsertProjectToDb).not.toHaveBeenCalled();
+	});
+
 	it('refuses to restore when the phase was never reordered', async () => {
 		const result = await callTool(
 			'phase_agents_restore',
@@ -2660,6 +2734,189 @@ describe('operator MCP — phase_agents_reorder and phase_agents_restore', () =>
 
 		expect(result.content[0]?.text).toMatch(/^FORBIDDEN: /);
 		expect(findLatestOperatorAction).not.toHaveBeenCalled();
+		expect(upsertProjectToDb).not.toHaveBeenCalled();
+	});
+});
+
+describe('operator MCP — phase_agents_set', () => {
+	const CODEX = { cli: 'codex' as const, model: 'gpt-5.6-sol', reasoning: 'high' as const };
+	const CLAUDE = { cli: 'claude' as const, model: 'opus' };
+	const AGY = { cli: 'antigravity' as const, model: 'gemini-3.6-flash' };
+	const OTHER_PHASES = {
+		defaults: { claude: 'sonnet' },
+		review: { targets: [CLAUDE], cli: 'claude' as const, model: 'opus', timeoutMs: 20 * 60 * 1000 },
+	};
+
+	/** The stored project, re-read on every call so a test can save and read back. */
+	let stored: ReturnType<typeof createMockProjectRecord>;
+
+	beforeEach(() => {
+		stored = createMockProjectRecord({
+			id: 'proj-a',
+			agents: {
+				...OTHER_PHASES,
+				planning: { targets: [AGY, CODEX], timeoutMs: 30 * 60 * 1000, prompt: 'Plan small.' },
+			},
+		});
+		findProjectRecordByIdFromDb.mockImplementation(async (id: string) =>
+			id === 'proj-a' ? stored : undefined,
+		);
+		upsertProjectToDb.mockImplementation(async (config: typeof stored) => {
+			stored = config;
+		});
+	});
+
+	function savedAgents() {
+		expect(upsertProjectToDb).toHaveBeenCalledTimes(1);
+		return upsertProjectToDb.mock.calls[0]?.[0].agents;
+	}
+
+	function lastSettle() {
+		return settleOperatorAction.mock.calls.at(-1)?.[1];
+	}
+
+	it('adds, drops, edits and orders targets in one call, touching nothing else', async () => {
+		const result = await callTool(
+			'phase_agents_set',
+			{
+				projectId: 'proj-a',
+				phase: 'planning',
+				targets: [
+					{ cli: 'claude', model: 'opus', reasoning: 'max' },
+					{ cli: 'codex', model: 'gpt-5.5' },
+				],
+				reason: 'plan on opus first, drop antigravity',
+			},
+			'admin-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		const next = [
+			{ cli: 'claude', model: 'opus', reasoning: 'max' },
+			{ cli: 'codex', model: 'gpt-5.5' },
+		];
+		expect(result.structuredContent).toEqual({
+			dryRun: false,
+			auditId: 'audit-1',
+			result: { projectId: 'proj-a', phase: 'planning', before: [AGY, CODEX], after: next },
+		});
+		// The new list with its mirror; the timeout, prompt and every other phase as stored.
+		expect(savedAgents()).toEqual({
+			...OTHER_PHASES,
+			planning: {
+				targets: next,
+				cli: 'claude',
+				model: 'opus',
+				reasoning: 'max',
+				timeoutMs: 30 * 60 * 1000,
+				prompt: 'Plan small.',
+			},
+		});
+		expect(recordOperatorAction).toHaveBeenCalledWith(
+			expect.objectContaining({ tool: 'phase_agents_set', target: 'proj-a/planning' }),
+		);
+		expect(lastSettle()).toEqual({
+			outcome: 'succeeded',
+			error: null,
+			projectId: 'proj-a',
+			detail: { previous: [AGY, CODEX], next },
+		});
+	});
+
+	it('answers a dry run with the full targets before and after, saving nothing', async () => {
+		const result = await callTool(
+			'phase_agents_set',
+			{
+				projectId: 'proj-a',
+				phase: 'planning',
+				targets: [{ cli: 'codex', model: 'gpt-5.6-sol', reasoning: 'low' }],
+				reason: 'checking',
+				dryRun: true,
+			},
+			'admin-token',
+		);
+
+		expect(result.structuredContent).toEqual({
+			dryRun: true,
+			auditId: 'audit-1',
+			preview: {
+				projectId: 'proj-a',
+				phase: 'planning',
+				before: [AGY, CODEX],
+				after: [{ cli: 'codex', model: 'gpt-5.6-sol', reasoning: 'low' }],
+			},
+		});
+		expect(upsertProjectToDb).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		'planning',
+		'implementation',
+		'implementationUnplanned',
+		'review',
+		'respondToReview',
+		'respondToCi',
+		'resolveConflicts',
+	])('sets the targets of %s', async (phase) => {
+		const result = await callTool(
+			'phase_agents_set',
+			{ projectId: 'proj-a', phase, targets: [{ cli: 'codex' }, CLAUDE], reason: 'trying' },
+			'admin-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(savedAgents()[phase].targets).toEqual([{ cli: 'codex' }, CLAUDE]);
+	});
+
+	it('puts a phase back on its coded defaults with an empty list, keeping its timeout and prompt', async () => {
+		const result = await callTool(
+			'phase_agents_set',
+			{ projectId: 'proj-a', phase: 'planning', targets: [], reason: 'back to defaults' },
+			'admin-token',
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent?.result).toMatchObject({ after: [] });
+		expect(savedAgents()).toEqual({
+			...OTHER_PHASES,
+			planning: { timeoutMs: 30 * 60 * 1000, prompt: 'Plan small.' },
+		});
+	});
+
+	it('refuses a target its schema rejects, naming it and saving nothing', async () => {
+		const result = await callTool(
+			'phase_agents_set',
+			{
+				projectId: 'proj-a',
+				phase: 'planning',
+				targets: [CLAUDE, { cli: 'codex', model: 'opus' }],
+				reason: 'trying',
+			},
+			'admin-token',
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(
+			/^BAD_REQUEST: targets\[1\] \(codex\/opus\): model must be one of the known models.*`agent_models_list`/,
+		);
+		expect(upsertProjectToDb).not.toHaveBeenCalled();
+		expect(lastSettle()).toMatchObject({ outcome: 'refused', projectId: null });
+	});
+
+	it.each([
+		['driver-token', /^FORBIDDEN: /],
+		['member-token', /^FORBIDDEN: /],
+		['stranger-token', /^NOT_FOUND: /],
+	])('refuses %s — it is projectAdmin-only — reading and saving nothing', async (token, error) => {
+		const result = await callTool(
+			'phase_agents_set',
+			{ projectId: 'proj-a', phase: 'planning', targets: [CLAUDE], reason: 'trying' },
+			token,
+		);
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(error);
+		expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
 		expect(upsertProjectToDb).not.toHaveBeenCalled();
 	});
 });
