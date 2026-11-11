@@ -12,8 +12,10 @@ import {
 	DeliveryDeferredError,
 	HANDOFF_FILENAMES,
 	type ScmDeliveryProvider,
+	saveDeliveryProgress,
 	UnretryableDeliveryError,
 } from '@/scm/delivery.js';
+import { MERGE_VERIFICATION_REFUSED } from '@/worker/failure-diagnosis.js';
 import type { GitWorktreeManager, WorktreeHandle } from '@/worker/git-worktree-manager.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
@@ -81,6 +83,32 @@ function writeHandoff(worktreePath: string): void {
 			body: 'Merged main; resolved every conflict.',
 			verification: [{ command: 'npm test', outcome: 'passed' }],
 		}),
+	);
+}
+
+/** The hand-off of the incident in issue #1422: a merge the agent says its own tests fail on. */
+function writeFailedVerificationHandoff(worktreePath: string): void {
+	writeFileSync(
+		join(worktreePath, HANDOFF_FILENAMES.resolveConflicts),
+		JSON.stringify({
+			status: 'resolved',
+			body: 'Merged main; resolved every conflict.',
+			verification: [
+				{
+					command: 'npm test',
+					outcome: 'failed',
+					detail: 'integration setup: column "draft_verdict_recorded_at" already exists',
+				},
+			],
+		}),
+	);
+}
+
+/** A hand-off the schema refuses outright (no `verification` at all). */
+function writeInvalidHandoff(worktreePath: string): void {
+	writeFileSync(
+		join(worktreePath, HANDOFF_FILENAMES.resolveConflicts),
+		JSON.stringify({ status: 'resolved', body: 'Merged main.' }),
 	);
 }
 
@@ -367,6 +395,125 @@ describe('resolve-conflicts production delivery', () => {
  * competing for threads — hence the explicit per-case budget.
  */
 const RACE_CASE_TIMEOUT_MS = 30_000;
+
+/**
+ * Issue #1422. Once the checkout holds delivery progress, a deferral resumes
+ * delivery *without* the agent and re-reads the same hand-off, so a refusal of the
+ * hand-off's content must settle terminally and release the checkout — otherwise
+ * every retry, "Retry now" included, replays the identical refusal in half a second.
+ */
+describe('resolve-conflicts refusing its own hand-off (issue #1422)', () => {
+	function resumedDeliveryOf(write: (worktreePath: string) => void) {
+		const { worktreePath, headSha, baseSha } = makeConflictedCheckout();
+		stageResolution(worktreePath, 'resolved by hand\n');
+		write(worktreePath);
+		// What the attempt that deferred left behind: the sidecar a resume adopts.
+		saveDeliveryProgress(worktreePath, {
+			deliveryId: 'an-earlier-attempt',
+			pushed: false,
+			followUpEnqueued: false,
+		});
+		return { ...makeOptions(worktreePath, headSha, baseSha), resumeDelivery: true };
+	}
+
+	it('settles a resumed delivery of a failed-verification hand-off terminally', async () => {
+		const options = resumedDeliveryOf(writeFailedVerificationHandoff);
+
+		const error = await runResolveConflictsPhase(options).catch((e) => e);
+
+		expect(error).toBeInstanceOf(UnretryableDeliveryError);
+		expect(error).not.toBeInstanceOf(DeliveryDeferredError);
+		expect(error.message).toContain(MERGE_VERIFICATION_REFUSED);
+		expect(error.message).toContain('column "draft_verdict_recorded_at" already exists');
+		expect(error.message).toContain('not a transient condition');
+		expect(error.message).toContain('"Retry now" then runs the agent again on a fresh checkout');
+		// The resume ran no agent, and nothing reached the remote.
+		expect(options.runAgent).not.toHaveBeenCalled();
+		expect(options.pushBranch).not.toHaveBeenCalled();
+		expect(options.postComment).not.toHaveBeenCalled();
+		// Released, so the next attempt provisions fresh and runs the agent again.
+		expect(options.cleanup).toHaveBeenCalledTimes(1);
+		expect(options.preserve).not.toHaveBeenCalled();
+	});
+
+	it('settles a resumed delivery of an invalid hand-off terminally', async () => {
+		const options = resumedDeliveryOf(writeInvalidHandoff);
+
+		const error = await runResolveConflictsPhase(options).catch((e) => e);
+
+		expect(error).toBeInstanceOf(UnretryableDeliveryError);
+		expect(error).not.toBeInstanceOf(DeliveryDeferredError);
+		expect(error.message).toContain('Invalid hand-off');
+		expect(error.message).toContain('on a resumed delivery');
+		expect(options.runAgent).not.toHaveBeenCalled();
+		expect(options.cleanup).toHaveBeenCalledTimes(1);
+		expect(options.preserve).not.toHaveBeenCalled();
+	});
+
+	// The path that writes delivery progress *before* a gate: the base advanced, the
+	// first merge is committed, and the catch-up pass reports its tests failing.
+	it(
+		'settles a catch-up pass whose hand-off fails verification terminally',
+		async () => {
+			const { worktreePath, seed, headSha, baseSha } = makeConflictedCheckout();
+			const options = makeOptions(worktreePath, headSha, baseSha);
+			let passes = 0;
+			options.runAgent = vi.fn(async () => {
+				passes += 1;
+				if (passes === 1) {
+					stageResolution(worktreePath, 'resolved by hand\n');
+					advanceBase(seed, 'main moved on again\n');
+				} else {
+					mergeAdvancedBase(worktreePath, 'resolved against the newer main\n');
+					writeFailedVerificationHandoff(worktreePath);
+				}
+				return agentResult();
+			});
+
+			const error = await runResolveConflictsPhase(options).catch((e) => e);
+
+			expect(error).toBeInstanceOf(UnretryableDeliveryError);
+			expect(error).not.toBeInstanceOf(DeliveryDeferredError);
+			expect(error.message).toContain(MERGE_VERIFICATION_REFUSED);
+			expect(options.runAgent).toHaveBeenCalledTimes(2);
+			expect(options.postComment).not.toHaveBeenCalled();
+			expect(options.cleanup).toHaveBeenCalledTimes(1);
+			expect(options.preserve).not.toHaveBeenCalled();
+		},
+		RACE_CASE_TIMEOUT_MS,
+	);
+
+	it(
+		'settles a catch-up pass whose hand-off stays invalid after its repair pass terminally',
+		async () => {
+			const { worktreePath, seed, headSha, baseSha } = makeConflictedCheckout();
+			const options = makeOptions(worktreePath, headSha, baseSha);
+			let passes = 0;
+			options.runAgent = vi.fn(async () => {
+				passes += 1;
+				if (passes === 1) {
+					stageResolution(worktreePath, 'resolved by hand\n');
+					advanceBase(seed, 'main moved on again\n');
+				} else if (passes === 2) {
+					mergeAdvancedBase(worktreePath, 'resolved against the newer main\n');
+					writeInvalidHandoff(worktreePath);
+				}
+				// Pass 3 is the hand-off repair pass, which fixes nothing.
+				return agentResult();
+			});
+
+			const error = await runResolveConflictsPhase(options).catch((e) => e);
+
+			expect(error).toBeInstanceOf(UnretryableDeliveryError);
+			expect(error).not.toBeInstanceOf(DeliveryDeferredError);
+			expect(error.message).toContain('Invalid hand-off');
+			expect(options.runAgent).toHaveBeenCalledTimes(3);
+			expect(options.cleanup).toHaveBeenCalledTimes(1);
+			expect(options.preserve).not.toHaveBeenCalled();
+		},
+		RACE_CASE_TIMEOUT_MS,
+	);
+});
 
 describe('resolve-conflicts when the base advances mid-run', () => {
 	it(

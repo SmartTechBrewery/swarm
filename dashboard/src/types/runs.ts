@@ -67,6 +67,7 @@ export const failureDiagnosisSchema = z.object({
 		'continuation-no-progress',
 		'commit-unavailable',
 		'nothing-to-deliver',
+		'merge-verification-refused',
 		'review-waiting-for-checks',
 		'review-provider-unreachable',
 	]),
