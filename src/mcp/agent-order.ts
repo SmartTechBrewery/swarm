@@ -1,14 +1,19 @@
 /**
- * The pure half of the operator MCP server's phase-agent reorder tools (issue
- * #1349): naming a phase's `targets`, permuting them by those names, and telling
- * whether a recorded order is still a permutation of the current list.
+ * The pure half of the operator MCP server's phase-agent tools: naming a phase's
+ * `targets`, permuting them by those names, and telling whether a recorded order
+ * is still a permutation of the current list (issue #1349) — and replacing the
+ * whole list (issue #1415).
  *
- * Nothing here may add, drop or edit a target — a reorder changes which target a
- * worker prefers, never what the phase may run on — so every function either
+ * The reorder functions may not add, drop or edit a target — a reorder changes
+ * which target a worker prefers, never what the phase may run on — so each either
  * returns the *same* target objects in another order or refuses with the reason.
+ * {@link setTargets} is the one that may, and it validates the new list exactly as
+ * a save does.
  */
 
-import type { AgentTarget } from '../config/schema.js';
+import type { ZodIssue } from 'zod';
+
+import { type AgentConfig, AgentConfigSchema, type AgentTarget } from '../config/schema.js';
 
 /**
  * A target as an audit row recorded it — read back from JSON, so only its
@@ -117,4 +122,65 @@ export function restoreOrder(
 		ok: true,
 		targets: right.map((value) => current[left.indexOf(value)] as AgentTarget),
 	};
+}
+
+/** A target as `phase_agents_set` takes it, before the config schema normalises it. */
+export interface TargetInput {
+	cli?: string;
+	model?: string;
+	reasoning?: string;
+}
+
+export type SetTargetsResult =
+	| {
+			ok: true;
+			/** The phase's new configuration, or `undefined` when nothing of it is left. */
+			agent: AgentConfig | undefined;
+			targets: AgentTarget[];
+	  }
+	| { ok: false; reason: string };
+
+/** A target as a refusal names it: its {@link targetKey}, plus the reasoning level it asked for. */
+function describeTarget(target: TargetInput): string {
+	return target.reasoning
+		? `${targetKey(target)} at reasoning "${target.reasoning}"`
+		: targetKey(target);
+}
+
+/** One schema issue, naming the target it is about when it is about one. */
+function describeIssue(issue: ZodIssue, targets: readonly TargetInput[]): string {
+	const [field, index] = issue.path;
+	if (field === 'targets' && typeof index === 'number') {
+		const target = targets[index];
+		return `targets[${index}]${target ? ` (${describeTarget(target)})` : ''}: ${issue.message}`;
+	}
+	return issue.path.length > 0 ? `${issue.path.join('.')}: ${issue.message}` : issue.message;
+}
+
+/**
+ * `agent` with its `targets` replaced by `targets`, in that order (issue #1415) —
+ * targets may be added, dropped, edited and reordered at once, while the phase's
+ * `timeoutMs` and `prompt` are kept. The result is parsed through
+ * `AgentConfigSchema`, the very validation a save applies (known model per CLI, a
+ * reasoning level the model supports, at most one target per CLI), so it comes back
+ * normalised — a CLI pinned from its model, the `cli`/`model`/`reasoning` mirror
+ * rewritten from the new first target — or refused naming each target at fault.
+ *
+ * An empty `targets` clears the list, putting the phase back on its coded
+ * defaults; `agent` is `undefined` when that leaves the phase nothing at all.
+ */
+export function setTargets(
+	agent: AgentConfig | undefined,
+	targets: readonly TargetInput[],
+): SetTargetsResult {
+	const parsed = AgentConfigSchema.safeParse({ ...agent, targets });
+	if (!parsed.success) {
+		return {
+			ok: false,
+			reason: parsed.error.issues.map((issue) => describeIssue(issue, targets)).join('; '),
+		};
+	}
+	const next = parsed.data;
+	const remaining = Object.values(next).some((value) => value !== undefined);
+	return { ok: true, agent: remaining ? next : undefined, targets: next.targets ?? [] };
 }

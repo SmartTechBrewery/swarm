@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { AgentTarget } from '@/config/schema.js';
-import { reorderTargets, restoreOrder, targetKey } from '@/mcp/agent-order.js';
+import { reorderTargets, restoreOrder, setTargets, targetKey } from '@/mcp/agent-order.js';
 
 /**
  * The pure half of `phase_agents_reorder` / `phase_agents_restore` (issue #1349): a
@@ -67,5 +67,91 @@ describe('restoreOrder', () => {
 
 		expect(result.ok).toBe(false);
 		if (!result.ok) expect(result.reason).toMatch(/no longer a permutation/);
+	});
+});
+
+/** The pure half of `phase_agents_set` (issue #1415): replacing a phase's whole list. */
+describe('setTargets', () => {
+	const STORED = {
+		targets: [CODEX, AGY],
+		cli: 'codex' as const,
+		model: 'gpt-5.6-sol',
+		reasoning: 'high' as const,
+		timeoutMs: 20 * 60 * 1000,
+		prompt: 'Plan small.',
+	};
+
+	it('adds, drops, edits and orders targets at once, keeping the timeout and prompt', () => {
+		const result = setTargets(STORED, [
+			{ cli: 'claude', model: 'opus', reasoning: 'max' },
+			{ cli: 'codex', model: 'gpt-5.5' },
+		]);
+
+		expect(result).toEqual({
+			ok: true,
+			targets: [
+				{ cli: 'claude', model: 'opus', reasoning: 'max' },
+				{ cli: 'codex', model: 'gpt-5.5' },
+			],
+			agent: {
+				targets: [
+					{ cli: 'claude', model: 'opus', reasoning: 'max' },
+					{ cli: 'codex', model: 'gpt-5.5' },
+				],
+				// The mirror follows the new first target.
+				cli: 'claude',
+				model: 'opus',
+				reasoning: 'max',
+				timeoutMs: 20 * 60 * 1000,
+				prompt: 'Plan small.',
+			},
+		});
+	});
+
+	it('sets the first list of a phase that had no configuration', () => {
+		expect(setTargets(undefined, [{ cli: 'claude' }])).toEqual({
+			ok: true,
+			targets: [{ cli: 'claude' }],
+			agent: { targets: [{ cli: 'claude' }], cli: 'claude' },
+		});
+	});
+
+	it('clears the list to put the phase back on its coded defaults, keeping the timeout and prompt', () => {
+		expect(setTargets(STORED, [])).toEqual({
+			ok: true,
+			targets: [],
+			agent: { timeoutMs: 20 * 60 * 1000, prompt: 'Plan small.' },
+		});
+	});
+
+	it('leaves nothing of a phase whose only configuration was its targets', () => {
+		expect(setTargets({ targets: [CLAUDE], cli: 'claude', model: 'opus' }, [])).toEqual({
+			ok: true,
+			targets: [],
+			agent: undefined,
+		});
+	});
+
+	it.each([
+		[
+			'a model its CLI does not know',
+			[CLAUDE, { cli: 'codex', model: 'opus' }],
+			/^targets\[1\] \(codex\/opus\): model must be one of the known models/,
+		],
+		[
+			'a reasoning level the model does not support',
+			[{ cli: 'claude', model: 'haiku', reasoning: 'high' }],
+			/^targets\[0\] \(claude\/haiku at reasoning "high"\): reasoning must be a level supported/,
+		],
+		[
+			'two targets on one CLI',
+			[CLAUDE, { cli: 'claude', model: 'sonnet' }],
+			/^targets: targets must not name the same cli twice/,
+		],
+	])('refuses %s, naming what is wrong', (_case, targets, reason) => {
+		const result = setTargets(STORED, targets);
+
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.reason).toMatch(reason);
 	});
 });
