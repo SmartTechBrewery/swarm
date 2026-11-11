@@ -90,7 +90,10 @@ import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
 import { HEARTBEAT_MS, stillRunningLine } from '../worker/live-output.js';
 import { linkRunAbortController } from '../worker/run-cancellation.js';
 import { CommitUnavailableError } from '../worktree/commit-availability.js';
-import { createHostLocalWorktreeRuntime } from '../worktree/host-local-runtime.js';
+import {
+	createHostLocalWorktreeRuntime,
+	OwnRunLeaseHeldError,
+} from '../worktree/host-local-runtime.js';
 import { BlockedRecoveryError } from '../worktree/reclaim.js';
 import { reconstructProjectConfig } from './db-free-project.js';
 import { type DeliveryClientOptions, deliveryUrl, type FetchLike } from './delivery-client.js';
@@ -271,6 +274,11 @@ export function classifyDeferrable(err: unknown): DeferrableAssignmentFailure | 
 	// knows whether one exists. The message already names the commit and both fetch
 	// failures, so the frame's `reason` carries the whole cause across.
 	if (err instanceof CommitUnavailableError) return { kind: 'commit-unavailable' };
+	// The task's lease stayed held by this same run's other owner on this host — a
+	// reset's discard of its abandoned checkout — past the bounded wait (issue #1421).
+	// A collision with the run's own checkout, not a protected one, so it retries on
+	// the worktree-collision timer instead of settling the run terminally.
+	if (err instanceof OwnRunLeaseHeldError) return { kind: 'worktree-exists' };
 	if (err instanceof AgentRunError) {
 		const kind = err.failure.kind;
 		if (kind === 'rate-limit' || kind === 'capacity' || kind === 'aborted' || kind === 'stalled') {

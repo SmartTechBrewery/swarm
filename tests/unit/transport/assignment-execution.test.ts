@@ -39,6 +39,7 @@ import {
 	BranchUnavailableError,
 	CommitUnavailableError,
 } from '@/worktree/commit-availability.js';
+import { OwnRunLeaseHeldError } from '@/worktree/host-local-runtime.js';
 import { BlockedRecoveryError } from '@/worktree/reclaim.js';
 import {
 	createMockPullRequestContext,
@@ -1552,6 +1553,31 @@ describe('runAssignmentDbFree', () => {
 			),
 		).toEqual({ kind: 'delivery' });
 		expect(classifyDeferrable(new AgentRunError('agent failed', { kind: 'auth' }))).toBeUndefined();
+	});
+
+	// Issue #1421: a reset routed back to the worker that preserved the run found the
+	// lease still held by that worker's own discard of the run's checkout. It is the
+	// run's own collision, so it defers on the worktree-collision timer instead of
+	// settling the run `failed` with no retry, as a protected checkout still does.
+	it("defers a lease the run's own other owner still holds, unlike a protected collision", () => {
+		const assignment = buildTaskAssignment(
+			createMockTaskAssignmentInput({ phase: 'resolve-conflicts' }),
+		);
+		const frame = deferrableOrFailedResult(
+			new OwnRunLeaseHeldError("Worktree for task '2196-conflicts' is still held"),
+			assignment,
+		);
+
+		expect(frame).toMatchObject({
+			status: 'deferred',
+			failureKind: 'worktree-exists',
+			resumable: false,
+			reason: "Worktree for task '2196-conflicts' is still held",
+		});
+		expect(frame.retryDelayMs as number).toBeGreaterThan(0);
+		expect(
+			deferrableOrFailedResult(new BlockedRecoveryError('live-leased', 'held'), assignment),
+		).toMatchObject({ status: 'failed', blockedReason: 'live-leased' });
 	});
 
 	it('defers a provider server error with a reason naming the provider', () => {

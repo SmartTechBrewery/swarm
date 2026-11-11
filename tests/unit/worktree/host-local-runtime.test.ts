@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
 	createHostLocalWorktreeRuntime,
+	OwnRunLeaseHeldError,
 	sweepStaleHostLocalState,
 	UNREADABLE_LEASE_TOKEN,
 } from '@/worktree/host-local-runtime.js';
@@ -143,6 +144,74 @@ describe('host-local worktree runtime', () => {
 			expect(
 				await runtime('dispatch-a', new Set(), 'run-a').isOwnedByRun('swarm', '1140', 'run-a'),
 			).toBe(false);
+		});
+	});
+
+	// A reset routed back to the worker that preserved the run's checkout races that
+	// worker's own discard of it, which holds the lease under the *reset run's* owner key
+	// for the length of a `git worktree remove` (issue #1421).
+	describe('awaitOwnRunRelease (issue #1421)', () => {
+		function attempt(live: Set<string>, ownRunReleaseWaitMs: number) {
+			return createHostLocalWorktreeRuntime({
+				repoRoot: repoRoot(),
+				worktreeRoot: '.swarm-workspaces',
+				ownerId: 'dispatch-new',
+				runId: 'run-a',
+				isOwnerLive: (candidate) => live.has(candidate),
+				ownRunReleaseWaitMs,
+				ownRunReleasePollMs: 5,
+			});
+		}
+
+		it("waits for the run's own discard to release the lease, then the claim succeeds", async () => {
+			const live = new Set(['checkout-discard:1', 'dispatch-new']);
+			const discard = runtime('checkout-discard:1', live, 'run-a');
+			expect(await discard.tryClaim('swarm', '2196-conflicts', 'discard-token')).toBe(true);
+
+			const restarted = attempt(live, 5_000);
+			const waited = restarted.awaitOwnRunRelease?.('swarm', '2196-conflicts');
+			setTimeout(() => void discard.release('swarm', '2196-conflicts', 'discard-token'), 30);
+			await waited;
+
+			await expect(restarted.claim('swarm', '2196-conflicts')).resolves.toBeUndefined();
+		});
+
+		it('throws a deferrable error naming the discard, not "re-run", when it outlasts the wait', async () => {
+			const live = new Set(['checkout-discard:1', 'dispatch-new']);
+			await runtime('checkout-discard:1', live, 'run-a').claim('swarm', '2196-conflicts', 't');
+
+			const error = await attempt(live, 20)
+				.awaitOwnRunRelease?.('swarm', '2196-conflicts')
+				.catch((err: unknown) => err);
+
+			expect(error).toBeInstanceOf(OwnRunLeaseHeldError);
+			expect(error).not.toBeInstanceOf(BlockedRecoveryError);
+			expect((error as Error).message).toContain(
+				"the removal of this run's abandoned checkout that Reset & restart requested",
+			);
+			expect((error as Error).message).not.toContain('re-run the task');
+		});
+
+		it("returns at once for another run's live lease, leaving the claim's own refusal", async () => {
+			const live = new Set(['dispatch-b', 'dispatch-new']);
+			await runtime('dispatch-b', live, 'run-b').claim('swarm', '2196-conflicts', 't');
+
+			const restarted = attempt(live, 60_000);
+			await expect(
+				restarted.awaitOwnRunRelease?.('swarm', '2196-conflicts'),
+			).resolves.toBeUndefined();
+			await expect(restarted.claim('swarm', '2196-conflicts')).rejects.toBeInstanceOf(
+				BlockedRecoveryError,
+			);
+		});
+
+		it("does not wait on the run's own lease once its owner is gone", async () => {
+			const live = new Set(['dispatch-new']);
+			await runtime('checkout-discard:1', live, 'run-a').claim('swarm', '2196-conflicts', 't');
+
+			await expect(
+				attempt(live, 60_000).awaitOwnRunRelease?.('swarm', '2196-conflicts'),
+			).resolves.toBeUndefined();
 		});
 	});
 
