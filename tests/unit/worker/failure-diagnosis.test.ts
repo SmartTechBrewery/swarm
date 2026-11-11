@@ -6,6 +6,8 @@ import {
 	diagnoseFailure,
 	IMPLEMENTATION_NOTHING_TO_DELIVER,
 	isImplementationNothingToDeliverFailure,
+	isMergeVerificationRefusal,
+	MERGE_VERIFICATION_REFUSED,
 	MIN_SCOPE_STALL_DURATION_MS,
 } from '@/worker/failure-diagnosis.js';
 
@@ -111,6 +113,7 @@ describe('diagnoseFailure (issue #269)', () => {
 		['continuation-budget-exhausted', 'Known condition: continuation ceiling reached'],
 		['continuation-no-progress', 'Known condition: checkpoint continuations made no progress'],
 		['nothing-to-deliver', 'Known condition: nothing to deliver'],
+		['merge-verification-refused', 'Known condition: the merge failed its own verification'],
 	] as const)('%s takes precedence over scope-looking evidence', (knownCondition, title) => {
 		const diagnosis = diagnoseFailure({
 			knownCondition,
@@ -155,6 +158,32 @@ describe('the nothing-to-deliver diagnosis', () => {
 		expect(
 			isImplementationNothingToDeliverFailure(
 				'Unsafe delivery: every change in the working tree is a SWARM hand-off artifact, so there is nothing to deliver. Nothing was committed or pushed.',
+			),
+		).toBe(false);
+	});
+});
+
+// Issue #1422: a refused hand-off is a decision for the operator, not a transient
+// condition — retrying delivery replays the same file, so the copy must say so.
+describe('the merge-verification-refused diagnosis', () => {
+	it('says the refusal is of the hand-off and that Retry now re-runs the agent', () => {
+		const diagnosis = diagnoseFailure({ knownCondition: 'merge-verification-refused' });
+
+		expect(diagnosis?.message).toContain('not a transient condition');
+		expect(diagnosis?.message).toContain('was not deferred');
+		expect(diagnosis?.recovery).toContain('Retry now');
+		expect(diagnosis?.recovery).toContain('runs the agent again');
+	});
+
+	it('recognises the Resolve-conflicts refusal by its wording, and nothing else', () => {
+		expect(
+			isMergeVerificationRefusal(
+				`resolve-conflicts: the merge for PR #2196 ${MERGE_VERIFICATION_REFUSED} — \`npm test\`: column already exists.`,
+			),
+		).toBe(true);
+		expect(
+			isMergeVerificationRefusal(
+				'Conflict-resolution delivery deferred for retry ← 502 Bad Gateway from the SCM API',
 			),
 		).toBe(false);
 	});

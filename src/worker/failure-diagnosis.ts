@@ -15,6 +15,7 @@ export const FailureDiagnosisKindSchema = z.enum([
 	'continuation-no-progress',
 	'commit-unavailable',
 	'nothing-to-deliver',
+	'merge-verification-refused',
 	'review-waiting-for-checks',
 	'review-provider-unreachable',
 ]);
@@ -55,6 +56,21 @@ export const IMPLEMENTATION_NOTHING_TO_DELIVER = 'Implementation found nothing t
 /** Whether a failure message is Implementation's nothing-to-deliver failure. */
 export function isImplementationNothingToDeliverFailure(error: string): boolean {
 	return error.includes(IMPLEMENTATION_NOTHING_TO_DELIVER);
+}
+
+/**
+ * The words of the refusal Resolve-conflicts raises when its agent's hand-off
+ * records a `failed` verification entry (issues #924, #1422,
+ * `src/pipeline/resolve-conflicts.ts`). Keyed on by the `merge-verification-refused`
+ * diagnosis for the same reason as {@link IMPLEMENTATION_NOTHING_TO_DELIVER}: a
+ * DB-free worker's failure reaches the control plane as its message alone.
+ */
+export const MERGE_VERIFICATION_REFUSED =
+	'fails verification the agent attributes to the merge itself';
+
+/** Whether a failure message is Resolve-conflicts' refusal of a failed-verification hand-off. */
+export function isMergeVerificationRefusal(error: string): boolean {
+	return error.includes(MERGE_VERIFICATION_REFUSED);
 }
 
 export interface DiagnoseFailureInput {
@@ -127,6 +143,13 @@ function knownDiagnosis(condition: KnownFailureCondition): FailureDiagnosis {
 				'Known condition: nothing to deliver',
 				"The implementer agent finished without changing any repository file, so nothing was committed and no pull request was opened. The work is most likely already on the base branch, or the card's acceptance criteria are already met. SWARM moves the card out of In progress to Backlog, where nothing starts it again by itself; the run error says whether that move succeeded.",
 				"Update the card's scope if work remains, or close it if the work is already done. Re-running Implementation on the card as it stands would find nothing to change again.",
+			);
+		case 'merge-verification-refused':
+			return diagnosis(
+				condition,
+				'Known condition: the merge failed its own verification',
+				"The Resolve-conflicts agent staged a merge but its hand-off records a `failed` verification entry — a failure the agent attributes to the merge itself — so SWARM refused to deliver it. This is a refusal of the agent's hand-off, not a transient condition: a delivery retry would only re-read the same hand-off and refuse it again, so the run was not deferred and the checkout was released. The run error names the failed commands and the agent's own detail.",
+				'Check whether the failure is really caused by the merge. One caused by the worker\'s environment — for example a shared test database still holding an earlier migration of this branch — needs fixing on that machine first. Then "Retry now" runs the agent again on a fresh checkout, so it resolves and re-verifies the merge.',
 			);
 		case 'continuation-budget-exhausted':
 			return diagnosis(

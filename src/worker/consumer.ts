@@ -272,6 +272,7 @@ import {
 	diagnoseFailure,
 	type FailureDiagnosis,
 	isImplementationNothingToDeliverFailure,
+	isMergeVerificationRefusal,
 	type KnownFailureCondition,
 } from './failure-diagnosis.js';
 import { notifyBlockingFailure } from './failure-notification.js';
@@ -5220,6 +5221,9 @@ function knownFailureCondition(
 	// Keyed on the message, not the class (issue #1335): a DB-free worker's failure
 	// arrives here as `AgentRunError{kind:'error'}` carrying the message alone.
 	if (isImplementationNothingToDeliverFailure(error)) return 'nothing-to-deliver';
+	// Keyed on the message for the same reason (issue #1422): the hand-off refusal
+	// must read as a decision to make, not as a transient failure to retry past.
+	if (isMergeVerificationRefusal(error)) return 'merge-verification-refused';
 	if (isLaunchOrAuthenticationFailure(error)) return 'launch-or-authentication';
 	return undefined;
 }

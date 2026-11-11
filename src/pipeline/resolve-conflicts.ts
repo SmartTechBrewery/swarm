@@ -40,6 +40,7 @@ import {
 	UnretryableDeliveryError,
 } from '../scm/delivery.js';
 import type { WorkerBranchUpdateOutcome } from '../scm/merge.js';
+import { MERGE_VERIFICATION_REFUSED } from '../worker/failure-diagnosis.js';
 import { GitWorktreeManager } from '../worker/git-worktree-manager.js';
 import { graftEnvironment } from '../worktree/graft.js';
 import { mergeCommitSubject } from './commit-subject-pattern.js';
@@ -281,11 +282,19 @@ async function settleResolvedPaths(
  * failure both hand-offs report, which is the honest reading — two hand-offs
  * were gated — and cheaper than teaching this to diff them.
  *
- * Deliberately a plain `Error`, not an `UnretryableDeliveryError`: that class is
- * for refusals nothing between attempts can change, while a re-run resolves the
- * merge from scratch and can genuinely produce a tree that builds. The message
- * is what the phase-failure report posts, so it names the commands and the
- * agent's own detail — a broken merge, not a schema complaint.
+ * An {@link UnretryableDeliveryError} (issue #1422), because the only retry it
+ * could be given is one that cannot change it. Once the checkout holds delivery
+ * progress — a resumed delivery, or a base-advanced catch-up pass gating after the
+ * first merge was committed — a plain `Error` was deferred as a delivery resume,
+ * and that resume skips the agent ({@link resumedDeliveryAgent}), re-reads this
+ * same hand-off and refuses it again: half a second per attempt, indefinitely,
+ * with "Retry now" replaying it too. A re-run of the *agent* can genuinely produce
+ * a tree that verifies, but that needs a fresh checkout, so the run settles here,
+ * the checkout is released, and the operator's retry is the fresh pass. The
+ * message is what the phase-failure report posts and what the
+ * `merge-verification-refused` diagnosis keys on ({@link MERGE_VERIFICATION_REFUSED}),
+ * so it names the commands and the agent's own detail — a broken merge, not a
+ * schema complaint — and says why it was not retried and what clears it.
  */
 function assertMergeVerified(
 	handoff: ConflictHandoff,
@@ -301,8 +310,8 @@ function assertMergeVerified(
 		);
 	const failed = handoff.verification.filter((e) => e.outcome === 'failed');
 	if (failed.length > 0)
-		throw new Error(
-			`resolve-conflicts: the merge for PR #${context.prNumber} fails verification the agent attributes to the merge itself — ${describe(failed)}. Nothing was committed or pushed; the pull request is still conflicted.`,
+		throw new UnretryableDeliveryError(
+			`resolve-conflicts: the merge for PR #${context.prNumber} ${MERGE_VERIFICATION_REFUSED} — ${describe(failed)}. SWARM committed and pushed nothing from this hand-off. This is a verification refusal of the agent's hand-off, not a transient condition, so it was not deferred: a delivery retry would only re-read the same hand-off and refuse it again. If the failure comes from the worker's environment rather than the merge (for example a shared test database still holding an earlier migration of this branch), fix that first; "Retry now" then runs the agent again on a fresh checkout to resolve and re-verify the merge.`,
 		);
 }
 
@@ -342,10 +351,11 @@ function taskMergeCommitSubject(
  * A still-invalid hand-off fails with the original validator message as the
  * **head** of the composed error — it names the actual defect, which is what an
  * operator reads first — carrying the original error on `cause`
- * (`repairFailureError`'s rule). Deliberately a plain `Error`, not an
- * `UnretryableDeliveryError`: a fresh attempt re-runs the agent and can
- * genuinely produce a valid hand-off, the same reasoning
- * {@link assertMergeVerified} states.
+ * (`repairFailureError`'s rule). An {@link UnretryableDeliveryError}, for the
+ * reason {@link assertMergeVerified} states (issue #1422): a catch-up pass gates
+ * after delivery progress exists, and deferring it would resume delivery
+ * without the agent and re-read this same file. A fresh attempt re-runs the agent
+ * and can genuinely produce a valid hand-off, so the checkout is released for it.
  */
 async function readConflictHandoff(ctx: MergePassContext): Promise<ConflictHandoff> {
 	const read = () =>
@@ -404,8 +414,25 @@ async function readConflictHandoff(ctx: MergePassContext): Promise<ConflictHando
 				...context,
 				reason: describeError(repairError),
 			});
-			throw new Error(`${validationError} — ${repairNote}`, { cause: error });
+			throw new UnretryableDeliveryError(`${validationError} — ${repairNote}`, { cause: error });
 		}
+	}
+}
+
+/**
+ * The hand-off a resumed delivery is bound to. No agent ran in this attempt and
+ * none will in a deferred one, so a file that no longer validates is refused
+ * terminally rather than deferred into a resume that re-reads it unchanged
+ * (issue #1422).
+ */
+function readResumedHandoff(worktreePath: string): ConflictHandoff {
+	try {
+		return readHandoff(worktreePath, RESOLVE_CONFLICTS_OUTCOME_FILENAME, ConflictHandoffSchema);
+	} catch (error) {
+		throw new UnretryableDeliveryError(
+			`${describeError(error)} — on a resumed delivery, which runs no agent, so a retry would re-read the same file. "Retry now" runs the agent again on a fresh checkout.`,
+			{ cause: error },
+		);
 	}
 }
 
@@ -737,9 +764,10 @@ export async function runResolveConflictsPhase(
 		// `settleResolvedPaths` above (issue #844) for why each exists.
 		let handoff: ConflictHandoff;
 		if (shouldResumeDelivery) {
-			handoff = readHandoff(handle.path, RESOLVE_CONFLICTS_OUTCOME_FILENAME, ConflictHandoffSchema);
+			handoff = readResumedHandoff(handle.path);
 			// Before every delivery step, so a merge we are going to refuse never
-			// reaches the remote (issue #924).
+			// reaches the remote (issue #924) — terminally, since this attempt ran no
+			// agent and deferring it again would replay the same file (issue #1422).
 			assertMergeVerified(handoff, { taskId, prNumber, headSha });
 		} else {
 			handoff = await gatePreparedMerge(mergeContext);
@@ -818,9 +846,9 @@ export async function runResolveConflictsPhase(
 		return { agent, outcome };
 	} catch (error) {
 		// `shouldDeferDeliveryFailure` (not a bare progress check): a refusal that is a
-		// property of the prepared tree, or of a branch that cannot fast-forward, settles
-		// terminally rather than spending the retry budget re-validating identical state
-		// (#558, generalised by #839).
+		// property of the prepared tree, of a branch that cannot fast-forward, or of the
+		// agent's own hand-off settles terminally rather than spending the retry budget
+		// re-validating identical state (#558, generalised by #839; the hand-off by #1422).
 		if (shouldDeferDeliveryFailure(error, handle.path)) {
 			preserveForResume = true;
 			throw new DeliveryDeferredError('Conflict-resolution delivery deferred for retry', {

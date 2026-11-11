@@ -889,7 +889,10 @@ import {
 	reportInterruptedJobToBoard,
 	runAssignedPhase,
 } from '@/worker/consumer.js';
-import { IMPLEMENTATION_NOTHING_TO_DELIVER } from '@/worker/failure-diagnosis.js';
+import {
+	IMPLEMENTATION_NOTHING_TO_DELIVER,
+	MERGE_VERIFICATION_REFUSED,
+} from '@/worker/failure-diagnosis.js';
 import { RunTerminatedError } from '@/worker/run-cancellation.js';
 
 type ProcessJobArgs = Parameters<typeof processJobWithDeps>;
@@ -3209,6 +3212,28 @@ describe('processJob', () => {
 		expect(body).toContain(IMPLEMENTATION_NOTHING_TO_DELIVER);
 		expect(body).toContain('Known condition: nothing to deliver');
 		expect(body).not.toMatch(/re-trigger|hasn't moved/i);
+	});
+
+	// Issue #1422: a Resolve-conflicts refusal of its own hand-off is a decision to
+	// make, not a transient failure — keyed on the message, so a DB-free worker's
+	// rebuilt `AgentRunError{kind:'error'}` diagnoses too.
+	it('diagnoses a Resolve-conflicts merge-verification refusal of the hand-off', async () => {
+		phaseImpl = async () => {
+			throw new AgentRunError(
+				`resolve-conflicts: the merge for PR #17 ${MERGE_VERIFICATION_REFUSED} — \`npm test\`: column already exists.`,
+				{ kind: 'error' },
+			);
+		};
+
+		const outcome = await processJob(
+			createMockScmWebhookJob(),
+			registryReturning(RESOLVE_CONFLICTS_TRIGGER),
+		);
+
+		expect(outcome).toMatchObject({
+			status: 'phase-failed',
+			failureDiagnosis: { kind: 'merge-verification-refused' },
+		});
 	});
 
 	it('reports an early provider stall rather than claiming an unproven scope problem', async () => {
