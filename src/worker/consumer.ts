@@ -292,6 +292,7 @@ import {
 } from './run-cancellation.js';
 import { PHASE_DEFAULT_CLI, phaseAgentConfig, resolveTargetPolicy } from './target-policy.js';
 import { selectTarget, type TargetSelection } from './target-selection.js';
+import { resolveShuffleWorkers } from './worker-rotation.js';
 import {
 	processWorkerUpdateDispatch,
 	type WorkerUpdateSettledOutcome,
@@ -5774,6 +5775,9 @@ async function gateDispatch(
 				// Planning joins the affinity-gated phases when the project requires an
 				// assignee (issue #1165).
 				requireAssignee: resolveRequireAssignee(project.pipeline),
+				// Prefer the least recently dispatched eligible worker over the configured
+				// order when the project opts in (issue #1416).
+				shuffleWorkers: resolveShuffleWorkers(project.pipeline),
 				// The machine holding this continuation's preserved checkout, when there
 				// is one (issue #567) — the hardest narrowing the gate applies — and, when
 				// it lost its transport under this run, when the wait for it ends (#1141).
@@ -5831,6 +5835,7 @@ async function gateDispatch(
 		targetIndex: selection.targetIndex,
 		unavailable: selection.skippedClis,
 		pinnedToPreservedWorker: selection.pinnedToPreservedWorker,
+		shuffleWorkers: resolveShuffleWorkers(project.pipeline),
 	});
 	return selection;
 }
@@ -5870,6 +5875,9 @@ async function bindSelectedWorker(
 		workerFencingToken: executionIdentity.fencingToken,
 		cli: selection.cli,
 		heartbeatTtlMs: executionIdentity.heartbeatTtlMs,
+		// Resuming a preserved checkout on its own machine is not a new task, so it
+		// does not advance the "Shuffle workers" rotation (issue #1416).
+		countsAsRotationTurn: !selection.pinnedToPreservedWorker,
 	});
 	if (claim.claimed) return;
 

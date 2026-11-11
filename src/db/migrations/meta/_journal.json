@@ -687,6 +687,13 @@
       "when": 1794307691142,
       "tag": "0097_run_attempts",
       "breakpoints": true
+    },
+    {
+      "idx": 98,
+      "version": "7",
+      "when": 1794383755504,
+      "tag": "0098_enrollment_last_dispatched_at",
+      "breakpoints": true
     }
   ]
 }

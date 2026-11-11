@@ -63,6 +63,14 @@
  * silently falls back to `targets[0]` — a target no worker can run is skipped,
  * and exhausting the list yields a structured reason, not a blind dispatch.
  *
+ * **A project can trade that fixed order for a rotation** (`pipeline.shuffleWorkers`,
+ * issue #1416, {@link DispatchGateInput.shuffleWorkers}). The roster is then walked
+ * least recently dispatched first (`./worker-rotation.ts`) instead of in the
+ * configured order, so a chain of tasks that block one another spreads over the
+ * project's machines rather than draining the first one. The reordering happens
+ * once, before anything below, and every rule after it is unchanged: it decides
+ * which eligible worker is *preferred*, never which is eligible.
+ *
  * **Which of several eligible workers it takes is a pool decision** (issue #533).
  * "First in the deterministic order" is the right answer only when this dispatch is
  * the only one in play; with the consumer processing dispatches concurrently it can
@@ -123,6 +131,7 @@ import {
 import type { PMProvider, WorkItem } from '../pm/types.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import { type PoolDemand, selectPooledWorker } from './pool-scheduling.js';
+import { orderForRotation } from './worker-rotation.js';
 
 /**
  * Why a *dispatch* was refused — Phase 2's per-worker vocabulary plus the two
@@ -298,6 +307,12 @@ export interface DispatchGateInput {
 	 * affinity-gated phases to include `planning`; absent means `false`.
 	 */
 	requireAssignee?: boolean;
+	/**
+	 * The project's `pipeline.shuffleWorkers` (issue #1416). Set, the roster is
+	 * walked least recently dispatched first instead of in the configured worker
+	 * order — a preference between eligible workers only; absent means `false`.
+	 */
+	shuffleWorkers?: boolean;
 	/** The project's PM provider — only its `type`/`supportsAssignees` are read. */
 	pm?: Pick<PMProvider, 'type' | 'supportsAssignees'>;
 	/**
@@ -867,10 +882,17 @@ export async function evaluateDispatchEligibility(
 	input: DispatchGateInput,
 	options: DispatchGateOptions = {},
 ): Promise<GateDecision> {
-	const candidates = await listProjectDispatchCandidates(input.projectId);
+	const roster = await listProjectDispatchCandidates(input.projectId);
 	// No enrollments: this project is not federated, so there is no other user's
 	// machine to gate. The local worker runs it, exactly as before #130.
-	if (candidates.length === 0) return { status: 'unfederated' };
+	if (roster.length === 0) return { status: 'unfederated' };
+	// "Shuffle workers" (issue #1416) reorders the whole roster once, here, and
+	// changes nothing else: every step below — the pin, affinity, the per-target
+	// eligibility walk, the pass-over preference, the pool matching and its
+	// first-eligible fallback — already preserves candidate order, so the least
+	// recently dispatched *eligible* worker is the one preferred, and an ineligible
+	// one is still skipped however early it sorts.
+	const candidates = input.shuffleWorkers ? orderForRotation(roster) : roster;
 
 	const clis = [
 		...new Set(input.targets.map((target) => resolveTargetCli(target, input.phaseDefaultCli))),

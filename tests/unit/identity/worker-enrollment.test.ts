@@ -26,6 +26,7 @@ const validEnrollment = {
 	allowedPhases: ['implementation', 'review'],
 	concurrencyAllocation: 2,
 	orderIndex: 1,
+	lastDispatchedAt: null,
 	sharingConsent: true,
 	createdAt: new Date('2026-01-01T00:00:00Z'),
 	updatedAt: new Date('2026-01-01T00:00:00Z'),

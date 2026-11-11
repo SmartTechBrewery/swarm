@@ -45,6 +45,7 @@ function rowToEnrollment(row: EnrollmentRow): WorkerEnrollment {
 		allowedPhases: row.allowedPhases as TriggerPhase[],
 		concurrencyAllocation: row.concurrencyAllocation,
 		orderIndex: row.orderIndex,
+		lastDispatchedAt: row.lastDispatchedAt ?? null,
 		sharingConsent: row.sharingConsent,
 		createdAt: row.createdAt,
 		updatedAt: row.updatedAt,

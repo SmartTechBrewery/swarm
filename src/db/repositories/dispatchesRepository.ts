@@ -661,6 +661,14 @@ export interface ClaimWorkerForDispatchInput {
 	workerFencingToken: number;
 	cli: AgentCli;
 	heartbeatTtlMs: number;
+	/**
+	 * Whether a successful claim counts as this worker's turn in the project's
+	 * "Shuffle workers" rotation (issue #1416) — stamping the enrollment's
+	 * `last_dispatched_at`. Defaults to `true`; the caller passes `false` for a
+	 * continuation pinned to the machine holding its preserved checkout, which
+	 * resumes work rather than taking a new task.
+	 */
+	countsAsRotationTurn?: boolean;
 }
 
 function dispatchClaimRefusal(
@@ -836,6 +844,18 @@ export async function claimWorkerForDispatch(
 				),
 			)
 			.returning();
+		// The rotation's record (issue #1416): when this worker last took a phase run
+		// for the project. Written on every claim whatever the project's
+		// `pipeline.shuffleWorkers` says, so turning shuffle on starts from real
+		// history; with it off nothing reads the column. The enrollment row is already
+		// held FOR UPDATE above, so this adds no lock. `updatedAt` is restated to
+		// suppress its `$onUpdate`: a routine dispatch is not an enrollment edit.
+		if (claimed && enrollment && input.countsAsRotationTurn !== false) {
+			await tx
+				.update(workerProjectEnrollments)
+				.set({ lastDispatchedAt: now, updatedAt: enrollment.updatedAt })
+				.where(eq(workerProjectEnrollments.id, enrollment.id));
+		}
 		return { claimed: true, dispatch: claimed as DispatchRow };
 	});
 }

@@ -1133,6 +1133,26 @@ flight — Review, Respond-to-review, Respond-to-CI, and the Planning or Impleme
 of a ticket already holding a WIP slot — and only then a new ticket's start. Equally
 ranked work goes oldest first, and nothing already running is interrupted.
 
+**Which** of a project's free, eligible workers takes a phase follows the project's
+worker order — the order the project page's **Workers** tab lists them in, which a
+project administrator rearranges with the up/down arrows there. By default the first
+eligible worker in that order wins, so when only one task is runnable at a time (a
+chain of tasks that block one another) every phase lands on the same machine and
+drains that one CLI quota while the rest sit idle. Ticking **Shuffle workers** on the
+same tab (`pipeline.shuffleWorkers`,
+[`docs/configuration.md`](./configuration.md#pipeline); issue #1416) rotates tasks
+across the project's workers instead: SWARM records, per worker, when it last took a
+phase run for the project, and offers the next one to the worker that has gone longest
+without one — the next worker in the list, wrapping after the last. A worker that
+can't take the task right now (busy, offline, draining, cooling on its CLI, missing the
+phase or CLI, not consenting, or not the assignee's on an assignee-gated phase) is
+skipped for the one after it, and is first in line next time. Shuffle only changes
+which eligible worker is *preferred*: it never makes a task wait while some eligible
+worker is free, never makes an ineligible worker eligible, and does not read CLI quota
+readings. Every claimed phase run counts as a turn, except a continuation that resumes
+on the machine holding its preserved checkout. While it is ticked the arrows are
+hidden; unticking it brings them back with the saved order unchanged.
+
 Each repository also has a **WIP limit** (`repositories[].wipLimit`, default 1 —
 [`docs/configuration.md`](./configuration.md#repositories), editable per repository on
 the Source Control tab), which bounds how many **tickets** are in flight there rather

@@ -106,6 +106,7 @@ function makeCandidate(
 			// (issue #750) — `listProjectDispatchCandidates` has already applied it — so
 			// the stored position is irrelevant here and every candidate carries the same.
 			orderIndex: 0,
+			lastDispatchedAt: null,
 			sharingConsent: true,
 			createdAt: new Date('2026-01-01T00:00:00Z'),
 			updatedAt: new Date('2026-01-01T00:00:00Z'),
@@ -1030,6 +1031,237 @@ describe('evaluateDispatchEligibility', () => {
 			);
 
 			expect(decision).toMatchObject({ status: 'selected', selection: { cli: 'codex' } });
+		});
+	});
+
+	// Issue #1416 — "Shuffle workers". With it on, the roster is walked least recently
+	// dispatched first instead of in the configured order, so a chain of blocking tasks
+	// spreads over the project's machines. It is a preference between eligible workers
+	// only: every eligibility rule still applies, and a free eligible worker is always
+	// taken rather than waited past.
+	describe('the “Shuffle workers” rotation (issue #1416)', () => {
+		const T0 = Date.parse('2026-11-01T00:00:00Z');
+
+		/** A candidate whose enrollment last took a phase run `minutes` after T0 (`null` = never). */
+		function lastTook(
+			id: string,
+			minutes: number | null,
+			overrides: Parameters<typeof makeCandidate>[1] = {},
+		): WorkerDispatchCandidate {
+			return makeCandidate(id, {
+				...overrides,
+				enrollment: {
+					lastDispatchedAt: minutes === null ? null : new Date(T0 + minutes * 60_000),
+					...overrides.enrollment,
+				},
+			});
+		}
+
+		/**
+		 * Dispatch `count` tasks one after another, each stamping its chosen worker the
+		 * way `claimWorkerForDispatch` does, and report who took each — the
+		 * one-runnable-task-at-a-time chain the issue describes.
+		 */
+		async function dispatchChain(
+			fleet: WorkerDispatchCandidate[],
+			count: number,
+			input: Partial<DispatchGateInput> = {},
+		): Promise<string[]> {
+			const taken: string[] = [];
+			for (let turn = 1; turn <= count; turn++) {
+				listProjectDispatchCandidates.mockResolvedValue(fleet);
+				const decision = await evaluateDispatchEligibility(
+					gateInput({ shuffleWorkers: true, ...input }),
+				);
+				if (decision.status !== 'selected') throw new Error(`turn ${turn}: ${decision.status}`);
+				const { workerId } = decision.selection;
+				taken.push(workerId);
+				fleet = fleet.map((candidate) =>
+					candidate.worker.id === workerId
+						? {
+								...candidate,
+								enrollment: {
+									...candidate.enrollment,
+									lastDispatchedAt: new Date(T0 + (100 + turn) * 60_000),
+								},
+							}
+						: candidate,
+				);
+			}
+			return taken;
+		}
+
+		it('keeps the configured order exactly when shuffle is off, however recently the first worker ran', async () => {
+			const fleet = [lastTook('w-a', 30), lastTook('w-b', null), lastTook('w-c', 10)];
+			for (const shuffleWorkers of [undefined, false]) {
+				listProjectDispatchCandidates.mockResolvedValue(fleet);
+				expect(await evaluateDispatchEligibility(gateInput({ shuffleWorkers }))).toMatchObject({
+					status: 'selected',
+					selection: { workerId: 'w-a' },
+				});
+				// …and the pool path keeps it too.
+				expect(
+					await evaluateDispatchEligibility(
+						gateInput({ shuffleWorkers, dispatchId: 'd-self', phase: 'review' }),
+						{
+							loadPoolDemands: async () => [
+								{
+									dispatchId: 'd-self',
+									phase: 'review',
+									targets: [{}],
+									phaseDefaultCli: 'claude',
+									repository: REPOSITORY,
+								},
+							],
+						},
+					),
+				).toMatchObject({ status: 'selected', selection: { workerId: 'w-a' } });
+			}
+		});
+
+		it('hands consecutive tasks to successive workers in list order, wrapping after the last', async () => {
+			const fleet = [lastTook('w-a', null), lastTook('w-b', null), lastTook('w-c', null)];
+
+			expect(await dispatchChain(fleet, 7)).toEqual([
+				'w-a',
+				'w-b',
+				'w-c',
+				'w-a',
+				'w-b',
+				'w-c',
+				'w-a',
+			]);
+		});
+
+		it('offers the next task to the worker after the one that took the last task', async () => {
+			// `w-b` took the most recent task; `w-c` and then `w-a` are next in line.
+			const fleet = [lastTook('w-a', 1), lastTook('w-b', 2), lastTook('w-c', 0)];
+
+			expect(await dispatchChain(fleet, 3)).toEqual(['w-c', 'w-a', 'w-b']);
+		});
+
+		it('skips a busy next-in-line worker for the one after it, and offers it the task after that', async () => {
+			const fleet = [lastTook('w-a', 3), lastTook('w-b', 1, { activeRuns: 1 }), lastTook('w-c', 2)];
+			listProjectDispatchCandidates.mockResolvedValue(fleet);
+
+			expect(await evaluateDispatchEligibility(gateInput({ shuffleWorkers: true }))).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-c' },
+			});
+
+			// `w-b` frees up: having been skipped, it is first in line rather than a lap away.
+			const freed = [lastTook('w-a', 3), lastTook('w-b', 1), lastTook('w-c', 4)];
+			listProjectDispatchCandidates.mockResolvedValue(freed);
+			expect(await evaluateDispatchEligibility(gateInput({ shuffleWorkers: true }))).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-b' },
+			});
+		});
+
+		it('never selects an ineligible worker, however long ago it last ran', async () => {
+			// Each of these is the least recently used and would be next in line, but
+			// cannot take the task; the most recently used eligible worker gets it.
+			const ineligible: Array<[string, Parameters<typeof makeCandidate>[1]]> = [
+				['offline', { connected: false }],
+				['draining', { drainingSince: new Date(T0) }],
+				['no consent', { enrollment: { sharingConsent: false } }],
+				['suspended', { enrollment: { status: 'suspended' } }],
+				['phase not declared', { supportedPhases: ['review'] }],
+				['phase not allowed', { enrollment: { allowedPhases: ['review'] } }],
+				['cli missing', { capabilities: ['codex'] }],
+				['cli cooling', { rateLimitedClis: new Map([['claude', new Date(T0 + 3_600_000)]]) }],
+				['other repository', { repositories: [OTHER_REPOSITORY] }],
+			];
+			for (const [label, overrides] of ineligible) {
+				listProjectDispatchCandidates.mockResolvedValue([
+					lastTook('w-recent', 50),
+					lastTook('w-stale', null, overrides),
+				]);
+				expect(
+					await evaluateDispatchEligibility(gateInput({ shuffleWorkers: true })),
+					label,
+				).toMatchObject({ status: 'selected', selection: { workerId: 'w-recent' } });
+			}
+		});
+
+		it('still dispatches to the only free eligible worker even when it took the last task', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				lastTook('w-busy', null, { activeRuns: 1 }),
+				lastTook('w-only', 99),
+			]);
+
+			expect(await evaluateDispatchEligibility(gateInput({ shuffleWorkers: true }))).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-only' },
+			});
+		});
+
+		it('refuses exactly as it would without shuffle when nobody is eligible', async () => {
+			const fleet = [
+				lastTook('w-a', null, { activeRuns: 1 }),
+				lastTook('w-b', 5, { connected: false }),
+			];
+			listProjectDispatchCandidates.mockResolvedValue(fleet);
+			const shuffled = await evaluateDispatchEligibility(gateInput({ shuffleWorkers: true }));
+			listProjectDispatchCandidates.mockResolvedValue(fleet);
+			const fixed = await evaluateDispatchEligibility(gateInput());
+
+			expect(shuffled).toEqual(fixed);
+			expect(shuffled).toMatchObject({ status: 'ineligible', reason: 'worker-unavailable' });
+		});
+
+		it('rotates only among the assignee’s own workers on an affinity-gated phase', async () => {
+			resolveAssignedUser.mockResolvedValue(assignedTo(BOB));
+			const fleet = [
+				lastTook('w-alice', null),
+				lastTook('w-bob-1', null, { ownerUserId: BOB }),
+				lastTook('w-bob-2', null, { ownerUserId: BOB }),
+			];
+
+			expect(
+				await dispatchChain(fleet, 3, { workItem: ASSIGNED_ITEM, pm: PM, phase: 'implementation' }),
+			).toEqual(['w-bob-1', 'w-bob-2', 'w-bob-1']);
+		});
+
+		it('keeps a continuation on the machine holding its preserved checkout', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				lastTook('w-a', null),
+				lastTook('w-preserved', 99),
+			]);
+
+			expect(
+				await evaluateDispatchEligibility(
+					gateInput({ shuffleWorkers: true, preservedWorker: { id: 'w-preserved' } }),
+				),
+			).toMatchObject({
+				status: 'selected',
+				selection: { workerId: 'w-preserved', pinnedToPreservedWorker: true },
+			});
+		});
+
+		it('offers the rotation’s pick to the pool when nothing contends for it', async () => {
+			listProjectDispatchCandidates.mockResolvedValue([
+				lastTook('w-a', 2),
+				lastTook('w-b', 1),
+				lastTook('w-c', 3),
+			]);
+			const loadPoolDemands = vi.fn(async () => [
+				{
+					dispatchId: 'd-self',
+					phase: 'review' as const,
+					targets: [{}],
+					phaseDefaultCli: 'claude' as const,
+					repository: REPOSITORY,
+				},
+			]);
+
+			expect(
+				await evaluateDispatchEligibility(
+					gateInput({ shuffleWorkers: true, dispatchId: 'd-self', phase: 'review' }),
+					{ loadPoolDemands },
+				),
+			).toMatchObject({ status: 'selected', selection: { workerId: 'w-b' } });
+			expect(loadPoolDemands).toHaveBeenCalled();
 		});
 	});
 

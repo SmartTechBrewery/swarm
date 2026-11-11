@@ -643,6 +643,20 @@ export const PipelineBaseSchema = z.object({
 	 * `PMProvider.supportsAssignees` only.
 	 */
 	requireAssignee: z.boolean().optional(),
+	/**
+	 * Opt-in (issue #1416): rotate dispatches across the project's workers
+	 * instead of always preferring the first eligible one in the configured
+	 * worker order. Unset defaults to `false` in code (`resolveShuffleWorkers`,
+	 * `src/worker/worker-rotation.ts`).
+	 *
+	 * When `true`, the dispatch gate prefers the eligible worker that least
+	 * recently claimed a phase run for this project (never-dispatched first, ties
+	 * in the configured order). Every claimed phase run counts as a turn, except a
+	 * continuation pinned to the machine holding its preserved checkout. It is a
+	 * preference only: eligibility rules are unchanged, a dispatch never waits
+	 * while some eligible worker is free, and no CLI quota data is read.
+	 */
+	shuffleWorkers: z.boolean().optional(),
 });
 
 export const PipelineConfigSchema = PipelineBaseSchema.refine(

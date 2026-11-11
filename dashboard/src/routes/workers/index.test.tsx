@@ -56,6 +56,11 @@ vi.mock('@/lib/trpc.js', () => ({
 			list: {
 				queryOptions: () => ({ queryKey: ['projects.list'], queryFn: projectsListQueryFn }),
 			},
+			// The roster reads the scoped project's Shuffle workers setting through this
+			// (issue #1416); the global screen hands it `skipToken`, so it never runs here.
+			getById: {
+				queryOptions: () => ({ queryKey: ['projects.getById'], enabled: false }),
+			},
 			// The roster table's **Enrolled** column asks this per visible project
 			// (issue #1035); left pending, which is its fail-closed reading.
 			viewerAccess: {

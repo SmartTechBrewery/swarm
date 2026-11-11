@@ -1,4 +1,10 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import {
+	skipToken,
+	type UseMutationResult,
+	useMutation,
+	useQuery,
+	useQueryClient,
+} from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
 import { RefreshCw, Search, SearchX, Server } from 'lucide-react';
 import { useState } from 'react';
@@ -87,6 +93,8 @@ export function WorkersRoster({ projectId, canAdminister = false }: WorkersRoste
 		navigate({ to: '/workers/$workerId', params: { workerId } });
 	};
 
+	const shuffle = useShuffleWorkers(projectId, canAdminister);
+
 	const reorderMutation = useMutation({
 		mutationFn: (variables: { workerId: string; direction: 'up' | 'down' }) => {
 			if (!projectId) throw new Error('Reordering needs a project.');
@@ -103,27 +111,18 @@ export function WorkersRoster({ projectId, canAdminister = false }: WorkersRoste
 		},
 	});
 
-	// Withheld unless all three hold: the global screen has no project order, a
+	// Withheld unless all four hold: the global screen has no project order, a
 	// non-administrator may not change one, and a *filtered* list is the wrong
 	// thing to reorder against — a move is relative to the project's whole order,
 	// so on a narrowed list the boundary arrows would disable against the wrong
-	// rows and a move would step over a machine the viewer cannot see.
+	// rows and a move would step over a machine the viewer cannot see. Nor while
+	// the project shuffles its workers (issue #1416): a fixed priority no longer
+	// applies, so the arrows go — the stored order is left untouched, and they come
+	// back with it the moment shuffle is turned off. Withheld too while that setting
+	// is still loading, so they never flash in on a shuffled project.
 	const reorder =
-		canAdminister && projectId && query === ''
-			? {
-					onMove: (workerId: string, direction: 'up' | 'down') =>
-						reorderMutation.mutate({ workerId, direction }),
-					pendingWorkerId: reorderMutation.isPending
-						? reorderMutation.variables?.workerId
-						: undefined,
-					error:
-						reorderMutation.isError && reorderMutation.variables
-							? {
-									workerId: reorderMutation.variables.workerId,
-									message: reorderMutation.error.message,
-								}
-							: null,
-				}
+		canAdminister && projectId && query === '' && shuffle?.checked === false
+			? reorderControls(reorderMutation)
 			: undefined;
 
 	if (workersQuery.isLoading) {
@@ -147,6 +146,7 @@ export function WorkersRoster({ projectId, canAdminister = false }: WorkersRoste
 					search={search}
 					onSearchChange={setSearch}
 				/>
+				{shuffle ? <ShuffleWorkersToggle {...shuffle} /> : null}
 				{visible.length > 0 ? (
 					<WorkersTable
 						workers={visible}
@@ -224,6 +224,113 @@ function RosterToolbar({
 			{projectId && canAdminister ? (
 				<UpdateWorkersButton scope="project" projectId={projectId} />
 			) : null}
+		</div>
+	);
+}
+
+/**
+ * The table's reorder callback and its in-flight/error state, read off the reorder
+ * mutation — split out of {@link WorkersRoster} so the roster's own branching stays
+ * about *whether* the controls are offered.
+ */
+function reorderControls(
+	mutation: UseMutationResult<
+		unknown,
+		Error,
+		{ workerId: string; direction: 'up' | 'down' },
+		unknown
+	>,
+) {
+	return {
+		onMove: (workerId: string, direction: 'up' | 'down') =>
+			mutation.mutate({ workerId, direction }),
+		pendingWorkerId: mutation.isPending ? mutation.variables?.workerId : undefined,
+		error:
+			mutation.isError && mutation.variables
+				? { workerId: mutation.variables.workerId, message: mutation.error.message }
+				: null,
+	};
+}
+
+/** What the **Shuffle workers** checkbox renders and does (issue #1416). */
+interface ShuffleWorkersState {
+	/** The setting as displayed — the pending value while a save is in flight; `undefined` while it loads. */
+	checked: boolean | undefined;
+	/** Whether the viewer may change it — the project administrator only. */
+	editable: boolean;
+	saving: boolean;
+	error: string | undefined;
+	onChange: (next: boolean) => void;
+}
+
+/**
+ * The project's `pipeline.shuffleWorkers` setting (issue #1416), read from the
+ * project record the route already caches and written through `projects.update`'s
+ * pipeline patch, which merges a top-level key over the stored pipeline. `undefined`
+ * on the global roster, where there is no project to configure.
+ *
+ * The displayed value is the in-flight one while a save runs and the stored one
+ * otherwise, so a refused save falls back to what the server holds with nothing to
+ * roll back by hand; a successful one lands the returned record in the cache.
+ */
+function useShuffleWorkers(
+	projectId: string | undefined,
+	canAdminister: boolean,
+): ShuffleWorkersState | undefined {
+	const queryClient = useQueryClient();
+	// `skipToken` on the global roster: there is no project to read, so no request.
+	const projectQueryOptions = trpc.projects.getById.queryOptions(
+		projectId ? { id: projectId } : skipToken,
+	);
+	const projectQuery = useQuery(projectQueryOptions);
+	const mutation = useMutation({
+		mutationFn: (shuffleWorkers: boolean) => {
+			if (!projectId) throw new Error('Shuffling workers needs a project.');
+			return trpcClient.projects.update.mutate({ id: projectId, pipeline: { shuffleWorkers } });
+		},
+		onSuccess: (project) => {
+			queryClient.setQueryData(projectQueryOptions.queryKey, project);
+		},
+	});
+	if (!projectId) return undefined;
+	const stored = projectQuery.data
+		? projectQuery.data.pipeline?.shuffleWorkers === true
+		: undefined;
+	return {
+		checked: mutation.isPending ? mutation.variables : stored,
+		editable: canAdminister,
+		saving: mutation.isPending,
+		error: mutation.isError ? mutation.error.message : undefined,
+		onChange: (next) => mutation.mutate(next),
+	};
+}
+
+/**
+ * The project tab's **Shuffle workers** checkbox (issue #1416). Unchecked, dispatch
+ * prefers the workers in the order the table shows; checked, it rotates tasks across
+ * them, least recently dispatched first, skipping any that cannot take the task.
+ * Every enrolled member sees the state; only the project's administrator may change
+ * it, and the server re-checks that regardless.
+ */
+function ShuffleWorkersToggle({ checked, editable, saving, error, onChange }: ShuffleWorkersState) {
+	return (
+		<div className="space-y-1">
+			<label className="inline-flex items-center gap-2 text-sm text-zinc-300">
+				<input
+					type="checkbox"
+					checked={checked === true}
+					disabled={!editable || saving || checked === undefined}
+					title={editable ? undefined : 'Only a project administrator can change this.'}
+					onChange={(event) => onChange(event.target.checked)}
+					className="h-4 w-4 rounded border-zinc-700 bg-zinc-900 text-violet-600 focus:ring-1 focus:ring-violet-500 disabled:opacity-50 disabled:cursor-not-allowed"
+				/>
+				Shuffle workers
+			</label>
+			<p className="text-xs text-zinc-500">
+				Rotate tasks across this project’s workers instead of always preferring the first one in the
+				list. A worker that can’t take the task right now is skipped.
+			</p>
+			{error ? <p className="text-xs text-red-400">{error}</p> : null}
 		</div>
 	);
 }
