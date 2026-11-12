@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { Link } from '@tanstack/react-router';
 import { ArrowLeft, Bug, ExternalLink } from 'lucide-react';
-import { type ReactNode, useState } from 'react';
+import { type ReactNode, useEffect, useState } from 'react';
 import { buttonClass } from '@/components/ui/button.js';
 import { canChangeBugReportStatus } from '@/lib/bug-reports-nav.js';
 import { formatRelativeTime } from '@/lib/format.js';
@@ -269,6 +269,15 @@ function BugReportList({
 	const totalPages = Math.max(1, Math.ceil(total / BUG_REPORTS_PAGE_SIZE));
 	const startIdx = (page - 1) * BUG_REPORTS_PAGE_SIZE + 1;
 	const endIdx = Math.min(page * BUG_REPORTS_PAGE_SIZE, total);
+
+	// A batch status change can move every report on a later page out of the filter; the
+	// refetch then answers that page empty while earlier pages still match. Step back to
+	// the last page that has reports instead of showing a false empty state — the batch
+	// outcome and any refused selection stay, so the operator still sees what happened.
+	const loaded = listQuery.data !== undefined;
+	useEffect(() => {
+		if (loaded && page > totalPages) setPage(totalPages);
+	}, [loaded, page, totalPages]);
 
 	return (
 		<>

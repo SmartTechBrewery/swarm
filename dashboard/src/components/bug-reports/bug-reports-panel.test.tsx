@@ -496,6 +496,35 @@ describe('BugReportsPanel batch status change (issue #1443)', () => {
 		expect(screen.getByText('1 selected')).not.toBeNull();
 	});
 
+	it('returns to a non-empty page when a batch change empties the last one', async () => {
+		const PAGE_ONE = makeReport({ id: ORIGINAL_ID, title: 'Leases expire early' });
+		let total = 26;
+		listFn.mockImplementation(async ({ offset }: { offset: number }) => {
+			if (offset === 0) return { data: [PAGE_ONE], total };
+			return { data: total > 25 ? [FIRST] : [], total };
+		});
+		setStatusFn.mockImplementation(async () => {
+			total = 25;
+			return { ...FIRST, status: 'resolved' };
+		});
+		renderPanel();
+		await screen.findByText('Leases expire early');
+
+		fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+		await screen.findByText('Worker loses its lease');
+		fireEvent.click(screen.getByRole('checkbox', { name: 'Select all on this page' }));
+		chooseStatus('resolved');
+		fireEvent.click(screen.getByRole('button', { name: 'Change status of 1 report' }));
+
+		// Page 2 now answers empty, so the list steps back to page 1 rather than claiming
+		// nothing matches, and the batch outcome stays on screen.
+		await screen.findByText('Leases expire early');
+		expect(listFn).toHaveBeenLastCalledWith(expect.objectContaining({ offset: 0 }));
+		expect(screen.queryByText('No bug reports match this filter.')).toBeNull();
+		expect(screen.getByText('Page 1 of 1')).not.toBeNull();
+		expect(screen.getByRole('status').textContent).toContain('Changed the status of 1 report.');
+	});
+
 	it('offers no selection to a viewer who may change none of the reports', async () => {
 		signInAs(false, 'contributor');
 		listFn.mockResolvedValue({ data: [FIRST, INSTALLATION], total: 2 });

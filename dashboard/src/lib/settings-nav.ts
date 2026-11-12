@@ -51,7 +51,6 @@ export interface SettingsViewer {
  * - `fleet` (issue #1284) is visibility on top of enforcement of the one key it edits:
  *   `settings.update` refuses a non-administrator's change to
  *   `workers.followInstallationVersion` with `FORBIDDEN` (`src/api/routers/settings.ts`).
-
  */
 const INSTANCE_ADMIN_ONLY_TABS: readonly SettingsTab[] = [
 	'agents',
