@@ -110,13 +110,12 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 // The review-dispatch dedup is Redis-backed; the updated head's claim (issue
 // #874) is asserted through these rather than against a real connection.
 const claimReviewDispatch = vi.fn(async (_key: string, _trigger: string, _ctx: unknown) => true);
-const refreshReviewDispatchClaim = vi.fn(async (_key: string, _ttl: number) => {});
 vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	buildReviewDispatchKey: (repo: string, prNumber: string, headSha: string) =>
 		`${repo}:${prNumber}:${headSha}`,
 	claimReviewDispatch: (key: string, trigger: string, ctx: unknown) =>
 		claimReviewDispatch(key, trigger, ctx),
-	refreshReviewDispatchClaim: (key: string, ttl: number) => refreshReviewDispatchClaim(key, ttl),
+	MERGE_AUTOMATION_CLAIM_OWNER: 'merge-automation',
 }));
 
 // The real GitHub adapter over a stubbed Octokit (issue #1113), for the one case
@@ -294,7 +293,6 @@ beforeEach(() => {
 	scheduleCoalescedDispatch.mockResolvedValue(undefined);
 	claimReviewDispatch.mockClear();
 	claimReviewDispatch.mockResolvedValue(true);
-	refreshReviewDispatchClaim.mockClear();
 	settleAbsorbedChildren.mockClear();
 	settleAbsorbedChildren.mockResolvedValue([]);
 	markReviewVerdictSuperseded.mockClear();
@@ -1145,15 +1143,18 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 			}),
 		});
 
+		// Held past the dedup module's five-minute default, which CI routinely
+		// outlasts — in the claim itself, so its merge-automation owner value (the
+		// one a red event may take over, issue #1430) is never rewritten by a refresh.
 		expect(claimReviewDispatch).toHaveBeenCalledExactlyOnceWith(
 			`${project.repo}:17:merged-with-base`,
 			'merge-automation',
-			{ prNumber: '17', headSha: 'merged-with-base' },
-		);
-		// Held past the dedup module's five-minute default, which CI routinely outlasts.
-		expect(refreshReviewDispatchClaim).toHaveBeenCalledExactlyOnceWith(
-			`${project.repo}:17:merged-with-base`,
-			15 * 60,
+			{
+				prNumber: '17',
+				headSha: 'merged-with-base',
+				owner: 'merge-automation',
+				ttlSec: 15 * 60,
+			},
 		);
 		expect(claimReviewDispatch.mock.invocationCallOrder[0]).toBeLessThan(
 			scheduleDispatchRetry.mock.invocationCallOrder[0],
@@ -1654,7 +1655,7 @@ describe('processMergeAutomationDispatch: a provider that cannot update a branch
 		expect(claimReviewDispatch).toHaveBeenCalledWith(
 			`${project.repo}:17:worker-merge`,
 			'merge-automation',
-			{ prNumber: '17', headSha: 'worker-merge' },
+			expect.objectContaining({ prNumber: '17', headSha: 'worker-merge' }),
 		);
 		expect(updateReviewMergeOutcome).toHaveBeenCalledExactlyOnceWith('run-1', {
 			status: 'stale-base',

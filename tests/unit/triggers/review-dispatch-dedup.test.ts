@@ -103,6 +103,29 @@ describe('claimReviewDispatch', () => {
 		);
 	});
 
+	// Issue #1430: merge automation's updated-head claim takes its longer lease in
+	// the claim itself, so the owner token it is recognised by is never rewritten.
+	it('takes the lease a holder asks for in the same SET NX', async () => {
+		const { claimReviewDispatch, MERGE_AUTOMATION_CLAIM_OWNER } = await import(
+			'@/triggers/review-dispatch-dedup.js'
+		);
+
+		await claimReviewDispatch('acme/widgets:42:abc', 'merge-automation', {
+			prNumber: '42',
+			headSha: 'abc',
+			owner: MERGE_AUTOMATION_CLAIM_OWNER,
+			ttlSec: 900,
+		});
+
+		expect(set).toHaveBeenCalledExactlyOnceWith(
+			`${NS}acme/widgets:42:abc`,
+			'merge-automation',
+			'EX',
+			900,
+			'NX',
+		);
+	});
+
 	it('returns false when the key is already claimed (SET NX returns null)', async () => {
 		set.mockResolvedValue(null);
 		const { claimReviewDispatch } = await import('@/triggers/review-dispatch-dedup.js');
@@ -310,5 +333,47 @@ describe('reviewClaimedWithoutChecksTtlSec', () => {
 		);
 
 		await expect(reviewClaimedWithoutChecksTtlSec('acme/widgets:42:abc')).resolves.toBeUndefined();
+	});
+});
+
+/**
+ * Issue #1430 — a red event takes over merge automation's updated-head claim, and
+ * no other holder's, for the one CI fix the red needs.
+ */
+describe('takeOverMergeAutomationClaim', () => {
+	it('compare-and-sets the namespaced key from the merge-automation owner, keeping its TTL', async () => {
+		const { takeOverMergeAutomationClaim } = await import('@/triggers/review-dispatch-dedup.js');
+
+		await expect(
+			takeOverMergeAutomationClaim('acme/widgets:42:abc', 'pr-review:dispatch-7'),
+		).resolves.toBe(true);
+
+		expect(evalScript).toHaveBeenCalledWith(
+			expect.stringContaining("'XX', 'KEEPTTL'"),
+			1,
+			`${NS}acme/widgets:42:abc`,
+			'merge-automation',
+			'pr-review:dispatch-7',
+		);
+		expect(set).not.toHaveBeenCalled();
+	});
+
+	it('reports a loss when the slot has another holder or none', async () => {
+		evalScript.mockResolvedValue(0);
+		const { takeOverMergeAutomationClaim } = await import('@/triggers/review-dispatch-dedup.js');
+
+		await expect(
+			takeOverMergeAutomationClaim('acme/widgets:42:abc', 'pr-review:dispatch-7'),
+		).resolves.toBe(false);
+	});
+
+	// Fails closed: keeping the duplicate drop is cheaper than a second CI fix.
+	it('reports a loss when Redis fails', async () => {
+		evalScript.mockRejectedValue(new Error('ECONNREFUSED'));
+		const { takeOverMergeAutomationClaim } = await import('@/triggers/review-dispatch-dedup.js');
+
+		await expect(
+			takeOverMergeAutomationClaim('acme/widgets:42:abc', 'pr-review:dispatch-7'),
+		).resolves.toBe(false);
 	});
 });

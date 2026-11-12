@@ -206,7 +206,7 @@ import {
 import {
 	buildReviewDispatchKey,
 	claimReviewDispatch,
-	refreshReviewDispatchClaim,
+	MERGE_AUTOMATION_CLAIM_OWNER,
 } from '../triggers/review-dispatch-dedup.js';
 
 /**
@@ -796,7 +796,15 @@ function mergeRefusalCommentBody(
  *
  * Held for {@link UPDATED_HEAD_CLAIM_TTL_SEC} rather than the dedup module's
  * default five minutes: CI routinely outlasts that, and a claim that lapses
- * mid-wait is the same slot burnt a few minutes later. Best-effort — a claim
+ * mid-wait is the same slot burnt a few minutes later. The lease is set by the
+ * claim itself rather than by a refresh after it, so the claim keeps its
+ * {@link MERGE_AUTOMATION_CLAIM_OWNER} value for its whole life.
+ *
+ * It only ever holds off a Review. A **red** on that head is not locked out: the
+ * `pr-review` trigger takes this claim over for the one CI fix the red needs
+ * (`takeOverMergeAutomationClaim`, issue #1430), whether this dispatch is still
+ * waiting or has already given up — this dispatch never fixes CI itself, and
+ * without the take-over nothing would ever act on that red. Best-effort — a claim
  * that cannot be taken (Redis down, or something already holds the slot) is
  * logged and the merge proceeds, since the cost is a wasted Review rather than a
  * wrong merge.
@@ -810,6 +818,8 @@ async function claimUpdatedHeadReviewSlot(
 	const claimed = await claimReviewDispatch(key, 'merge-automation', {
 		prNumber: job.prNumber,
 		headSha,
+		owner: MERGE_AUTOMATION_CLAIM_OWNER,
+		ttlSec: UPDATED_HEAD_CLAIM_TTL_SEC,
 	});
 	if (!claimed) {
 		logger.warn('Merge automation: could not claim the review slot for the updated head', {
@@ -817,9 +827,7 @@ async function claimUpdatedHeadReviewSlot(
 			prNumber: job.prNumber,
 			headSha,
 		});
-		return;
 	}
-	await refreshReviewDispatchClaim(key, UPDATED_HEAD_CLAIM_TTL_SEC);
 }
 
 /**
