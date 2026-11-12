@@ -569,7 +569,7 @@ always equals the occurrence rows, and `firstSeenAt`/`lastSeenAt` are the first
 and latest of them.
 
 The dashboard shows the same reports, read-only, on the **Issues** tab of the
-**General** page (sidebar **Settings → General**): `/settings?tab=issues`, or
+**General** page (sidebar **General → Settings**): `/settings?tab=issues`, or
 `/settings?tab=issues&report=<id>` for one report (see
 [`MANUAL.md`](./MANUAL.md)).
 
