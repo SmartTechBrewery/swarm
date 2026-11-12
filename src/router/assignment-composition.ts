@@ -149,13 +149,15 @@ export function composeSystemPrompt(
 			);
 		case 'resolve-problem':
 			// The one prompt the worker runs verbatim (`../pipeline/resolve-problem.ts`):
-			// the failed run's record is here, on the side with the database.
+			// the failed run's (or stuck ticket's) record is here, on the side with the
+			// database.
 			if (!runId) throw new Error('resolve-problem prompt requires the run id');
 			return buildResolveProblemPrompt(
 				{
 					project,
 					runId,
-					failedRun: trigger.failedRun,
+					...(trigger.failedRun ? { failedRun: trigger.failedRun } : {}),
+					...(trigger.ticket ? { ticket: trigger.ticket } : {}),
 					maxWriteActions: resolveProblemMaxWriteActions(project.pipeline),
 				},
 				customPrompt,

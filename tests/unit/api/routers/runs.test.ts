@@ -1308,6 +1308,7 @@ describe('runsRouter', () => {
 							state: 'waiting-on-operator',
 							operatorReason: 'plan-awaiting-greenlight',
 							phase: 'planning',
+							latestRunId: 'run-plan',
 							lastActivityAt: OPENED_AT.toISOString(),
 						},
 					],

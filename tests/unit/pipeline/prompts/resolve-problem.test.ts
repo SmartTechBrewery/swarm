@@ -3,20 +3,23 @@ import { describe, expect, it } from 'vitest';
 import {
 	buildResolveProblemPrompt,
 	RESOLVE_PROBLEM_REPORT_FILENAME,
+	type ResolveProblemFailedRun,
 	type ResolveProblemPromptInput,
 } from '@/pipeline/prompts/resolve-problem.js';
+
+const FAILED_RUN: ResolveProblemFailedRun = {
+	id: 'run-failed',
+	phase: 'implementation',
+	taskId: '1395',
+	prNumber: null,
+	error: 'Agent did not write required hand-off implementation_handoff.json',
+	failureDiagnosis: null,
+};
 
 const INPUT: ResolveProblemPromptInput = {
 	project: { id: 'swarm', repo: 'SmartTechBrewery/swarm' },
 	runId: 'run-resolve',
-	failedRun: {
-		id: 'run-failed',
-		phase: 'implementation',
-		taskId: '1395',
-		prNumber: null,
-		error: 'Agent did not write required hand-off implementation_handoff.json',
-		failureDiagnosis: null,
-	},
+	failedRun: FAILED_RUN,
 	maxWriteActions: 5,
 };
 
@@ -35,7 +38,7 @@ describe('buildResolveProblemPrompt (issue #1395)', () => {
 		const prompt = buildResolveProblemPrompt({
 			...INPUT,
 			failedRun: {
-				...INPUT.failedRun,
+				...FAILED_RUN,
 				prNumber: '42',
 				failureDiagnosis: {
 					kind: 'worker-shutdown',
@@ -86,5 +89,50 @@ describe('buildResolveProblemPrompt (issue #1395)', () => {
 		const prompt = buildResolveProblemPrompt(INPUT, 'Ping #ops before any reset.');
 		expect(prompt).toContain('--- PROJECT INSTRUCTIONS ---');
 		expect(prompt).toContain('Ping #ops before any reset.');
+	});
+});
+
+describe('buildResolveProblemPrompt — stuck tickets (issue #1425)', () => {
+	const TICKET = {
+		taskId: '1425',
+		repository: 'SmartTechBrewery/swarm',
+		reason: 'stalled' as const,
+		slotOpenedAt: '2026-11-10T08:00:00.000Z',
+		lastActivityAt: '2026-11-10T09:00:00.000Z',
+		prNumber: '42',
+		workItemId: 'PVTI_card',
+	};
+
+	it('describes the stuck ticket and its latest run, and files the report on that run', () => {
+		const prompt = buildResolveProblemPrompt({ ...INPUT, ticket: TICKET });
+		expect(prompt).toContain('has stopped moving: task 1425 in SmartTechBrewery/swarm');
+		expect(prompt).toContain('no run and no dispatch since 2026-11-10T09:00:00.000Z');
+		expect(prompt).toContain('--- THE STUCK TICKET ---');
+		expect(prompt).toContain('Pull request: #42');
+		expect(prompt).toContain('Board card: PVTI_card');
+		expect(prompt).toContain('Slot held since: 2026-11-10T08:00:00.000Z');
+		expect(prompt).toContain('--- ITS LATEST RUN ---');
+		expect(prompt).not.toContain('--- THE FAILED RUN ---');
+		expect(prompt).toContain('runId: "run-failed"');
+		expect(prompt).toContain('filedByRunId: "run-resolve"');
+		expect(prompt).toContain('If no SWARM tool can move the ticket');
+	});
+
+	it('files the report on the task and project when the ticket never ran', () => {
+		const { failedRun: _, ...input } = INPUT;
+		const { lastActivityAt: __, ...ticket } = TICKET;
+		const prompt = buildResolveProblemPrompt({ ...input, ticket });
+		expect(prompt).toContain('no run and no dispatch since 2026-11-10T08:00:00.000Z');
+		expect(prompt).not.toContain('--- ITS LATEST RUN ---');
+		expect(prompt).toContain('taskId: "1425"');
+		expect(prompt).toContain('projectId: "swarm"');
+		expect(prompt).not.toContain('runId: "');
+		expect(prompt).toContain('filedByRunId: "run-resolve"');
+	});
+
+	it('leaves a failed-run attempt without the ticket wording', () => {
+		const prompt = buildResolveProblemPrompt(INPUT);
+		expect(prompt).not.toContain('THE STUCK TICKET');
+		expect(prompt).not.toContain('If no SWARM tool can move the ticket');
 	});
 });

@@ -3,12 +3,10 @@ import { z } from 'zod';
 
 import {
 	findProjectRepository,
-	resolveWipLimit,
 	scopeProjectToRepository,
 } from '../../config/project-repository.js';
 import type { ProjectConfig, ProjectRecord } from '../../config/schema.js';
 import {
-	countWipLimitWaitsByRepository,
 	type DispatchRow,
 	getActiveDispatchByRunId,
 	getDispatchById,
@@ -29,7 +27,6 @@ import {
 	hasReviewInFlightAbove,
 	hasSubmittedEveryPermittedVerdict,
 	isLastPermittedVerdict,
-	isReviewAllowanceSpent,
 	listActiveReviewSlotsForPullRequest,
 	type PullRequestReviewSlot,
 	REVIEW_SUPERSEDED_CAP,
@@ -49,7 +46,6 @@ import {
 	cancelDeferredRunInDb,
 	countMergedPullRequestsByRepository,
 	countRunsByStatusAndPhase,
-	getCompletedReviewRunForOrdinal,
 	getLatestCompletedReviewRunForPullRequest,
 	getRunByIdFromDb,
 	getRunLogsFromDb,
@@ -71,7 +67,7 @@ import {
 	recordStalledDismissal,
 } from '../../db/repositories/stalledDismissalsRepository.js';
 import { getUserById } from '../../db/repositories/usersRepository.js';
-import { listWipSlots, type WipSlotRow } from '../../db/repositories/wipSlotsRepository.js';
+import { listWipSlots } from '../../db/repositories/wipSlotsRepository.js';
 import {
 	classifyDispatchClaim,
 	type DispatchClaimLiveness,
@@ -106,7 +102,6 @@ import {
 import {
 	ITEM_ACTIVITY_LOOKBACK_MS,
 	type ItemLivenessDismissal,
-	type ItemLivenessPolicy,
 	ItemLivenessUnitKindSchema,
 	type StalledItem,
 	toStalledItems,
@@ -121,6 +116,12 @@ import { dropCheckoutContinuation, reconstructRetryJob } from '../../dispatch/re
 import { awaitsReviewRecheck } from '../../dispatch/review-recheck-wait.js';
 import { RunResetError, type RunResetRefusal, resetRun } from '../../dispatch/run-reset.js';
 import { releasePutBackTicketSlot } from '../../dispatch/wip-limit.js';
+import {
+	itemLivenessPolicyFor,
+	loadWipUsageEntries,
+	resolveReviewCapSpent,
+	wipLimitFrom,
+} from '../../dispatch/wip-usage-loader.js';
 import { AgentCliSchema } from '../../harness/agent-cli.js';
 import { ReasoningLevelSchema } from '../../harness/models.js';
 import type { SwarmUser } from '../../identity/schema.js';
@@ -161,11 +162,7 @@ import {
 	type QueuedRun,
 	toQueuedRuns,
 } from '../../queue/queued-runs.js';
-import {
-	toWipUsage,
-	type WipCappedPullRequest,
-	type WipUsageEntry,
-} from '../../queue/wip-usage.js';
+import type { WipUsageEntry } from '../../queue/wip-usage.js';
 import type { PullRequestDetails, SCMProvider } from '../../scm/types.js';
 import {
 	buildConflictCheckJob,
@@ -1881,43 +1878,6 @@ async function resolveRetryScheduled(run: RunRow): Promise<boolean | null> {
 }
 
 /**
- * Whether this Review run's verdict is the last one SWARM will produce for its
- * pull request unless an operator intervenes (issue #1038): the review-verdict
- * allowance is spent, no operator grant is outstanding, this run holds the
- * highest submitted slot, and no later reservation is already in flight.
- *
- * That last clause is what keeps the answer true *after* an operator acts. A grant
- * is spent by the reservation it pays for, so the moment the granted Review takes
- * its slot the ledger shows a spent allowance, no outstanding grant, and this run
- * still holding the last submitted verdict — every earlier clause satisfied while
- * SWARM is mid-review. Only the pending slot above it says otherwise — and only
- * while the dispatch that took it is still due to run: a reservation whose owner
- * died is a relic no reservation will clear on a capped pull request, so counting
- * it as a review in flight would retire the callout exactly when the operator
- * needs it ({@link hasReviewInFlightAbove}).
- *
- * Resolved here rather than stored on the run, because the answer belongs to the
- * *pull request's* ledger and keeps changing after the run ends (a later grant, a
- * recovered slot). {@link readReviewCapSlots} makes the one indexed read it,
- * {@link resolveReviewCapOverrideOutstanding} and {@link resolveReviewCapStop}
- * share.
- *
- * `null`, never `false`, when the question does not apply, so the dashboard can
- * tell "not a ledgered Review run" from "still has allowance left".
- */
-function resolveReviewCapSpent(
-	run: { reviewOrdinal: number | null },
-	slots: readonly PullRequestReviewSlot[] | null,
-): boolean | null {
-	if (!slots) return null;
-	return (
-		isReviewAllowanceSpent(slots) &&
-		isLastPermittedVerdict(slots, run.reviewOrdinal) &&
-		!hasReviewInFlightAbove(slots, run.reviewOrdinal)
-	);
-}
-
-/**
  * The single ledger read both cap facts above are resolved from, with the cost
  * gate and the failure posture they describe: `null` — and no read at all — for
  * every run the question does not apply to, and `null` rather than a throw when
@@ -2174,26 +2134,6 @@ function toPullRequestStatus(
 }
 
 /**
- * The two project policies the liveness classification consults, read exactly as
- * the pipeline itself reads them (issue #840): Planning's `autoAdvance` is off
- * unless set (`DEFAULT_AUTO_ADVANCE`, `src/pipeline/planning.ts`) and merge
- * automation is opt-in per repository (`src/worker/consumer.ts`, issue #1066) —
- * which is why this reads the whole **record**, not a config scoped to one of its
- * repositories. A project that no longer resolves gets those same defaults rather
- * than an exception — a stalled-work view that throws because one project row went
- * missing is worse than one that reports that project under the pipeline's own
- * defaults.
- */
-function itemLivenessPolicyFor(record: ProjectRecord | undefined): ItemLivenessPolicy {
-	return {
-		planningAutoAdvance: record?.pipeline?.planning?.autoAdvance === true,
-		autoMergeRepositories:
-			record?.repositories.filter((entry) => entry.autoMerge === true).map((entry) => entry.repo) ??
-			[],
-	};
-}
-
-/**
  * Narrow the stored dismissal rows onto the read model's own input shape (issue
  * #880). `stalled_dismissals.unit` is `text` — the enum lives in
  * `ItemLivenessUnitKindSchema`, not in Postgres — so a row naming a kind this build
@@ -2283,126 +2223,17 @@ function withPullRequestUrls(
 }
 
 /**
- * A repository's resolved WIP limit from the project records the caller loaded. A
- * repository the project no longer owns — slots outliving a removed entry — reads at
- * the project default rather than failing the view.
- */
-function wipLimitFrom(records: Map<string, ProjectRecord>) {
-	return (projectId: string, repository: string): number => {
-		const record = records.get(projectId);
-		const entry = record ? findProjectRepository(record, repository) : undefined;
-		return resolveWipLimit(entry ?? {});
-	};
-}
-
-/**
- * The holders' pull requests the review cap stopped on a refused approval (issue
- * #1379) — rule 2b of `src/queue/wip-usage.ts`. That stop fires on a webhook and
- * records no run, so it is read off each pull request's review ledger: the highest
- * submitted slot's completed Review run must be the one {@link resolveReviewCapSpent}
- * calls cap-spent, and an approval merge automation refused (`not-eligible`) — the
- * same fact the run-detail page's `isCapSpentApproval` reads, so the two agree. An
- * outstanding grant or a review in flight above that verdict means an operator has
- * acted, and the ticket is the pipeline's again.
- *
- * One ledger read per distinct pull request held in a slot (bounded by the sum of
- * the WIP limits), plus one run read only for a spent allowance. Best-effort per
- * pull request: a failed read logs and leaves that ticket uncapped rather than
- * failing the view.
- */
-async function loadWipCappedPullRequests(
-	slots: readonly WipSlotRow[],
-): Promise<WipCappedPullRequest[]> {
-	const pullRequests = new Map<
-		string,
-		{ projectId: string; repository: string; prNumber: string }
-	>();
-	for (const slot of slots) {
-		if (!slot.prNumber) continue;
-		pullRequests.set([slot.projectId, slot.repository, slot.prNumber].join('\u0000'), {
-			projectId: slot.projectId,
-			repository: slot.repository,
-			prNumber: slot.prNumber,
-		});
-	}
-	const resolved = await Promise.all(
-		[...pullRequests.values()].map(async (pr): Promise<WipCappedPullRequest | null> => {
-			try {
-				const slotsOfPr = await listActiveReviewSlotsForPullRequest(
-					pr.projectId,
-					pr.repository,
-					pr.prNumber,
-				);
-				if (!isReviewAllowanceSpent(slotsOfPr)) return null;
-				const submitted = slotsOfPr.filter((slot) => slot.state === 'submitted');
-				if (submitted.length === 0) return null;
-				const lastOrdinal = Math.max(...submitted.map((slot) => slot.ordinal));
-				if (hasReviewInFlightAbove(slotsOfPr, lastOrdinal)) return null;
-				const run = await getCompletedReviewRunForOrdinal(
-					pr.projectId,
-					pr.repository,
-					pr.prNumber,
-					lastOrdinal,
-				);
-				if (
-					!run ||
-					run.status !== 'completed' ||
-					run.phase !== 'review' ||
-					run.reviewVerdict !== 'approve' ||
-					run.reviewMergeOutcome !== 'not-eligible' ||
-					resolveReviewCapSpent(run, slotsOfPr) !== true
-				) {
-					return null;
-				}
-				return { ...pr, runId: run.id };
-			} catch (error) {
-				logger.warn('runs.wip: review-ledger lookup failed; reporting the pull request uncapped', {
-					projectId: pr.projectId,
-					repository: pr.repository,
-					prNumber: pr.prNumber,
-					error: describeError(error),
-				});
-				return null;
-			}
-		}),
-	);
-	return resolved.filter((pr): pr is WipCappedPullRequest => pr !== null);
-}
-
-/**
- * Assemble the `runs.wip` read model (issue #1192) for `projectIds` (every project
- * when absent) from its four bounded reads, and link each holder's pull request in
- * its project's own provider grammar. Postgres only, like `runs.stalled`.
+ * The `runs.wip` read model (issue #1192) for `projectIds` (every project when
+ * absent) — `loadWipUsageEntries` (`../../dispatch/wip-usage-loader.ts`, shared with
+ * Resolve problem's sweep since issue #1425) — with each holder's pull request linked
+ * in its project's own provider grammar. Postgres only, like `runs.stalled`.
  */
 async function loadWipUsage(
 	records: ProjectRecord[],
 	projectIds?: string[],
 ): Promise<WipUsageEntry[]> {
-	const since = new Date(Date.now() - ITEM_ACTIVITY_LOOKBACK_MS);
-	const [slots, waiters] = await Promise.all([
-		listWipSlots(projectIds),
-		countWipLimitWaitsByRepository(projectIds),
-	]);
-	if (slots.length === 0 && waiters.length === 0) return [];
-	const [activity, activeDispatches, cappedPullRequests] = slots.length
-		? await Promise.all([
-				listTaskActivitySince({ since, projectIds }),
-				listActiveDispatchTaskRefs(projectIds),
-				loadWipCappedPullRequests(slots),
-			])
-		: [[], [], []];
-	const recordsById = new Map(records.map((record) => [record.id, record]));
-	const entries = toWipUsage({
-		slots,
-		waiters,
-		limitFor: wipLimitFrom(recordsById),
-		activity,
-		activeDispatches,
-		cappedPullRequests,
-		policies: Object.fromEntries(
-			records.map((record) => [record.id, itemLivenessPolicyFor(record)]),
-		),
-	});
+	const entries = await loadWipUsageEntries(records, projectIds);
+	if (entries.length === 0) return entries;
 	const resolve = pullRequestUrlResolver(
 		new Map(records.map((record) => [record.id, scopeProjectToRepository(record)])),
 		'runs.wip',

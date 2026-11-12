@@ -146,6 +146,37 @@ describe('SwarmJobSchema', () => {
 		});
 	});
 
+	// Issue #1425 — a Resolve problem dispatch names a failed run or a stuck ticket.
+	describe('resolve-problem job', () => {
+		const RUN_ID = '11111111-1111-4111-8111-111111111111';
+
+		it('still parses a run attempt written before ticket attempts existed', () => {
+			const job = { type: 'resolve-problem', projectId: 'swarm', failedRunId: RUN_ID };
+			expect(SwarmJobSchema.parse(roundTrip(job))).toEqual(job);
+		});
+
+		it('parses a ticket attempt, with or without an anchor run', () => {
+			const ticket = {
+				type: 'resolve-problem',
+				projectId: 'swarm',
+				repository: 'acme/widgets',
+				ticket: { taskId: '1425', reason: 'stalled', slotOpenedAt: '2026-11-10T08:00:00.000Z' },
+			};
+			expect(SwarmJobSchema.parse(roundTrip(ticket))).toEqual(ticket);
+			const anchored = { ...ticket, failedRunId: RUN_ID };
+			expect(SwarmJobSchema.parse(roundTrip(anchored))).toEqual(anchored);
+		});
+
+		it('rejects a ticket attempt for a reason it does not take on', () => {
+			const job = {
+				type: 'resolve-problem',
+				projectId: 'swarm',
+				ticket: { taskId: '1', reason: 'terminated', slotOpenedAt: '2026-11-10T08:00:00.000Z' },
+			};
+			expect(() => SwarmJobSchema.parse(roundTrip(job))).toThrow();
+		});
+	});
+
 	describe('legacy durable envelope (pre-#385)', () => {
 		/** A dispatch row as the router wrote it when `type` *was* the provider id. */
 		function legacyJob(event: Record<string, unknown>) {

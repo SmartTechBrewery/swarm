@@ -652,22 +652,49 @@ export const WorkerUpdateJobSchema = jobBase.extend({
 
 /**
  * A **Resolve problem** dispatch (issue #1395): run the Resolve problem agent
- * against one failed run. It carries no webhook event and resolves no trigger —
- * the phase's inputs are read off the failed run itself at dispatch — and, unlike
- * every phase a webhook starts, it is not ticket work: it holds no WIP slot,
- * provisions no worktree and never moves the board card. Its dedup key is the
- * failed run (`resolve-problem:<failedRunId>`), never the task.
+ * against one failed run — or, since issue #1425, against one stuck ticket: a WIP
+ * slot holder the panel shows as Waiting on you (`stalled`). It carries no webhook
+ * event and resolves no trigger — the phase's inputs are read at dispatch — and,
+ * unlike every phase a webhook starts, it is not ticket work: it holds no WIP slot,
+ * provisions no worktree and never moves the board card.
+ *
+ * A run attempt names only `failedRunId`, and is deduplicated on it
+ * (`resolve-problem:<failedRunId>`). A ticket attempt names `ticket`, plus
+ * `failedRunId` when the ticket has a latest run (its anchor), and is deduplicated
+ * on the stuck situation: that run's key, or the slot's own key when the ticket
+ * never ran. At least one of the two is required; that rule is enforced where the
+ * job is claimed (`resolveProblemTrigger`), because a discriminated union member
+ * must stay a plain object schema.
  */
 export const ResolveProblemJobSchema = jobBase.extend({
 	type: z.literal('resolve-problem'),
-	/** The failed `runs` row this dispatch tries to resolve. */
-	failedRunId: z.string().uuid(),
 	/**
-	 * The failed run's own repository (`runs.repository`), so the project is scoped
-	 * to the repository the failed work was for — the {@link repositoryForJob} read.
-	 * Absent when the failed run recorded none, which means the default entry.
+	 * The `runs` row this dispatch is about: the failed run a run attempt tries to
+	 * resolve, or a ticket attempt's anchor — the ticket's latest run, when it has one.
+	 */
+	failedRunId: z.string().uuid().optional(),
+	/**
+	 * The failed run's own repository (`runs.repository`), or the stuck ticket's slot
+	 * repository, so the project is scoped to the repository the work was for — the
+	 * {@link repositoryForJob} read. Absent when the failed run recorded none, which
+	 * means the default entry.
 	 */
 	repository: z.string().min(1).optional(),
+	/**
+	 * A ticket attempt (issue #1425): the WIP slot holder it is about, as the sweep
+	 * saw it. Re-checked against the WIP classifier when claimed — the slot's
+	 * `openedAt` and the anchor run must still be the ones named here.
+	 */
+	ticket: z
+		.object({
+			taskId: z.string().min(1),
+			reason: z.literal('stalled'),
+			/** ISO 8601 — when the slot the ticket holds was opened. */
+			slotOpenedAt: z.string().datetime(),
+			prNumber: z.string().min(1).optional(),
+			workItemId: z.string().min(1).optional(),
+		})
+		.optional(),
 });
 
 const swarmJobVariants = z.discriminatedUnion('type', [
@@ -739,8 +766,9 @@ export type SwarmJob = z.infer<typeof swarmJobVariants>;
  *   (`ProjectRepository.pmRoutingToken`), and a card claiming none or two is
  *   refused at ingress rather than enqueued. `undefined` only for a row written
  *   before that — the default entry, exactly as it ran then.
- * - `resolve-problem` — the failed run's own repository, copied onto the job when
- *   the dispatch was scheduled (issue #1395).
+ * - `resolve-problem` — the failed run's own repository, or a stuck ticket's slot
+ *   repository, copied onto the job when the dispatch was scheduled (issues #1395,
+ *   #1425).
  * - `worker-update` — none, stated rather than defaulted (see the case below).
  *
  * One `switch` exhaustive over the discriminator rather than a lookup with a

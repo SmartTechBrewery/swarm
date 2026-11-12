@@ -3943,8 +3943,9 @@ async function tryCreateRun(
 			reasoning: overrides.reasoning,
 			timeoutMs: overrides.timeoutMs,
 			jobPayload: job,
-			// The failed run this attempt is for (issue #1395) — what links the two on
-			// the run list and in either run's detail.
+			// The failed run this attempt is for (issue #1395), or a ticket attempt's
+			// anchor run (issue #1425) — what links the two on the run list and in
+			// either run's detail. None for a stuck ticket that never ran.
 			resolvesRunId: trigger.phase === 'resolve-problem' ? trigger.failedRunId : undefined,
 		});
 		job.agentSessionId = runId;
@@ -4738,8 +4739,9 @@ async function reportPhaseFailureToBoardOrPr(
 	try {
 		const body = phaseFailureCommentBody(trigger.phase, error, failureDiagnosis);
 		if (trigger.phase === 'resolve-problem') {
-			// The failed run's own item: its board card when it had one, else the pull
-			// request it acted on (issue #1395). The card is commented on, never moved.
+			// The failed run's (or the stuck ticket's) own item: its board card when it
+			// had one, else the pull request it acted on (issues #1395, #1425). The card
+			// is commented on, never moved.
 			if (trigger.workItemId) {
 				const commentId = await requireProjectPMProvider(project).addComment(
 					trigger.workItemId,
@@ -4748,6 +4750,7 @@ async function reportPhaseFailureToBoardOrPr(
 				logger.debug('Posted Resolve problem failure comment to the board item', {
 					projectId: project.id,
 					failedRunId: trigger.failedRunId,
+					ticketTaskId: trigger.ticket?.taskId,
 					workItemId: trigger.workItemId,
 					commentId,
 				});
@@ -5081,6 +5084,7 @@ async function skipResolveProblemDispatch(
 	logger.info('Resolve problem skipped', {
 		projectId: project.id,
 		failedRunId: job.failedRunId,
+		ticketTaskId: job.ticket?.taskId,
 		reason: skip.skip,
 	});
 	if (job.runId) {
@@ -5090,7 +5094,7 @@ async function skipResolveProblemDispatch(
 	return {
 		status: 'skipped-not-eligible',
 		phase: 'resolve-problem',
-		taskId: skip.taskId ?? job.failedRunId,
+		taskId: skip.taskId ?? job.ticket?.taskId ?? job.failedRunId ?? 'resolve-problem',
 		reason: skip.skip,
 	};
 }
@@ -6872,6 +6876,7 @@ async function processClaimedDispatch(
 				runId,
 				report: result.resolveProblem,
 				agent: result.agent,
+				subject: trigger.ticket ? 'ticket' : 'failed-run',
 			});
 		}
 		logger.debug('Job phase completed', {

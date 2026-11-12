@@ -57,7 +57,7 @@ import { priorityFor } from '../queue/producer.js';
 import type { TriggerPhase } from '../triggers/types.js';
 import { mergeDispatchDedupKey } from '../worker/merge-automation.js';
 import { publishDispatchWakeUp } from './dispatcher.js';
-import { dispatchResolveProblemForFailedRuns } from './resolve-problem-trigger.js';
+import { sweepResolveProblem } from './resolve-problem-trigger.js';
 import { awaitsReviewRecheck } from './review-recheck-wait.js';
 import { promoteAllWipWaits } from './wip-limit.js';
 
@@ -531,7 +531,7 @@ export async function reconcileDispatchesPeriodically(): Promise<void> {
 			});
 		}
 		// Never throws, and logs its own outcome.
-		await dispatchResolveProblemForFailedRuns();
+		await sweepResolveProblem();
 	} catch (err) {
 		logger.error('dispatch-reconciler: periodic reconciliation failed (continuing)', {
 			error: describeError(err),

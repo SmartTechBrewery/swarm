@@ -1804,6 +1804,38 @@ another. The ten minutes are fixed (`RESOLVE_PROBLEM_DELAY_MS`), not a setting.
 The dispatch is deduplicated on the failed run (`resolve-problem:<failedRunId>`),
 so two sweeps running at once create one.
 
+**Waiting on you tickets (issue #1425).** The same sweep also takes on tickets the
+dashboard's WIP panel shows as **Waiting on you**. It reads the panel's own
+classification (`src/dispatch/wip-usage-loader.ts`), so the two cannot disagree.
+Each reason is in scope or excluded (`src/dispatch/resolve-problem-scope.ts`):
+
+- **Stalled** — in scope. The ticket holds a WIP slot and nothing has moved it. The
+  attempt is about the *ticket*: the agent gets the task, its pull request and
+  card, how long it has held the slot, and its latest run when it has one.
+- **Failed** — in scope, at any age. Its latest run failed with nothing queued, so
+  it gets the same attempt as a failed run above. A failed run older than the
+  24-hour window is picked up here.
+- **Terminated** — excluded. A user terminated the run. Restarting it (moving the
+  card out of its column and back) is that person's call.
+- **Review cap reached** — excluded. The review cap is a safety stop SWARM placed
+  on purpose. Granting another review, or merging, is a person's decision.
+- **Plan awaiting greenlight** — excluded. The plan waits for the operator's
+  greenlight, a deliberate human gate.
+- **Approved, awaiting merge** — excluded. The approved pull request waits for a
+  person to merge it, a deliberate human gate.
+
+A ticket is attempted once it has waited at least the same ten minutes since it
+last moved. It gets **one attempt per stuck situation**: the situation is its
+latest run, or — for a ticket that never ran — the slot it holds. Only a newer run,
+or the slot being taken again, makes a new situation. Nothing is attempted while a
+dispatch is queued for the ticket, a newer run moved it, or its run is being reset
+or will retry by itself. A Resolve problem run never counts as the ticket moving,
+so an attempt neither qualifies itself nor hides the ticket from the panel. When
+the attempt is claimed, the ticket is checked again: it must still hold the same
+slot, still be Waiting on you for a reason in scope, and have the same latest run.
+Otherwise the attempt is skipped. If no SWARM tool can move the ticket, the agent
+reports it `unresolved` and says what the person should do.
+
 **Turning it on.** The phase is **off by default**. Turn it on with the
 **Enabled** toggle on the Resolve problem screen of the project's **Agents** tab,
 or set `pipeline.resolveProblem.enabled: true` in `swarm.config.json` and run

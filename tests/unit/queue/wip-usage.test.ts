@@ -124,8 +124,22 @@ describe('toWipUsage', () => {
 			openedAt: LONG_AGO.toISOString(),
 			state: 'running',
 			phase: 'planning',
+			latestRunId: 'run-1',
 			lastActivityAt: LONG_AGO.toISOString(),
 		});
+	});
+
+	it('names the deciding unit’s latest run, and none for a holder that never ran (issue #1425)', () => {
+		expect(
+			holder({ activity: [makeActivity({ runId: 'run-7', status: 'failed' })] }),
+		).toMatchObject({
+			state: 'waiting-on-operator',
+			operatorReason: 'failed',
+			latestRunId: 'run-7',
+		});
+		const neverRan = holder();
+		expect(neverRan).toMatchObject({ state: 'waiting-on-operator', operatorReason: 'stalled' });
+		expect(neverRan.latestRunId).toBeUndefined();
 	});
 
 	it('reads a holder whose pull request has a live run as running', () => {
