@@ -2298,6 +2298,26 @@ function PipelineFailureCallout({ run, error, onResetSuccess }: PipelineFailureC
 	);
 }
 
+/**
+ * The `completed` callout for a Resolve problem run that found nothing left to
+ * resolve (issue #1441): the failure it was about was already fixed outside SWARM —
+ * its pull request merged or closed by hand — and the run's headline says how the
+ * agent knew. A success, not an error, so it reads green.
+ */
+function NothingLeftToResolveCallout({ note }: { note: string }) {
+	return (
+		<div className="p-4 bg-emerald-950/20 border border-emerald-900/30 rounded flex items-start gap-3">
+			<CheckCircle2 className="h-5 w-5 text-emerald-400 shrink-0 mt-0.5" />
+			<div>
+				<h3 className="text-xs font-semibold text-emerald-200">Nothing left to resolve</h3>
+				<p className="text-xs text-emerald-200/70 mt-1 font-mono whitespace-pre-wrap">
+					{normalizeRunError(note)}
+				</p>
+			</div>
+		</div>
+	);
+}
+
 interface RunStatusCalloutProps {
 	run: RunRow;
 	/** Forwarded to the recovery controls, which report their reset back to the header. */
@@ -2341,6 +2361,11 @@ function RunStatusCallout({ run, onResetSuccess }: RunStatusCalloutProps) {
 			) : null;
 		case 'checkpointed':
 			return <CheckpointedCallout run={run} onResetSuccess={onResetSuccess} />;
+		case 'completed':
+			// Only a Resolve problem run records a headline on success (issue #1441).
+			return run.phase === 'resolve-problem' && run.error ? (
+				<NothingLeftToResolveCallout note={run.error} />
+			) : null;
 		case 'failed':
 			return (
 				<>

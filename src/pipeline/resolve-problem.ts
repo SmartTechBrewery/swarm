@@ -70,9 +70,14 @@ const MCP_PROBE_TIMEOUT_MS = 30_000;
 /** The prefix of the failure a preflight that did not pass settles the run with. */
 export const MCP_UNREACHABLE_PREFIX = 'SWARM operator MCP unreachable';
 
-/** The hand-off the agent writes: what it concluded, and every real write it made. */
+/**
+ * The hand-off the agent writes: what it concluded, and every real write it made.
+ * `already-resolved` (issue #1441) says there was nothing left to resolve — the
+ * failure was already fixed outside SWARM, e.g. its pull request was merged or
+ * closed by hand — and settles the run `completed`, like `resolved`.
+ */
 export const ResolveProblemReportSchema = z.object({
-	outcome: z.enum(['resolved', 'unresolved']),
+	outcome: z.enum(['resolved', 'already-resolved', 'unresolved']),
 	bugReportId: z.string().min(1),
 	actions: z.array(
 		z.object({

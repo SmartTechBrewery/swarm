@@ -5186,6 +5186,94 @@ describe('runsRouter', () => {
 		});
 	});
 
+	// Issue #1441 — the live state of a pull request, from the project's own provider.
+	describe('prLiveState (issue #1441)', () => {
+		const REPO = 'SmartTechBrewery/swarm';
+		const INPUT = { projectId: 'p1', repository: REPO, prNumber: 2219 };
+		const getPullRequest = vi.fn();
+		const pullRequest = (overrides: Record<string, unknown> = {}) => ({
+			number: 2219,
+			headBranch: 'issue-2219',
+			headSha: 'abc123',
+			baseBranch: 'main',
+			baseSha: 'base',
+			mergeable: null,
+			authorLogin: 'someone',
+			state: 'open',
+			merged: false,
+			...overrides,
+		});
+
+		beforeEach(() => {
+			vi.mocked(findProjectRecordByIdFromDb).mockResolvedValue(
+				createMockProjectRecord({ id: 'p1' }),
+			);
+			getPullRequest.mockReset().mockResolvedValue(pullRequest());
+			vi.mocked(requireProjectSCMProvider).mockReturnValue({
+				type: 'github',
+				getPullRequest,
+			} as unknown as ReturnType<typeof requireProjectSCMProvider>);
+		});
+
+		it('reports a merged pull request as merged, with its head', async () => {
+			getPullRequest.mockResolvedValue(pullRequest({ state: 'closed', merged: true }));
+
+			await expect(caller.prLiveState(INPUT)).resolves.toEqual({
+				projectId: 'p1',
+				repository: REPO,
+				prNumber: 2219,
+				state: 'merged',
+				headSha: 'abc123',
+				headBranch: 'issue-2219',
+				baseBranch: 'main',
+			});
+			expect(getPullRequest).toHaveBeenCalledWith(expect.objectContaining({ repo: REPO }), 2219);
+		});
+
+		it('reports a pull request closed without merging as closed', async () => {
+			getPullRequest.mockResolvedValue(pullRequest({ state: 'closed', merged: false }));
+
+			await expect(caller.prLiveState(INPUT)).resolves.toMatchObject({ state: 'closed' });
+		});
+
+		it('reports an open pull request as open', async () => {
+			await expect(caller.prLiveState(INPUT)).resolves.toMatchObject({
+				state: 'open',
+				headSha: 'abc123',
+			});
+		});
+
+		it('reads a repository the project does not own as not found, asking no provider', async () => {
+			await expect(
+				caller.prLiveState({ ...INPUT, repository: 'acme/elsewhere' }),
+			).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+			expect(getPullRequest).not.toHaveBeenCalled();
+		});
+
+		it('fails when the provider read fails', async () => {
+			getPullRequest.mockRejectedValue(new Error('rate limited'));
+
+			await expect(caller.prLiveState(INPUT)).rejects.toThrowError(
+				expect.objectContaining({
+					code: 'INTERNAL_SERVER_ERROR',
+					message: expect.stringContaining('rate limited'),
+				}),
+			);
+		});
+
+		it('hides the project from a non-member before any read, and serves a contributor', async () => {
+			const ordinary = runsRouter.createCaller({ user: ORDINARY_USER });
+			vi.mocked(getMembership).mockResolvedValue(undefined);
+			await expect(ordinary.prLiveState(INPUT)).rejects.toThrowError(
+				expect.objectContaining({ code: 'NOT_FOUND' }),
+			);
+			expect(findProjectRecordByIdFromDb).not.toHaveBeenCalled();
+
+			vi.mocked(getMembership).mockResolvedValue(membershipFor('contributor'));
+			await expect(ordinary.prLiveState(INPUT)).resolves.toMatchObject({ state: 'open' });
+		});
+	});
+
 	// Issue #1351 — closing the work item behind a merged pull request.
 	describe('closeMergedWorkItem and previewCloseMergedWorkItem', () => {
 		const REPO = 'SmartTechBrewery/swarm';

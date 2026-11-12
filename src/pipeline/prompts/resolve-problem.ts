@@ -139,6 +139,32 @@ function diagnoseLine(input: ResolveProblemPromptInput): string {
 }
 
 /**
+ * The pull request the attempt is about, when it has one: the ticket's own (or its
+ * anchor run's) for a ticket attempt, the failed run's otherwise.
+ */
+function subjectPullRequest(
+	input: ResolveProblemPromptInput,
+): { repository: string; prNumber: string } | undefined {
+	const prNumber = input.ticket?.prNumber ?? input.failedRun?.prNumber;
+	if (!prNumber) return undefined;
+	return { repository: input.ticket?.repository ?? input.project.repo, prNumber };
+}
+
+/**
+ * The live pull-request check (issue #1441): SWARM's own records do not see a
+ * merge, close or push made outside SWARM, so the agent asks the provider before it
+ * acts — and reports `already-resolved` when the pull request is no longer open.
+ */
+function livePullRequestLine(input: ResolveProblemPromptInput): string[] {
+	const pr = subjectPullRequest(input);
+	if (!pr) return [];
+	const call = `\`pr_live_state\` (\`projectId: "${input.project.id}"\`, \`repository: "${pr.repository}"\`, \`prNumber: ${pr.prNumber}\`)`;
+	return [
+		`SWARM’s own records (\`run_get\`, \`pr_status\`) do not see a merge, a close or a push made outside SWARM. So call ${call} to read pull request #${pr.prNumber}’s live state from the source-control provider before any remedy, and again before you write your report. If it is \`merged\` or \`closed\`, the failure no longer blocks anything: make no recovery write, and do not tell the operator to re-run, merge or push anything. Still record the bug report below, then report \`already-resolved\` with a summary naming the pull request’s state and head as the reason.`,
+	];
+}
+
+/**
  * Which record the bug report names: the failed run (or a ticket's anchor run)
  * through `runId`, or — for a ticket that never ran — its task, filed under the
  * project (`bug_report_create` takes the project from `runId` only when there is one).
@@ -174,6 +200,7 @@ export function buildResolveProblemPrompt(
 		subjectLine(input),
 		'You have the SWARM operator MCP server (`swarm`) attached, under a credential that works only for this project, only for this run, and only until this run ends. You have no repository checkout: your working directory is an empty scratch directory.',
 		diagnoseLine(input),
+		...livePullRequestLine(input),
 		`Then try remedies one at a time. After each one, check with the read tools whether the pipeline actually moved before you try the next. Never repeat an action on the same target. You may make at most ${maxWriteActions} real (non-dry-run) write calls in this run; SWARM refuses any beyond that.`,
 		`Every write tool takes \`dryRun\` and a mandatory \`reason\`. Call each write with \`dryRun: true\` first and read the preview, then repeat it for real only if the preview shows exactly what you intend. Give every call a specific \`reason\` naming ${reasonSubject} and the cause you found.`,
 		'Hard limits — never cross them, even if a tool would let you: never change code; never edit, push to, approve or merge a pull request; never override a safety stop SWARM placed on purpose — the review-verdict cap, merge-retry-exhausted, a user termination and anything like them. A safety stop is a hand-off to a person: report it, do not undo it. If the only fix is one of these, leave the problem unresolved and say so.',
@@ -183,7 +210,7 @@ export function buildResolveProblemPrompt(
 				]
 			: []),
 		`Record what you found, whatever the outcome: search \`bug_reports_list\` (with \`query\`) for a report of the same problem. If one exists, add an occurrence to it with \`bug_report_add_occurrence\`; otherwise create one with \`bug_report_create\`. Either way pass ${bugReportSubject(input)} and \`filedByRunId: "${runId}"\` — SWARM checks that this run filed one and fails the run otherwise. Use status \`environmental\` for a cause outside SWARM (the network, a CLI quota, Docker, a machine).`,
-		`Finally write \`${RESOLVE_PROBLEM_REPORT_FILENAME}\` in your working directory as JSON: \`{ "outcome": "resolved" | "unresolved", "bugReportId": "<the report you created or added to>", "actions": [{ "tool": "<tool name>", "target": "<what it acted on>", "result": "<what happened>" }], "summary": "<the cause and what you did, for the operator>" }\`. List every real write in \`actions\` (an empty list if you made none). Say \`resolved\` only when you saw the pipeline move again; otherwise \`unresolved\`, with the summary saying what a person needs to do next.`,
+		`Finally write \`${RESOLVE_PROBLEM_REPORT_FILENAME}\` in your working directory as JSON: \`{ "outcome": "resolved" | "already-resolved" | "unresolved", "bugReportId": "<the report you created or added to>", "actions": [{ "tool": "<tool name>", "target": "<what it acted on>", "result": "<what happened>" }], "summary": "<the cause and what you did, for the operator>" }\`. List every real write in \`actions\` (an empty list if you made none). Say \`resolved\` only when you saw the pipeline move again; \`already-resolved\` when the problem was already gone before you fixed anything — its pull request merged or closed outside SWARM, or a newer run already did the work — with the summary saying how you know; otherwise \`unresolved\`, with the summary saying what a person needs to do next.`,
 		...subjectSections,
 		...projectInstructionsParagraph(customPrompt),
 	].join('\n\n');

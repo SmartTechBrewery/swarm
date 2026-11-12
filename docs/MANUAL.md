@@ -1939,12 +1939,28 @@ files a cause outside SWARM, such as the network, a CLI quota, Docker or a
 machine, with status `environmental`. SWARM checks the database for that
 occurrence: a run that filed none fails.
 
-**Escalation.** The attempt succeeds only when the agent reports `resolved` and
-SWARM finds the bug-report occurrence it filed. Anything else fails the attempt.
-The failure carries the agent's summary and every action it tried, and is posted
-on the failed run's board card (or its pull request), so a person picks it up
-from there. The failed run's detail page lists its attempts, and the attempt's
-page links back to the run it was resolving.
+**A pull request fixed outside SWARM (issue #1441).** SWARM's own records do not
+see a merge, a close or a push that a person made by hand: a manual merge is not a
+SWARM run or dispatch, so the sweep can still dispatch an attempt on a run whose
+pull request has since landed. When the failed run or the stuck ticket has a pull
+request, the agent therefore reads its live state with `pr_live_state`, which asks
+the project's own source-control provider for it — `open`, `merged` or `closed`,
+plus its head — before it tries any remedy and again before it reports. If the
+pull request is `merged` or `closed`, the agent makes no recovery write, does not
+tell the operator to re-run, merge or push anything, and reports
+`already-resolved`, saying why. It reports the same outcome for other evidence that
+the problem is already gone, such as a newer run that already did the work.
+
+**Escalation.** The attempt succeeds when the agent reports `resolved` — it saw
+the pipeline move again — or `already-resolved`, and SWARM finds the bug-report
+occurrence it filed. The bug report is required for every outcome. An
+`already-resolved` attempt settles **completed**, and its explanation is the run's
+headline: "Resolve problem found nothing left to resolve — the failed run was
+already fixed: …", shown on the run page as a green **Nothing left to resolve**
+callout. Anything else fails the attempt. The failure carries the agent's summary
+and every action it tried, and is posted on the failed run's board card (or its
+pull request), so a person picks it up from there. The failed run's detail page
+lists its attempts, and the attempt's page links back to the run it was resolving.
 
 ## Failure diagnosis
 

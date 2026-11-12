@@ -406,7 +406,7 @@ describe('verifyResolveProblemOutcome', () => {
 	const filed = vi.fn(async (_runId: string) => ({ id: 'occ-1', reportId: 'report-1' }));
 	const none = vi.fn(async (_runId: string) => undefined);
 
-	async function failureOf(promise: Promise<void>): Promise<AgentRunError> {
+	async function failureOf(promise: Promise<unknown>): Promise<AgentRunError> {
 		const error = await promise.catch((err: unknown) => err);
 		expect(error).toBeInstanceOf(AgentRunError);
 		expect((error as AgentRunError).failure.kind).toBe('error');
@@ -416,8 +416,55 @@ describe('verifyResolveProblemOutcome', () => {
 	it('succeeds on a resolved report backed by a bug report the run filed', async () => {
 		await expect(
 			verifyResolveProblemOutcome({ runId: 'run-resolve', report: REPORT, agent: AGENT }, filed),
-		).resolves.toBeUndefined();
+		).resolves.toEqual({});
 		expect(filed).toHaveBeenCalledWith('run-resolve');
+	});
+
+	it('settles an already-resolved report as a success with its explanation as the headline (issue #1441)', async () => {
+		const settle = await verifyResolveProblemOutcome(
+			{
+				runId: 'run-resolve',
+				report: {
+					...REPORT,
+					outcome: 'already-resolved',
+					actions: [],
+					summary: 'PR #2219 was merged outside SWARM at head abc123.',
+				},
+				agent: AGENT,
+			},
+			filed,
+		);
+		expect(settle.headline).toBe(
+			'Resolve problem found nothing left to resolve — the failed run was already fixed: PR #2219 was merged outside SWARM at head abc123. Tried: no recovery action.',
+		);
+	});
+
+	it('names a stuck ticket in an already-resolved headline (issue #1441)', async () => {
+		const settle = await verifyResolveProblemOutcome(
+			{
+				runId: 'run-resolve',
+				report: { ...REPORT, outcome: 'already-resolved', summary: 'PR #7 was closed.' },
+				agent: AGENT,
+				subject: 'ticket',
+			},
+			filed,
+		);
+		expect(settle.headline).toContain('the stuck ticket was already fixed: PR #7 was closed.');
+		expect(settle.headline).toContain(`run_reset on ${FAILED_RUN.id} → restarted`);
+	});
+
+	it('fails an already-resolved report that filed no bug report (issue #1441)', async () => {
+		const error = await failureOf(
+			verifyResolveProblemOutcome(
+				{
+					runId: 'run-resolve',
+					report: { ...REPORT, outcome: 'already-resolved', summary: 'PR #2219 was merged.' },
+					agent: AGENT,
+				},
+				none,
+			),
+		);
+		expect(error.message).toContain('filed no bug report');
 	});
 
 	it('fails an unresolved report with its summary and the actions it tried', async () => {
