@@ -2103,7 +2103,9 @@ const ADJUDICATED_RED_MESSAGES: Record<
  * reviewed diff and the current base are each fine and their combination is not.
  * Its red is Respond-to-CI's too since issue #1430 — the `checks completed` event
  * takes this head's merge-automation claim over — so the comment names that
- * agent and asks for a hand fix only where it is not enabled.
+ * agent and asks for a hand fix only where it is not enabled. That event re-runs
+ * the failed checks once first (issue #1433, `rerunUpdatedHeadOnce`), which the
+ * comment says too.
  * For the approved head itself (issue #1124) the review approved a commit whose
  * CI failed; the failure belongs to Respond-to-CI, which the `pr-review` trigger
  * routes this head to on its own, so nothing here races it.
@@ -2168,7 +2170,7 @@ async function refuseRedHead(
 		updated
 			? mergeRefusalCommentBody(
 					`SWARM brought this pull request's head up to date with the base and the resulting commit fails its checks: ${failed}. Each side is green on its own; together they are not.`,
-					'The failure is real — it is what this pull request would have landed. SWARM handles the failing checks the same way as for any red pull request (Respond-to-CI, when it is enabled for this repository), and a fixed head gets its own review before it can merge. Where Respond-to-CI is not enabled, the combination needs fixing by hand on this branch.',
+					'SWARM first re-runs the failing checks once, in case the failure is environmental. If they stay red, the failure is what this pull request would have landed: SWARM handles it the same way as for any red pull request (Respond-to-CI, when it is enabled for this repository), and a fixed head gets its own review before it can merge. Where Respond-to-CI is not enabled, the combination needs fixing by hand on this branch.',
 				)
 			: mergeRefusalCommentBody(
 					`The review approved head \`${job.approvedHeadSha}\`, but that head fails its checks: ${failed}.`,

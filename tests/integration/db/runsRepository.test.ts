@@ -13,6 +13,7 @@ import {
 	appendRunOutputEvents,
 	type CreateRunInput,
 	cancelDeferredRunInDb,
+	claimUpdatedHeadChecksRerun,
 	clearRunRecovery,
 	completeRun,
 	countMergedPullRequestsByRepository,
@@ -31,6 +32,7 @@ import {
 	findStoredPullRequestUrl,
 	findStoredTaskBranch,
 	findTaskIdForStoredTaskBranch,
+	findUpdatedHeadReviewRun,
 	getCompletedReviewRunForOrdinal,
 	getLatestCompletedPlanningScope,
 	getLatestRunForTask,
@@ -77,7 +79,11 @@ import {
 	abandonedReviewDiagnosis,
 	type FailureDiagnosis,
 } from '../../../src/worker/failure-diagnosis.js';
-import { createMockPmWebhookJob, createMockScmWebhookJob } from '../../helpers/factories.js';
+import {
+	createMockPmWebhookJob,
+	createMockScmEvent,
+	createMockScmWebhookJob,
+} from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
@@ -3548,6 +3554,123 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 				id: newer,
 				taskId: '70',
 			});
+		});
+	});
+
+	describe('findUpdatedHeadReviewRun / claimUpdatedHeadChecksRerun (issue #1433)', () => {
+		const key = { projectId: PROJECT_ID, repository: REPO, prNumber: '72', headSha: 'sha-updated' };
+
+		/**
+		 * A completed Review run on PR 72 that reviewed `reviewed` and approved it,
+		 * whose merge automation then advanced onto `advancedTo` (a base update).
+		 */
+		async function updatedRun(
+			opts: {
+				reviewed?: string | null;
+				advancedTo?: string;
+				prNumber?: string;
+				verdict?: 'approve' | 'request-changes';
+			} = {},
+		): Promise<string> {
+			const reviewed = opts.reviewed === undefined ? 'sha-reviewed' : opts.reviewed;
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: opts.prNumber ?? '72',
+				phase: 'review',
+				prNumber: opts.prNumber ?? '72',
+				...(reviewed !== null
+					? {
+							jobPayload: createMockScmWebhookJob({
+								event: createMockScmEvent({ headSha: reviewed }),
+							}),
+						}
+					: {}),
+			});
+			await completeRun(id, {
+				status: 'completed',
+				engine: 'claude',
+				reviewVerdict: opts.verdict ?? 'approve',
+			});
+			await updateReviewMergeOutcome(id, {
+				status: 'stale-base',
+				message: 'advanced',
+				attempt: 0,
+				approvedHeadSha: opts.advancedTo ?? 'sha-updated',
+			});
+			return id;
+		}
+
+		it('finds the approval whose merge advanced onto a head it did not review', async () => {
+			const id = await updatedRun();
+
+			expect(await findUpdatedHeadReviewRun(key)).toEqual({
+				id,
+				checksRerunHeadSha: null,
+				checksRerunAt: null,
+			});
+		});
+
+		it.each([
+			['the approved head itself (never advanced)', { reviewed: 'sha-updated' }],
+			['a run whose payload names no reviewed head', { reviewed: null }],
+			['a merge generation on another head', { advancedTo: 'sha-other' }],
+			['another pull request', { prNumber: '73' }],
+			['a request-changes verdict', { verdict: 'request-changes' as const }],
+		])('ignores %s', async (_label, opts) => {
+			await updatedRun(opts);
+
+			expect(await findUpdatedHeadReviewRun(key)).toBeUndefined();
+		});
+
+		it('ignores a superseded approval', async () => {
+			const id = await updatedRun();
+			await markReviewRunSuperseded(id);
+
+			expect(await findUpdatedHeadReviewRun(key)).toBeUndefined();
+		});
+
+		it('claims the re-run once per head, and stamps it on the run', async () => {
+			const id = await updatedRun();
+
+			expect(await claimUpdatedHeadChecksRerun(id, 'sha-updated')).toBe(true);
+			expect(await claimUpdatedHeadChecksRerun(id, 'sha-updated')).toBe(false);
+			const found = await findUpdatedHeadReviewRun(key);
+			expect(found?.checksRerunHeadSha).toBe('sha-updated');
+			expect(found?.checksRerunAt).toBeInstanceOf(Date);
+		});
+
+		it('claims again once the merge has advanced onto a fresh head', async () => {
+			const id = await updatedRun();
+			expect(await claimUpdatedHeadChecksRerun(id, 'sha-updated')).toBe(true);
+
+			await updateReviewMergeOutcome(id, {
+				status: 'stale-base',
+				message: 'advanced again',
+				attempt: 0,
+				approvedHeadSha: 'sha-updated-2',
+				advancedFrom: 'sha-updated',
+			});
+
+			expect(await claimUpdatedHeadChecksRerun(id, 'sha-updated-2')).toBe(true);
+			expect(await claimUpdatedHeadChecksRerun(id, 'sha-updated-2')).toBe(false);
+		});
+
+		it('never claims a head the merge generation does not cover', async () => {
+			const id = await updatedRun();
+
+			expect(await claimUpdatedHeadChecksRerun(id, 'sha-other')).toBe(false);
+			expect((await findUpdatedHeadReviewRun(key))?.checksRerunHeadSha).toBeNull();
+		});
+
+		it('clears the re-run with the rest of the merge state when the run is retried', async () => {
+			const id = await updatedRun();
+			await claimUpdatedHeadChecksRerun(id, 'sha-updated');
+
+			await resetRunToRunning(id);
+
+			const [row] = await getDb().select().from(runs).where(eq(runs.id, id));
+			expect(row?.reviewMergeChecksRerunHeadSha).toBeNull();
+			expect(row?.reviewMergeChecksRerunAt).toBeNull();
 		});
 	});
 

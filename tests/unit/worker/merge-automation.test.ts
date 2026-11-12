@@ -3283,6 +3283,8 @@ describe('processMergeAutomationDispatch: an adjudicated red approved head (issu
 		// tell a human to fix the branch that agent is pushing to.
 		expect(body).toContain('Respond-to-CI');
 		expect(body).not.toContain('Fix the combination on this branch');
+		// Issue #1433: the red is re-run once before it reaches that agent.
+		expect(body).toContain('re-runs the failing checks once');
 	});
 
 	it('keeps the #1124 refusal when the adjudication cannot be read', async () => {

@@ -22,6 +22,7 @@ const {
 	markReviewDispatchClaimedWithoutChecks,
 	reviewClaimedWithoutChecksTtlSec,
 	takeOverMergeAutomationClaim,
+	releaseReviewDispatch,
 } = vi.hoisted(() => ({
 	claimReviewDispatch: vi.fn(),
 	refreshReviewDispatchClaim: vi.fn(),
@@ -35,6 +36,8 @@ const {
 	// The red event's take-over of merge automation's updated-head claim (issue
 	// #1430); defaults to "not held by merge automation", the ordinary collision.
 	takeOverMergeAutomationClaim: vi.fn(),
+	// What a requested updated-head re-run hands back (issue #1433).
+	releaseReviewDispatch: vi.fn(),
 }));
 vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	claimReviewDispatch,
@@ -43,6 +46,7 @@ vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	markReviewDispatchClaimedWithoutChecks,
 	reviewClaimedWithoutChecksTtlSec,
 	takeOverMergeAutomationClaim,
+	releaseReviewDispatch,
 	reviewDispatchClaimOwner: (dispatchId: string) => `pr-review:${dispatchId}`,
 	buildReviewDispatchKey: (repo: string, prNumber: string, headSha: string) =>
 		`${repo}:${prNumber}:${headSha}`,
@@ -142,12 +146,18 @@ const {
 	createFailedRun,
 	getLatestRunForTask,
 	failRunFromStatus,
+	findUpdatedHeadReviewRun,
+	claimUpdatedHeadChecksRerun,
 } = vi.hoisted(() => ({
 	hasRunForTask: vi.fn(),
 	findTaskIdForStoredTaskBranch: vi.fn(),
 	createFailedRun: vi.fn(),
 	getLatestRunForTask: vi.fn(),
 	failRunFromStatus: vi.fn(),
+	// The updated-head re-run's run-row lookup and once-per-head claim (issue
+	// #1433); the lookup defaults to "not a head merge automation produced".
+	findUpdatedHeadReviewRun: vi.fn(),
+	claimUpdatedHeadChecksRerun: vi.fn(),
 }));
 vi.mock('@/db/repositories/runsRepository.js', async (importActual) => ({
 	...(await importActual<typeof import('@/db/repositories/runsRepository.js')>()),
@@ -156,6 +166,16 @@ vi.mock('@/db/repositories/runsRepository.js', async (importActual) => ({
 	createFailedRun,
 	getLatestRunForTask,
 	failRunFromStatus,
+	findUpdatedHeadReviewRun,
+	claimUpdatedHeadChecksRerun,
+}));
+
+// The updated-head re-run is made as the operator whose worker produced the pull
+// request (issue #1249); resolving that reads the run and worker tables.
+const { runAsPullRequestOperator } = vi.hoisted(() => ({ runAsPullRequestOperator: vi.fn() }));
+vi.mock('@/identity/pull-request-operator.js', async (importOriginal) => ({
+	...(await importOriginal<typeof import('@/identity/pull-request-operator.js')>()),
+	runAsPullRequestOperator,
 }));
 const { getActiveDispatchByRunId } = vi.hoisted(() => ({ getActiveDispatchByRunId: vi.fn() }));
 vi.mock('@/db/repositories/dispatchesRepository.js', () => ({ getActiveDispatchByRunId }));
@@ -202,6 +222,7 @@ const { hasCiNoFixRecovery, recoverAdjudicatedApprovedHead } = vi.hoisted(() => 
 vi.mock('@/dispatch/ci-no-fix-recovery.js', () => ({ hasCiNoFixRecovery }));
 vi.mock('@/dispatch/approved-head-checks-rerun.js', () => ({
 	recoverAdjudicatedApprovedHead,
+	RERUN_SETTLE_MS: 120_000,
 	RERUN_SETTLE_RECHECK_DELAY_MS: 135_000,
 }));
 
@@ -252,6 +273,17 @@ beforeEach(() => {
 	getLatestRunForTask.mockResolvedValue(undefined);
 	failRunFromStatus.mockReset();
 	failRunFromStatus.mockResolvedValue(true);
+	findUpdatedHeadReviewRun.mockReset();
+	findUpdatedHeadReviewRun.mockResolvedValue(undefined);
+	claimUpdatedHeadChecksRerun.mockReset();
+	claimUpdatedHeadChecksRerun.mockResolvedValue(true);
+	releaseReviewDispatch.mockReset();
+	releaseReviewDispatch.mockResolvedValue(undefined);
+	runAsPullRequestOperator.mockReset();
+	runAsPullRequestOperator.mockImplementation(
+		async (_project: unknown, _prNumber: string, fn: (operator: unknown) => Promise<unknown>) =>
+			fn({ workerId: 'worker-1', workerName: 'alice-laptop' }),
+	);
 	getActiveDispatchByRunId.mockReset();
 	getActiveDispatchByRunId.mockResolvedValue(undefined);
 	reserveReviewVerdict.mockReset();
@@ -4025,5 +4057,176 @@ describe('review trigger — red on a head merge automation brought up to date (
 		expect(takeOverMergeAutomationClaim).not.toHaveBeenCalled();
 		expect(claimReviewDispatch).not.toHaveBeenCalled();
 		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * A red on a head merge automation brought up to date for an approved pull request
+ * is re-run once before Respond-to-CI (issue #1433). The repro is
+ * `under-control-platform#2210`: approve → update-branch → `retry-exhausted` →
+ * red, where one manual re-run turned the head green. The real policy
+ * (`rerunUpdatedHeadOnce`) runs here; only its run-row reads, the operator lookup
+ * and the provider's re-run are stubbed.
+ */
+describe('review trigger — red on an updated head is re-run once first (issue #1433)', () => {
+	const KEY = `${PROJECT.repo}:42:merged-with-base`;
+	const AUTO_MERGE = createMockProjectConfig({ autoMerge: true });
+	const checks = {
+		kind: 'checks',
+		action: 'completed',
+		workItemId: '42',
+		headSha: 'merged-with-base',
+		prBranch: 'issue-42',
+	} as const;
+	const rerunFailedChecks = vi.fn();
+	const scm = { ...SCM, rerunFailedChecks };
+	const autoCtx = (extra: Parameters<typeof ctx>[1] = {}): TriggerContext =>
+		createMockScmTriggerContext({
+			project: AUTO_MERGE,
+			scm,
+			event: createMockScmEvent(checks),
+			...extra,
+		});
+	/** The approving Review run whose merge advanced onto this head, its re-run unspent. */
+	const UNSPENT = { id: 'run-review', checksRerunHeadSha: null, checksRerunAt: null };
+	const spentAgo = (ms: number) => ({
+		id: 'run-review',
+		checksRerunHeadSha: 'merged-with-base',
+		checksRerunAt: new Date(Date.now() - ms),
+	});
+
+	beforeEach(() => {
+		getPullRequest.mockResolvedValue({
+			number: 42,
+			headBranch: 'issue-42',
+			headSha: 'merged-with-base',
+			baseBranch: 'main',
+			baseSha: 'base123',
+			mergeable: true,
+			authorLogin: 'operator-human',
+			state: 'open',
+		});
+		getAggregateCheckStatus.mockResolvedValue(
+			checkStatus([['backend-integration', 'completed', 'failure']]),
+		);
+		findUpdatedHeadReviewRun.mockResolvedValue(UNSPENT);
+		rerunFailedChecks.mockReset();
+		rerunFailedChecks.mockResolvedValue({ status: 'requested', checks: ['backend-integration'] });
+	});
+
+	it('re-runs the failed checks and dispatches nothing — no claim, no fix attempt', async () => {
+		// Merge automation gave up (`retry-exhausted`) but still holds the slot.
+		claimReviewDispatch.mockResolvedValue(false);
+		takeOverMergeAutomationClaim.mockResolvedValue(true);
+		const noteDecline = vi.fn();
+
+		expect(await handler.handle(autoCtx({ noteDecline }))).toBeNull();
+
+		expect(findUpdatedHeadReviewRun).toHaveBeenCalledWith({
+			projectId: AUTO_MERGE.id,
+			repository: AUTO_MERGE.repo,
+			prNumber: '42',
+			headSha: 'merged-with-base',
+		});
+		expect(claimUpdatedHeadChecksRerun).toHaveBeenCalledExactlyOnceWith(
+			'run-review',
+			'merged-with-base',
+		);
+		expect(rerunFailedChecks).toHaveBeenCalledExactlyOnceWith(
+			AUTO_MERGE,
+			'merged-with-base',
+			'implementer',
+		);
+		// Released so the re-run's own checks event is decided rather than dropped.
+		expect(releaseReviewDispatch).toHaveBeenCalledExactlyOnceWith(KEY);
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+		expect(takeOverMergeAutomationClaim).not.toHaveBeenCalled();
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+		expect(noteDecline).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({
+				kind: 'skipped',
+				reason: expect.stringContaining('re-ran the failing checks once'),
+			}),
+		);
+	});
+
+	it('dispatches Respond-to-CI for a second red after the settle window', async () => {
+		claimUpdatedHeadChecksRerun.mockResolvedValueOnce(true).mockResolvedValue(false);
+		findUpdatedHeadReviewRun
+			.mockResolvedValueOnce(UNSPENT)
+			.mockResolvedValue(spentAgo(5 * 60 * 1000));
+
+		expect(await handler.handle(autoCtx())).toBeNull();
+		expect(await handler.handle(autoCtx())).toMatchObject({
+			phase: 'respond-to-ci',
+			prNumber: '42',
+			headSha: 'merged-with-base',
+		});
+
+		expect(rerunFailedChecks).toHaveBeenCalledTimes(1);
+		expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+	});
+
+	it('re-reads a red inside the settle window after the window instead of dispatching', async () => {
+		claimUpdatedHeadChecksRerun.mockResolvedValue(false);
+		findUpdatedHeadReviewRun.mockResolvedValue(spentAgo(10_000));
+		const noteDecline = vi.fn();
+
+		expect(await handler.handle(autoCtx({ recheckAttempt: 2, noteDecline }))).toBeNull();
+
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+		expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
+		const [job, , delayMs, waitReason] = scheduleCoalescedJob.mock.calls[0];
+		expect(job).toMatchObject({ recheckAttempt: 2 });
+		expect(delayMs).toBe(135_000);
+		expect(waitReason).toBe('recheck');
+		expect(noteDecline).toHaveBeenCalledWith(
+			expect.objectContaining({ kind: 'recheck-scheduled', retryAfterSec: 135 }),
+		);
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+	});
+
+	it('hands the red to Respond-to-CI when the re-run cannot be made', async () => {
+		rerunFailedChecks.mockResolvedValue({ status: 'unsupported', message: 'no re-run API' });
+
+		expect(await handler.handle(autoCtx())).toMatchObject({ phase: 'respond-to-ci' });
+
+		expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		expect(loggerWarn).toHaveBeenCalledWith(
+			expect.stringContaining('could not re-run the failed checks'),
+			expect.objectContaining({ reason: expect.stringContaining('unsupported') }),
+		);
+	});
+
+	// An implementer-pushed head is no head merge automation produced.
+	it('routes a red on an implementer head to Respond-to-CI exactly as before', async () => {
+		findUpdatedHeadReviewRun.mockResolvedValue(undefined);
+
+		expect(await handler.handle(autoCtx())).toMatchObject({ phase: 'respond-to-ci' });
+
+		expect(claimUpdatedHeadChecksRerun).not.toHaveBeenCalled();
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+		expect(releaseReviewDispatch).not.toHaveBeenCalled();
+	});
+
+	it('leaves an adjudicated red on an approved head to its own policy (issue #1128)', async () => {
+		hasCiNoFixRecovery.mockResolvedValue(true);
+		getApprovedHeadSlot.mockResolvedValue({ checksRerunAt: null });
+
+		expect(await handler.handle(autoCtx())).toBeNull();
+
+		expect(recoverAdjudicatedApprovedHead).toHaveBeenCalledTimes(1);
+		expect(findUpdatedHeadReviewRun).not.toHaveBeenCalled();
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+	});
+
+	it('does not apply when merge automation is off', async () => {
+		expect(await handler.handle(autoCtx({ project: PROJECT }))).toMatchObject({
+			phase: 'respond-to-ci',
+		});
+
+		expect(findUpdatedHeadReviewRun).not.toHaveBeenCalled();
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
 	});
 });

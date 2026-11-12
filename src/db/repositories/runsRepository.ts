@@ -835,6 +835,9 @@ async function resetRunRowToRunning(
 			reviewMergeMessage: null,
 			reviewMergeAttempt: null,
 			reviewMergeApprovedHeadSha: null,
+			// The updated-head re-run belongs to that generation too (issue #1433).
+			reviewMergeChecksRerunHeadSha: null,
+			reviewMergeChecksRerunAt: null,
 			// Same for the superseded-approval stamp (issue #1079): a re-running review
 			// has not been superseded, and its fresh approval is the one the next merge
 			// dispatch judges.
@@ -1955,6 +1958,87 @@ export async function findApprovedReviewRunForRearm(
 	const run = rows[0];
 	if (!run || !isPipelineRun(run)) return undefined;
 	return { id: run.id, taskId: run.taskId };
+}
+
+/** Which pull-request head {@link findUpdatedHeadReviewRun} asks about. */
+export type UpdatedHeadReviewRunKey = ApprovedReviewRunForRearmKey;
+
+/** The approving Review run whose merge produced a head, projected for its once-only re-run (issue #1433). */
+export interface UpdatedHeadReviewRun {
+	id: string;
+	/** The head this run's updated-head re-run was last spent on, or `null` while it never was. */
+	checksRerunHeadSha: string | null;
+	/** When that re-run was requested, or `null` while it never was. */
+	checksRerunAt: Date | null;
+}
+
+/**
+ * The latest completed, still-counting Review run that approved this pull request
+ * and whose merge automation brought it up to date onto `headSha` — a head the run
+ * did **not** review itself (issue #1433, `src/dispatch/updated-head-checks-rerun.ts`).
+ *
+ * Keyed on `reviewMergeApprovedHeadSha`, the head the run's current merge
+ * generation covers, exactly as {@link findApprovedReviewRunForRearm}; what makes
+ * the head an *updated* one is that it differs from the head the run reviewed,
+ * read off the run's own dispatching event (`job_payload.event.headSha`). A run
+ * whose payload names no head never matches, so a head SWARM cannot tell apart
+ * from the reviewed one keeps its ordinary red routing.
+ */
+export async function findUpdatedHeadReviewRun(
+	key: UpdatedHeadReviewRunKey,
+): Promise<UpdatedHeadReviewRun | undefined> {
+	const reviewedHeadSha = sql`${runs.jobPayload} -> 'event' ->> 'headSha'`;
+	const rows = await getDb()
+		.select({
+			id: runs.id,
+			checksRerunHeadSha: runs.reviewMergeChecksRerunHeadSha,
+			checksRerunAt: runs.reviewMergeChecksRerunAt,
+		})
+		.from(runs)
+		.where(
+			and(
+				eq(runs.kind, PIPELINE_RUN_KIND),
+				eq(runs.phase, 'review'),
+				eq(runs.status, 'completed'),
+				eq(runs.reviewVerdict, 'approve'),
+				eq(runs.projectId, key.projectId),
+				eq(runs.repository, key.repository),
+				eq(runs.prNumber, key.prNumber),
+				eq(runs.reviewMergeApprovedHeadSha, key.headSha),
+				isNull(runs.reviewSupersededAt),
+				sql`${reviewedHeadSha} IS NOT NULL`,
+				sql`${reviewedHeadSha} <> ${key.headSha}`,
+			),
+		)
+		.orderBy(desc(runs.completedAt))
+		.limit(1);
+	return rows[0];
+}
+
+/**
+ * Claim this run's one automatic re-run of the failed checks on `headSha`, the
+ * head its merge automation brought up to date (issue #1433). Conditional on the
+ * run's merge generation still covering `headSha` and on no re-run having been
+ * spent on that head yet, so of every red event that reaches the head exactly one
+ * wins; a later base update onto a fresh head can claim again, and a head the
+ * generation has moved off never can. Returns whether this call won.
+ */
+export async function claimUpdatedHeadChecksRerun(
+	runId: string,
+	headSha: string,
+): Promise<boolean> {
+	const rows = await getDb()
+		.update(runs)
+		.set({ reviewMergeChecksRerunHeadSha: headSha, reviewMergeChecksRerunAt: new Date() })
+		.where(
+			and(
+				eq(runs.id, runId),
+				eq(runs.reviewMergeApprovedHeadSha, headSha),
+				sql`${runs.reviewMergeChecksRerunHeadSha} IS DISTINCT FROM ${headSha}`,
+			),
+		)
+		.returning({ id: runs.id });
+	return rows.length > 0;
 }
 
 /**

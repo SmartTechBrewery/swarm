@@ -361,6 +361,8 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		reviewMergeMessage: null,
 		reviewMergeAttempt: null,
 		reviewMergeApprovedHeadSha: null,
+		reviewMergeChecksRerunHeadSha: null,
+		reviewMergeChecksRerunAt: null,
 		reviewSupersededAt: null,
 		exitCode: 0,
 		timedOut: false,
