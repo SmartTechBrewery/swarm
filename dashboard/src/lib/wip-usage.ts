@@ -10,6 +10,7 @@ import type { WorkItemCellRun } from '@/components/runs/work-item-cell.js';
 import type {
 	WipOperatorReason,
 	WipPipelineReason,
+	WipResolveProblemState,
 	WipTicket,
 	WipUsageEntry,
 } from '@/types/runs.js';
@@ -56,6 +57,27 @@ export function wipPipelineReasonLabel(reason: WipPipelineReason): string {
  * whose detail page carries Force re-review.
  */
 export const WIP_ACTION_RUN_LABEL = 'Open review run to Force re-review';
+
+/** What a Resolve problem attempt on a waiting holder concluded (issue #1428). */
+const RESOLVE_PROBLEM_STATE_LABELS: Record<WipResolveProblemState, string> = {
+	queued: 'Resolve problem: attempt queued',
+	running: 'Resolve problem: attempt running',
+	resolved: 'Resolve problem: resolved it',
+	unresolved: 'Resolve problem: could not resolve it',
+};
+
+/**
+ * The line a waiting holder carries once Resolve problem has made an attempt on its
+ * current situation (issue #1428), or `undefined` when none exists.
+ */
+export function wipResolveProblemLabel(ticket: WipTicket): string | undefined {
+	const attempt = ticket.resolveProblem;
+	if (!attempt) return undefined;
+	return RESOLVE_PROBLEM_STATE_LABELS[attempt.state] ?? `Resolve problem: ${attempt.state}`;
+}
+
+/** The link from that line to the attempt run. */
+export const WIP_RESOLVE_PROBLEM_RUN_LABEL = 'Open attempt run';
 
 /**
  * What a holder is doing, as one line: the phase it is in and whether it moves. A

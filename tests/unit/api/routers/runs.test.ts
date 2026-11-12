@@ -24,6 +24,8 @@ vi.mock('@/db/repositories/runsRepository.js', async (importOriginal) => ({
 	recordRunCleanupBlocked: vi.fn(),
 	// `getById`'s Resolve problem attempts read (issue #1395).
 	listResolveProblemAttempts: vi.fn(async () => []),
+	// `wip`'s Resolve problem attempts on waiting holders (issue #1428).
+	listResolveProblemAttemptsForHolders: vi.fn(async () => []),
 }));
 
 // The attempt history (issue #1400): what `getAttempts` reads and what Retry now
@@ -94,6 +96,8 @@ vi.mock('@/db/repositories/dispatchesRepository.js', async (importOriginal) => (
 	...(await importOriginal<typeof import('@/db/repositories/dispatchesRepository.js')>()),
 	getActiveDispatchByRunId: vi.fn(),
 	countWipLimitWaitsByRepository: vi.fn(),
+	// `wip`'s queued Resolve problem attempts (issue #1428).
+	listActiveDispatchesByDedupKeys: vi.fn(async () => []),
 	getDispatchById: vi.fn(),
 	hasActiveDispatchForCoalesceKeys: vi.fn(),
 	listActiveDispatchTaskRefs: vi.fn(),
@@ -217,6 +221,7 @@ import {
 	getActiveDispatchByRunId,
 	getDispatchById,
 	hasActiveDispatchForCoalesceKeys,
+	listActiveDispatchesByDedupKeys,
 	listActiveDispatchTaskRefs,
 	listDependencyWaits,
 	listWaitingDispatches,
@@ -251,6 +256,7 @@ import {
 	getRunOutputEvents,
 	type ListedRunRow,
 	listResolveProblemAttempts,
+	listResolveProblemAttemptsForHolders,
 	listRunsFromDb,
 	listTaskActivitySince,
 	markRunUserTerminated,
@@ -527,6 +533,10 @@ describe('runsRouter', () => {
 		vi.mocked(listActiveDispatchTaskRefs).mockResolvedValue([]);
 		vi.mocked(listWipSlots).mockReset();
 		vi.mocked(listWipSlots).mockResolvedValue([]);
+		vi.mocked(listResolveProblemAttemptsForHolders).mockReset();
+		vi.mocked(listResolveProblemAttemptsForHolders).mockResolvedValue([]);
+		vi.mocked(listActiveDispatchesByDedupKeys).mockReset();
+		vi.mocked(listActiveDispatchesByDedupKeys).mockResolvedValue([]);
 		vi.mocked(countWipLimitWaitsByRepository).mockReset();
 		vi.mocked(countWipLimitWaitsByRepository).mockResolvedValue([]);
 		vi.mocked(listStalledDismissals).mockReset();
@@ -1253,6 +1263,55 @@ describe('runsRouter', () => {
 			expect(listWipSlots).toHaveBeenCalledExactlyOnceWith(undefined);
 			expect(countWipLimitWaitsByRepository).toHaveBeenCalledExactlyOnceWith(undefined);
 			expect(listTaskActivitySince).not.toHaveBeenCalled();
+		});
+
+		// Issue #1428: a waiting holder carries the Resolve problem attempt on its
+		// current situation, read best-effort.
+		it('folds the Resolve problem attempt onto a waiting holder', async () => {
+			vi.mocked(listWipSlots).mockResolvedValue([slotRow()]);
+			vi.mocked(listResolveProblemAttemptsForHolders).mockResolvedValue([
+				{
+					id: 'attempt-1',
+					projectId: 'p1',
+					repository: 'acme/widgets',
+					taskId: '103',
+					resolvesRunId: null,
+					status: 'failed',
+					error: 'could not resolve the stuck ticket',
+					startedAt: new Date(OPENED_AT.getTime() + 60_000),
+					completedAt: new Date(OPENED_AT.getTime() + 120_000),
+				},
+			]);
+
+			const [entry] = await caller.wip({});
+
+			expect(listResolveProblemAttemptsForHolders).toHaveBeenCalledWith(
+				expect.objectContaining({
+					anchorRunIds: [],
+					tickets: [
+						{ projectId: 'p1', repository: 'acme/widgets', taskId: '103', since: OPENED_AT },
+					],
+				}),
+			);
+			expect(entry?.tickets[0]).toMatchObject({
+				state: 'waiting-on-operator',
+				operatorReason: 'stalled',
+				resolveProblem: {
+					runId: 'attempt-1',
+					state: 'unresolved',
+					message: 'could not resolve the stuck ticket',
+				},
+			});
+		});
+
+		it('reports waiting holders without an attempt, rather than failing, when that read fails', async () => {
+			vi.mocked(listWipSlots).mockResolvedValue([slotRow()]);
+			vi.mocked(listActiveDispatchesByDedupKeys).mockRejectedValue(new Error('db down'));
+
+			const [entry] = await caller.wip({});
+
+			expect(entry?.tickets[0]?.state).toBe('waiting-on-operator');
+			expect(entry?.tickets[0]?.resolveProblem).toBeUndefined();
 		});
 
 		it('reports in flight against the repository’s own limit, the waiters, and each holder', async () => {
@@ -1983,6 +2042,7 @@ describe('runsRouter', () => {
 				reviewCapOverrideOutstanding: null,
 				reviewCapStop: null,
 				resolveProblemAttempts: [],
+				resolveProblemTicket: null,
 			});
 			expect(result.nextRetryAt).toEqual(nextRetryAt);
 			expect(getRunByIdFromDb).toHaveBeenCalledWith('run-1');
@@ -2003,6 +2063,52 @@ describe('runsRouter', () => {
 
 			expect(listResolveProblemAttempts).toHaveBeenCalledWith('run-1');
 			expect(result.resolveProblemAttempts).toEqual([attempt]);
+		});
+
+		it("names a ticket attempt's stuck ticket from its own stored job (issue #1428)", async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({
+					id: 'run-2',
+					phase: 'resolve-problem',
+					jobPayload: {
+						type: 'resolve-problem',
+						projectId: 'proj-1',
+						repository: 'acme/widgets',
+						ticket: {
+							taskId: '1428',
+							reason: 'stalled',
+							slotOpenedAt: '2026-11-12T06:00:00.000Z',
+							prNumber: '7',
+						},
+					},
+				}),
+			);
+
+			const result = await caller.getById({ id: 'run-2' });
+
+			expect(result.resolveProblemTicket).toEqual({
+				taskId: '1428',
+				reason: 'stalled',
+				slotOpenedAt: '2026-11-12T06:00:00.000Z',
+			});
+		});
+
+		it('names no stuck ticket for a run attempt on a failed run', async () => {
+			vi.mocked(getRunByIdFromDb).mockResolvedValue(
+				makeRun({
+					id: 'run-2',
+					phase: 'resolve-problem',
+					jobPayload: {
+						type: 'resolve-problem',
+						projectId: 'proj-1',
+						failedRunId: '00000000-0000-4000-8000-000000000001',
+					},
+				}),
+			);
+
+			const result = await caller.getById({ id: 'run-2' });
+
+			expect(result.resolveProblemTicket).toBeNull();
 		});
 
 		it('throws NOT_FOUND when getRunByIdFromDb resolves undefined', async () => {
@@ -2531,6 +2637,7 @@ describe('runsRouter', () => {
 					reviewCapOverrideOutstanding: null,
 					reviewCapStop: null,
 					resolveProblemAttempts: [],
+					resolveProblemTicket: null,
 				});
 			});
 		});
@@ -6205,6 +6312,7 @@ describe('runsRouter', () => {
 					reviewCapOverrideOutstanding: null,
 					reviewCapStop: null,
 					resolveProblemAttempts: [],
+					resolveProblemTicket: null,
 				});
 			});
 		});

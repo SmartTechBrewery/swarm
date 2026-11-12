@@ -37,6 +37,7 @@ import { priorityFor } from '../queue/producer.js';
 import type { WipTicket } from '../queue/wip-usage.js';
 import type { TriggerResult } from '../triggers/types.js';
 import { createAndPublishDispatch } from './dispatcher.js';
+import { resolveProblemDedupKey, resolveProblemTicketDedupKey } from './resolve-problem-keys.js';
 import { resolveProblemScopeFor } from './resolve-problem-scope.js';
 import { loadWipUsageEntries } from './wip-usage-loader.js';
 
@@ -50,33 +51,10 @@ export const OPERATOR_MCP_ROUTE = '/operator/mcp';
  */
 export const RESOLVE_PROBLEM_TOKEN_GRACE_MS = 10 * 60 * 1000;
 
+export { resolveProblemDedupKey, resolveProblemTicketDedupKey } from './resolve-problem-keys.js';
+
 /** A Resolve problem trigger, narrowed. */
 export type ResolveProblemTrigger = Extract<TriggerResult, { phase: 'resolve-problem' }>;
-
-/**
- * The dedup identity of a Resolve problem dispatch: the failed run, never the task
- * — the attempt is about that one run, and a second request for it is the same
- * attempt.
- */
-export function resolveProblemDedupKey(failedRunId: string): string {
-	return `resolve-problem:${failedRunId}`;
-}
-
-/**
- * The dedup identity of a ticket attempt on a stuck ticket that never ran (issue
- * #1425): the slot itself — project, repository, task and the instant it opened —
- * so a re-opened slot is a new situation and the same slot never gets a second
- * attempt. A ticket that has run is keyed on its latest run instead
- * ({@link resolveProblemDedupKey}).
- */
-export function resolveProblemTicketDedupKey(slot: {
-	projectId: string;
-	repository: string;
-	taskId: string;
-	slotOpenedAt: string;
-}): string {
-	return `resolve-problem:slot:${slot.projectId}:${slot.repository}:${slot.taskId}:${Date.parse(slot.slotOpenedAt)}`;
-}
 
 /**
  * Schedule a Resolve problem attempt for `failedRun`. Idempotent on the failed run

@@ -2795,6 +2795,66 @@ export async function listResolveProblemAttempts(
 }
 
 /**
+ * One Resolve problem attempt the WIP panel may show against a slot holder (issue
+ * #1428) — a {@link ResolveProblemAttempt} plus what it is anchored to.
+ */
+export interface WipResolveProblemAttemptRow extends ResolveProblemAttempt {
+	projectId: string;
+	repository: string | null;
+	taskId: string | null;
+	resolvesRunId: string | null;
+}
+
+/**
+ * The Resolve problem attempts made on a set of WIP slot holders (issue #1428), in
+ * no particular order — the WIP read model picks the newest per holder. A holder is
+ * named one of two ways, matching the two anchors an attempt can have (issue #1425):
+ *
+ *  - `anchorRunIds` — a holder's latest run: every attempt whose `resolves_run_id`
+ *    is that run (a run attempt on it, or a ticket attempt anchored to it);
+ *  - `tickets` — a holder that has not run: an unanchored attempt
+ *    (`resolves_run_id IS NULL`) on the same `(project, repository, task)` started
+ *    at or after `since`, the instant its slot opened.
+ *
+ * Bounded by the holders named, which the sum of the WIP limits bounds. Both empty
+ * is answered without a query.
+ */
+export async function listResolveProblemAttemptsForHolders(input: {
+	anchorRunIds: readonly string[];
+	tickets: readonly { projectId: string; repository: string; taskId: string; since: Date }[];
+}): Promise<WipResolveProblemAttemptRow[]> {
+	const { anchorRunIds, tickets } = input;
+	if (anchorRunIds.length === 0 && tickets.length === 0) return [];
+	const holders: SQL[] = [];
+	if (anchorRunIds.length > 0) holders.push(inArray(runs.resolvesRunId, [...anchorRunIds]));
+	for (const ticket of tickets) {
+		holders.push(
+			and(
+				isNull(runs.resolvesRunId),
+				eq(runs.projectId, ticket.projectId),
+				eq(runs.repository, ticket.repository),
+				eq(runs.taskId, ticket.taskId),
+				gte(runs.startedAt, ticket.since),
+			) as SQL,
+		);
+	}
+	return getDb()
+		.select({
+			id: runs.id,
+			projectId: runs.projectId,
+			repository: runs.repository,
+			taskId: runs.taskId,
+			resolvesRunId: runs.resolvesRunId,
+			status: runs.status,
+			error: runs.error,
+			startedAt: runs.startedAt,
+			completedAt: runs.completedAt,
+		})
+		.from(runs)
+		.where(and(eq(runs.phase, RESOLVE_PROBLEM_PHASE), or(...holders)));
+}
+
+/**
  * Failed pipeline runs that nothing has picked up since they settled — the
  * candidates the Resolve problem trigger dispatches an attempt for (issue #1396,
  * `../../dispatch/resolve-problem-trigger.ts`, which owns the delay and the
@@ -2869,7 +2929,7 @@ export async function listUnrecoveredFailedRuns(options: {
 	const existingAttemptDispatch = db
 		.select({ id: dispatches.id })
 		.from(dispatches)
-		// `resolveProblemDedupKey` (`../../dispatch/resolve-problem.ts`), spelled in SQL.
+		// `resolveProblemDedupKey` (`../../dispatch/resolve-problem-keys.ts`), spelled in SQL.
 		.where(eq(dispatches.dedupKey, sql`'resolve-problem:' || ${runs.id}::text`));
 
 	const rows = await db

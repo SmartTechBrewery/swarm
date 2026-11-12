@@ -34,7 +34,13 @@ import {
 	isForcedReviewPending,
 	showsCapSpentApprovalCallout,
 } from '@/lib/force-re-review.js';
-import { formatDuration, formatPhase, formatTimeUntil, formatTokenCount } from '@/lib/format.js';
+import {
+	formatDuration,
+	formatPhase,
+	formatRelativeTime,
+	formatTimeUntil,
+	formatTokenCount,
+} from '@/lib/format.js';
 import { describePreservedWorker, preservedWorkerLabel } from '@/lib/preserved-worker.js';
 import { describeCancellationOrigin, normalizeRunError } from '@/lib/run-cancellation.js';
 import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
@@ -1349,13 +1355,16 @@ export function LateResultAcceptedNote({ run }: { run: RunRow }) {
 }
 
 /**
- * The link between a Resolve problem run and the failed run it is for (issue #1395):
- * on the attempt, "Resolving run <link>"; on the failed run, its attempts, newest
- * first, each with its outcome. Renders nothing for a run that is neither.
+ * The link between a Resolve problem run and what it is for (issue #1395): on the
+ * attempt, "Resolving run <link>" — and, for a ticket attempt (issue #1428), the
+ * stuck ticket it is about, with both lines when that ticket has a latest run; on
+ * the failed run, its attempts, newest first, each with its outcome. Renders
+ * nothing for a run that is neither.
  */
 export function ResolveProblemLinks({ run }: { run: RunRow }) {
 	const attempts = run.resolveProblemAttempts ?? [];
-	if (!run.resolvesRunId && attempts.length === 0) return null;
+	const ticket = run.resolveProblemTicket ?? null;
+	if (!run.resolvesRunId && !ticket && attempts.length === 0) return null;
 	const linkClass = 'font-mono text-violet-300 hover:text-violet-200 underline';
 	return (
 		<div
@@ -1364,6 +1373,18 @@ export function ResolveProblemLinks({ run }: { run: RunRow }) {
 		>
 			<Info className="h-4 w-4 shrink-0 mt-0.5 text-zinc-400" />
 			<div className="space-y-1 text-xs text-zinc-300">
+				{ticket ? (
+					<p>
+						Resolving stuck ticket <span className="font-mono text-zinc-200">{ticket.taskId}</span>{' '}
+						<span className="text-zinc-400">
+							({ticket.reason}, slot held since{' '}
+							<span title={new Date(ticket.slotOpenedAt).toLocaleString()}>
+								{formatRelativeTime(ticket.slotOpenedAt)}
+							</span>
+							)
+						</span>
+					</p>
+				) : null}
 				{run.resolvesRunId ? (
 					<p>
 						Resolving run{' '}
