@@ -250,6 +250,17 @@
  * (`takeOverMergeAutomationClaim`) and dispatches the CI fix; one sibling wins,
  * and every later event reads an ordinary holder and drops. A green on that head
  * still meets the claim and starts no Review.
+ *
+ * **That red is re-run once before it is fixed** (issue #1433). A red on a head
+ * merge automation produced is often environmental — a flaky integration suite
+ * on a change that never touched it — so before the take-over above,
+ * `resolveAggregateCheckReview` hands it to `rerunUpdatedHeadOnce`
+ * (`src/dispatch/updated-head-checks-rerun.ts`), which re-runs the failed checks
+ * once per (approving Review run, head) and releases merge automation's claim so
+ * the re-run's own `checks` event is decided: green continues on the green path,
+ * and a red after it — or a re-run that could not be made — goes to Respond-to-CI
+ * as above. Like `blocked-by-base` it is decided before the PR+SHA claim, so a
+ * requested re-run consumes nothing.
  */
 
 import type { ProjectConfig } from '../../config/schema.js';
@@ -273,6 +284,7 @@ import {
 import { readBaseBranchHealth } from '../../dispatch/base-branch-health.js';
 import { hasCiNoFixRecovery } from '../../dispatch/ci-no-fix-recovery.js';
 import { promoteMergeChecksWaits, scheduleCoalescedDispatch } from '../../dispatch/dispatcher.js';
+import { rerunUpdatedHeadOnce } from '../../dispatch/updated-head-checks-rerun.js';
 import { getSCMProvider } from '../../integrations/scm/registry.js';
 import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
@@ -1048,13 +1060,56 @@ async function handleAdjudicatedRed(
 }
 
 /**
+ * Re-run the failed checks of a red head merge automation brought up to date for
+ * an approved pull request, once, before any Respond-to-CI dispatch (issue #1433,
+ * `rerunUpdatedHeadOnce`). Taken before the PR+SHA claim, like `blocked-by-base`:
+ * a requested re-run dispatches nothing, so no claim or fix attempt may be
+ * consumed — the re-run's own `checks` event must still be decidable. A re-run
+ * spent moments ago (`rerun-settling`) is re-read once the settle window has
+ * passed ({@link scheduleRerunSettleRecheck}).
+ *
+ * Returns `true` when this red is settled here; `false` — a re-run already spent
+ * on the head, one that could not be made, or a head the policy does not cover —
+ * sends it on to Respond-to-CI exactly as before.
+ */
+async function handleUpdatedHeadRed(
+	ctx: ScmTriggerContext,
+	prNumber: string,
+	headSha: string,
+	failedChecks: string[],
+): Promise<boolean> {
+	const outcome = await rerunUpdatedHeadOnce({
+		project: ctx.project,
+		scm: ctx.scm,
+		prNumber,
+		headSha,
+		failedChecks,
+	});
+	if (outcome === 'rerun-settling') {
+		await scheduleRerunSettleRecheck(ctx, prNumber, headSha, failedChecks);
+		return true;
+	}
+	if (outcome === 'rerun-requested') {
+		noteSkip(
+			ctx,
+			`Pull request #${prNumber} at head '${headSha}' is a head merge automation brought up to ` +
+				'date for an approval, and its checks failed. SWARM re-ran the failing checks once ' +
+				'before handing the red to Respond-to-CI; that re-run decides what happens next.',
+		);
+		return true;
+	}
+	return false;
+}
+
+/**
  * Re-read a `rerun-settling` head once the settle window has passed, on the
- * aggregate-check recheck's coalesce key. Deliberately **not**
+ * aggregate-check recheck's coalesce key — for either re-run policy: the
+ * adjudicated approved head's (issue #1128) and the updated head's (issue #1433). Deliberately **not**
  * {@link scheduleReviewRecheck}: the wait is a fixed provider-lag guard, not CI
  * still running, so it neither draws nor advances the `state-pending` budget — a
  * short `reviewChecksWaitMinutes` would otherwise run out inside the window and
- * end the head as an abandoned Review instead of the operator notice. Bounded by
- * construction: the re-read lands past the window, where the policy answers off
+ * end the head as an abandoned Review instead of the policy's own verdict. Bounded
+ * by construction: the re-read lands past the window, where the policy answers off
  * the re-run's verdict and never settles again.
  */
 async function scheduleRerunSettleRecheck(
@@ -1082,12 +1137,69 @@ async function scheduleRerunSettleRecheck(
 			" This phase's disposition did not change.",
 		retryAfterSec: delaySec,
 	});
-	logger.debug('review: approved-head re-run settling — re-checking after the settle window', {
+	logger.debug('review: checks re-run settling — re-checking after the settle window', {
 		prNumber,
 		headSha,
 		failedChecks,
 		delayMs: RERUN_SETTLE_RECHECK_DELAY_MS,
 	});
+}
+
+/**
+ * Route a red aggregate (a check failed) — {@link resolveAggregateCheckReview}'s
+ * `respond-to-ci` decision, before it becomes one. Each judgement below is taken
+ * before the PR+SHA claim, so one that settles the red here consumes nothing: the
+ * `no-fix` hand-back's Review (issue #841), the adjudicated approved head's re-run
+ * policy (issue #1128), the updated head's one re-run (issue #1433), and the
+ * base-branch attribution (issue #873). Only what survives all four goes to
+ * Respond-to-CI.
+ */
+async function resolveRedAggregate(
+	ctx: ScmTriggerContext,
+	prNumber: string,
+	headSha: string,
+	baseBranch: string,
+	failedChecks: string[],
+): Promise<ReviewDisposition> {
+	// The `no-fix` hand-back (issue #841) — see the module header. The red is
+	// SWARM's own CI agent's verdict, not a fresh failure, so route to Review.
+	if (ctx.ciNoFixRecovery === true) {
+		logger.info('review: CI agent adjudicated this red — reviewing instead of re-fixing', {
+			prNumber,
+			headSha,
+			failedChecks,
+		});
+		return { kind: 'review', adjudicatedRed: true, failedChecks };
+	}
+	// The same adjudication, met by an ordinary red event (issue #1128): a head
+	// this PR approved whose red the CI agent already declined goes to the
+	// approved-head re-run policy — a Respond-to-CI run would only decline again.
+	// Nothing is dispatched, so it settles here, before the PR+SHA claim; a
+	// policy that did nothing (`not-applicable`) falls open to the routing below.
+	if (
+		(await isAdjudicatedApprovedHead(ctx.project, prNumber, headSha)) &&
+		(await handleAdjudicatedRed(ctx, prNumber, headSha, failedChecks))
+	) {
+		return { kind: 'none' };
+	}
+	// A red on a head merge automation brought up to date for an approval is
+	// often environmental (issue #1433): re-run its failed checks once before any
+	// CI fix. Like the bypass above it settles here, before the PR+SHA claim, so a
+	// requested re-run consumes nothing; a spent or refused one falls through.
+	if (await handleUpdatedHeadRed(ctx, prNumber, headSha, failedChecks)) {
+		return { kind: 'none' };
+	}
+	// Beside the bypass above, and the same shape: a second judgement about
+	// *whose* red this is, taken before any fix attempt is spent (issue #873).
+	const blockedByBase = await resolveBaseBranchAttribution(
+		ctx,
+		prNumber,
+		headSha,
+		baseBranch,
+		failedChecks,
+	);
+	if (blockedByBase) return blockedByBase;
+	return { kind: 'respond-to-ci', failedChecks };
 }
 
 /**
@@ -1148,38 +1260,7 @@ async function resolveAggregateCheckReview(
 	}
 
 	if (decision.action === 'respond-to-ci') {
-		// The `no-fix` hand-back (issue #841) — see the module header. The red is
-		// SWARM's own CI agent's verdict, not a fresh failure, so route to Review.
-		if (ctx.ciNoFixRecovery === true) {
-			logger.info('review: CI agent adjudicated this red — reviewing instead of re-fixing', {
-				prNumber,
-				headSha,
-				failedChecks: decision.failedChecks,
-			});
-			return { kind: 'review', adjudicatedRed: true, failedChecks: decision.failedChecks };
-		}
-		// The same adjudication, met by an ordinary red event (issue #1128): a head
-		// this PR approved whose red the CI agent already declined goes to the
-		// approved-head re-run policy — a Respond-to-CI run would only decline again.
-		// Nothing is dispatched, so it settles here, before the PR+SHA claim; a
-		// policy that did nothing (`not-applicable`) falls open to the routing below.
-		if (
-			(await isAdjudicatedApprovedHead(project, prNumber, headSha)) &&
-			(await handleAdjudicatedRed(ctx, prNumber, headSha, decision.failedChecks))
-		) {
-			return { kind: 'none' };
-		}
-		// Beside the bypass above, and the same shape: a second judgement about
-		// *whose* red this is, taken before any fix attempt is spent (issue #873).
-		const blockedByBase = await resolveBaseBranchAttribution(
-			ctx,
-			prNumber,
-			headSha,
-			baseBranch,
-			decision.failedChecks,
-		);
-		if (blockedByBase) return blockedByBase;
-		return { kind: 'respond-to-ci', failedChecks: decision.failedChecks };
+		return resolveRedAggregate(ctx, prNumber, headSha, baseBranch, decision.failedChecks);
 	}
 
 	// defer — some check is still incomplete; re-query fresh API state shortly.

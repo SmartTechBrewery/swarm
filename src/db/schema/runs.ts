@@ -241,6 +241,19 @@ export const runs = pgTable(
 		 */
 		reviewMergeApprovedHeadSha: text('review_merge_approved_head_sha'),
 		/**
+		 * The head merge automation brought up to date whose failed checks SWARM
+		 * re-ran once before handing its red to Respond-to-CI (issue #1433,
+		 * `src/dispatch/updated-head-checks-rerun.ts`). The bound on that re-run:
+		 * claimed by a conditional update that fires only while it differs from
+		 * {@link reviewMergeApprovedHeadSha}, so each head the run's merge advanced
+		 * onto gets one automatic re-run, however many red events reach it — and a
+		 * later base update onto a fresh head gets its own. Nullable: only an
+		 * approving Review run whose merge produced a red head sets it.
+		 */
+		reviewMergeChecksRerunHeadSha: text('review_merge_checks_rerun_head_sha'),
+		/** When the re-run {@link reviewMergeChecksRerunHeadSha} records was requested — read by its settle window. */
+		reviewMergeChecksRerunAt: timestamp('review_merge_checks_rerun_at'),
+		/**
 		 * When this Review run's approval was superseded by the pull request's head
 		 * moving after the review (issue #1079) — most often a Resolve-conflicts
 		 * merge of a fast-moving base — so it spent no `REVIEW_VERDICT_CAP` slot and

@@ -161,6 +161,7 @@ import {
 import { markReviewVerdictSuperseded } from '../db/repositories/reviewVerdictsRepository.js';
 import {
 	findApprovedReviewRunForRearm,
+	hasUpdatedHeadChecksRerun,
 	markReviewRunSuperseded,
 	updateReviewMergeOutcome,
 } from '../db/repositories/runsRepository.js';
@@ -213,6 +214,7 @@ import {
 	claimReviewDispatch,
 	MERGE_AUTOMATION_CLAIM_OWNER,
 	refreshMergeAutomationClaim,
+	releaseReviewDispatchHeldBy,
 } from '../triggers/review-dispatch-dedup.js';
 
 /**
@@ -967,7 +969,42 @@ async function settleMergeDispatch(
 	outcome: DispatchOutcome,
 ): Promise<void> {
 	await completeDispatch(dispatch.id, outcome);
+	if (outcome !== 'merged') await releaseUpdatedHeadClaimAfterRerun(job, project);
 	await promoteMergeQueueWaits(project.id, job.repo);
+}
+
+/**
+ * Give up this dispatch's PR+SHA claim on a head it brought up to date once it
+ * settles there without merging, **when that head's one checks re-run was
+ * requested** (issue #1433, `rerunUpdatedHeadOnce`). The re-run keeps the claim
+ * while this dispatch still waits on the head, so the re-run's green wakes the
+ * merge rather than starting a redundant Review; once this dispatch has given up
+ * (a red read before the re-run registered, or the pending wait running out) that
+ * green must be decided instead — reviewed and merged — and the claim would drop
+ * it as a duplicate. Owner-fenced, so a CI fix that already took the claim over
+ * (issue #1430) keeps it. Best-effort: a failed read keeps the claim, which the
+ * lease still reaps.
+ */
+async function releaseUpdatedHeadClaimAfterRerun(
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+): Promise<void> {
+	if (baseUpdatesSpent(job) === 0) return;
+	try {
+		if (!(await hasUpdatedHeadChecksRerun(job.reviewRunId, job.approvedHeadSha))) return;
+	} catch (err) {
+		logger.warn('Merge automation: could not read the updated head re-run — keeping its claim', {
+			runId: job.reviewRunId,
+			prNumber: job.prNumber,
+			headSha: job.approvedHeadSha,
+			error: describeError(err),
+		});
+		return;
+	}
+	await releaseReviewDispatchHeldBy(
+		buildReviewDispatchKey(project.repo, job.prNumber, job.approvedHeadSha),
+		MERGE_AUTOMATION_CLAIM_OWNER,
+	);
 }
 
 /**
@@ -2103,7 +2140,9 @@ const ADJUDICATED_RED_MESSAGES: Record<
  * reviewed diff and the current base are each fine and their combination is not.
  * Its red is Respond-to-CI's too since issue #1430 — the `checks completed` event
  * takes this head's merge-automation claim over — so the comment names that
- * agent and asks for a hand fix only where it is not enabled.
+ * agent and asks for a hand fix only where it is not enabled. That event re-runs
+ * the failed checks once first (issue #1433, `rerunUpdatedHeadOnce`), which the
+ * comment says too.
  * For the approved head itself (issue #1124) the review approved a commit whose
  * CI failed; the failure belongs to Respond-to-CI, which the `pr-review` trigger
  * routes this head to on its own, so nothing here races it.
@@ -2168,7 +2207,7 @@ async function refuseRedHead(
 		updated
 			? mergeRefusalCommentBody(
 					`SWARM brought this pull request's head up to date with the base and the resulting commit fails its checks: ${failed}. Each side is green on its own; together they are not.`,
-					'The failure is real — it is what this pull request would have landed. SWARM handles the failing checks the same way as for any red pull request (Respond-to-CI, when it is enabled for this repository), and a fixed head gets its own review before it can merge. Where Respond-to-CI is not enabled, the combination needs fixing by hand on this branch.',
+					'SWARM first re-runs the failing checks once, in case the failure is environmental. If they stay red, the failure is what this pull request would have landed: SWARM handles it the same way as for any red pull request (Respond-to-CI, when it is enabled for this repository), and a fixed head gets its own review before it can merge. Where Respond-to-CI is not enabled, the combination needs fixing by hand on this branch.',
 				)
 			: mergeRefusalCommentBody(
 					`The review approved head \`${job.approvedHeadSha}\`, but that head fails its checks: ${failed}.`,
