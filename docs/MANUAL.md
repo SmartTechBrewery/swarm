@@ -1925,7 +1925,7 @@ may file reports and add occurrences but not triage them. See
 [`docs/mcp.md`](./mcp.md#bug-reports).
 
 **The Issues tab shows them in the dashboard** (issue #1390). It is on the
-**General** page, which the sidebar's **Settings** link opens (`/settings?tab=issues`),
+**General** page, which the sidebar's **General** link opens (`/settings?tab=issues`),
 and every signed-in user sees it: it lists the reports of the projects you can
 read, plus installation-wide ones if you are an installation admin. It starts on
 the open reports (`new`, `confirmed`, `environmental`, `ticketed`); the chips above

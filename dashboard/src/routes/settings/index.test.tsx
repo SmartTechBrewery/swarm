@@ -13,7 +13,7 @@ import { SETTINGS_TABS, visibleSettingsTabs } from '@/lib/settings-nav.js';
 import { AppearancePanel, SettingsPageTitle, SettingsTabBar } from './index.js';
 
 describe('SettingsPageTitle', () => {
-	// The sidebar link reads "Settings"; the page it opens is "General" (issue #1390).
+	// The page reads "General", as does the sidebar link that opens it (issues #1390, #1426).
 	it('reads General', () => {
 		render(<SettingsPageTitle />);
 

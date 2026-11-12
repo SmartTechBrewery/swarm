@@ -139,7 +139,7 @@ export function ProjectCreateDialog({ open, onOpenChange }: ProjectCreateDialogP
 		// renders a working name either way, and the pattern editor on the Source Control tab
 		// is where a repository's own convention is set (issue #1241).
 		// An empty reviewer token is left out rather than sent blank: the server then falls
-		// back to the installation default from General → Credentials (sidebar: Settings).
+		// back to the installation default from General → Credentials.
 		const token = reviewerToken.trim();
 		mutation.mutate({
 			id,
