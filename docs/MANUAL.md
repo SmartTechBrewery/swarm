@@ -1195,7 +1195,12 @@ merge on a pull request whose head was superseded too many times (issue #1379): 
 ticket reads as waiting on you even when a later run, such as Resolve conflicts, is its
 latest, and links to the Review run whose page carries **Force re-review**. It goes
 back to the pipeline as soon as you force the re-review, and leaves the section when
-the pull request is merged or closed. A Review abandoned while
+the pull request is merged or closed. When [Resolve problem](#the-resolve-problem-phase)
+has made an attempt on a Waiting on you ticket's *current* situation (its latest run,
+or the slot it holds when it never ran), the ticket also says what the attempt
+concluded — queued, running, resolved it, or could not resolve it with the attempt's
+own message — and links the attempt run (issue #1428). An attempt on an earlier run or
+an earlier slot is a past situation and is not shown. A Review abandoned while
 the head's CI was still running is not one of these (issue #1203): the completed-checks
 event starts Review by itself, so the ticket shows as waiting on the pipeline —
 "Waiting for CI — Review starts when the checks finish" — and reads as stalled only if
@@ -1835,6 +1840,14 @@ the attempt is claimed, the ticket is checked again: it must still hold the same
 slot, still be Waiting on you for a reason in scope, and have the same latest run.
 Otherwise the attempt is skipped. If no SWARM tool can move the ticket, the agent
 reports it `unresolved` and says what the person should do.
+
+**Seeing the attempts (issue #1428).** A Waiting on you ticket in the **Tickets in
+progress** section shows the attempt on its current situation: queued, running,
+resolved it, or could not resolve it with its message, and a link to the attempt
+run. The attempt run's page names the stuck ticket it is about — "Resolving stuck
+ticket `<task>` (stalled, slot held since …)" — and, when the ticket has a latest
+run, links that run too ("Resolving run …"). That latest run's own page lists the
+attempts made on it.
 
 **Turning it on.** The phase is **off by default**. Turn it on with the
 **Enabled** toggle on the Resolve problem screen of the project's **Agents** tab,

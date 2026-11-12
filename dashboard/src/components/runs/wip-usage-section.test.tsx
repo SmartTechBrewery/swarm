@@ -200,6 +200,90 @@ describe('WipUsageSection', () => {
 		expect(within(stalled).queryByRole('link', { name: /Force re-review/ })).toBeNull();
 	});
 
+	// Issue #1428: a waiting holder says what Resolve problem's attempt on its current
+	// situation concluded, and links the attempt run.
+	it('shows the Resolve problem attempt on a waiting holder, per state', () => {
+		const message =
+			'Resolve problem could not resolve the stuck ticket: the branch is gone. Tried: no recovery action.';
+		renderSection(
+			<WipUsageSection
+				entries={[
+					makeEntry({
+						inFlight: 4,
+						limit: 4,
+						tickets: [
+							makeTicket({
+								taskId: '101',
+								state: 'waiting-on-operator',
+								operatorReason: 'stalled',
+								resolveProblem: { state: 'queued', at: '2026-11-12T08:00:00Z' },
+							}),
+							makeTicket({
+								taskId: '102',
+								state: 'waiting-on-operator',
+								operatorReason: 'stalled',
+								resolveProblem: {
+									runId: 'attempt-running',
+									state: 'running',
+									at: '2026-11-12T08:00:00Z',
+								},
+							}),
+							makeTicket({
+								taskId: '103',
+								state: 'waiting-on-operator',
+								operatorReason: 'failed',
+								resolveProblem: {
+									runId: 'attempt-resolved',
+									state: 'resolved',
+									at: '2026-11-12T08:00:00Z',
+								},
+							}),
+							makeTicket({
+								taskId: '104',
+								state: 'waiting-on-operator',
+								operatorReason: 'failed',
+								resolveProblem: {
+									runId: 'attempt-unresolved',
+									state: 'unresolved',
+									message,
+									at: '2026-11-12T08:00:00Z',
+								},
+							}),
+						],
+					}),
+				]}
+			/>,
+		);
+
+		const [queued, running, resolved, unresolved] = screen.getAllByTestId('wip-resolve-problem');
+		if (!queued || !running || !resolved || !unresolved) throw new Error('unreachable');
+		expect(within(queued).getByText('Resolve problem: attempt queued')).toBeDefined();
+		expect(within(queued).queryByRole('link')).toBeNull();
+		expect(within(running).getByText('Resolve problem: attempt running')).toBeDefined();
+		expect(
+			within(running).getByRole('link', { name: 'Open attempt run' }).getAttribute('href'),
+		).toBe('/runs/attempt-running');
+		expect(within(resolved).getByText('Resolve problem: resolved it')).toBeDefined();
+		expect(within(unresolved).getByText('Resolve problem: could not resolve it')).toBeDefined();
+		expect(within(unresolved).getByText(message).getAttribute('title')).toBe(message);
+		expect(
+			within(unresolved).getByRole('link', { name: 'Open attempt run' }).getAttribute('href'),
+		).toBe('/runs/attempt-unresolved');
+	});
+
+	it('shows no Resolve problem line without an attempt', () => {
+		renderSection(
+			<WipUsageSection
+				entries={[
+					makeEntry({
+						tickets: [makeTicket({ state: 'waiting-on-operator', operatorReason: 'stalled' })],
+					}),
+				]}
+			/>,
+		);
+		expect(screen.queryByTestId('wip-resolve-problem')).toBeNull();
+	});
+
 	it('names the board move that restarts a terminated run (issue #1361)', () => {
 		renderSection(
 			<WipUsageSection

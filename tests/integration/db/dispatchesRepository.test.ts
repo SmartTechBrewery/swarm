@@ -27,6 +27,7 @@ import {
 	getDispatchById,
 	getWorkerDispatchClaimState,
 	hasExecutingDispatchForTask,
+	listActiveDispatchesByDedupKeys,
 	listActiveDispatchTaskRefs,
 	listActiveMergeDispatchesForRepository,
 	listAvailabilityWaitsForWorker,
@@ -182,6 +183,37 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('dispatchesRepository (int
 			expect(first.created).toBe(true);
 			expect(second.created).toBe(false);
 			expect(second.dispatch.id).toBe(first.dispatch.id);
+		});
+
+		it('lists the non-terminal dispatches holding any of the given dedup keys (issue #1428)', async () => {
+			const queued = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job({ deliveryId: 'd-queued' }),
+				dedupKey: 'resolve-problem:queued',
+				source: 'synthetic',
+			});
+			const done = await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job({ deliveryId: 'd-done' }),
+				dedupKey: 'resolve-problem:done',
+				source: 'synthetic',
+			});
+			await cancelWaitingDispatch(done.dispatch.id, 'cleared the queue');
+			await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job({ deliveryId: 'd-other' }),
+				dedupKey: 'resolve-problem:other',
+				source: 'synthetic',
+			});
+
+			expect(await listActiveDispatchesByDedupKeys([])).toEqual([]);
+			expect(
+				await listActiveDispatchesByDedupKeys([
+					'resolve-problem:queued',
+					'resolve-problem:done',
+					'resolve-problem:missing',
+				]),
+			).toEqual([{ dedupKey: 'resolve-problem:queued', createdAt: queued.dispatch.createdAt }]);
 		});
 
 		it('enforces at most one active dispatch per run row (the duplicate-retry guard)', async () => {

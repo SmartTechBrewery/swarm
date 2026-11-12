@@ -7,11 +7,13 @@ import { formatRelativeTime } from '@/lib/format.js';
 import { trpc } from '@/lib/trpc.js';
 import {
 	WIP_ACTION_RUN_LABEL,
+	WIP_RESOLVE_PROBLEM_RUN_LABEL,
 	WIP_SECTION_EXPLANATION,
 	WIP_SECTION_TITLE,
 	wipInFlightLabel,
 	wipOperatorReasonLabel,
 	wipPipelineReasonLabel,
+	wipResolveProblemLabel,
 	wipTicketActivityLabel,
 	wipTicketRun,
 	wipUsageKey,
@@ -39,6 +41,42 @@ function PullRequestReference({ ticket }: { ticket: WipTicket }) {
 }
 
 /** One slot holder: what it is, since when it holds the slot, and what it is doing. */
+/**
+ * A waiting holder's Resolve problem attempt (issue #1428): what it concluded, the
+ * message an unresolved attempt left (truncated, full text on hover), and a link to
+ * the attempt run. Neutral-toned — the Waiting on you badge is the one attention
+ * cue. Nothing for a holder without an attempt.
+ */
+function ResolveProblemAttemptLine({ ticket }: { ticket: WipTicket }) {
+	const label = wipResolveProblemLabel(ticket);
+	const attempt = ticket.resolveProblem;
+	if (!label || !attempt) return null;
+	return (
+		<div
+			data-testid="wip-resolve-problem"
+			className="flex min-w-0 max-w-full flex-wrap items-center gap-x-2 md:justify-end"
+		>
+			<span className="text-zinc-300" title={new Date(attempt.at).toLocaleString()}>
+				{label}
+			</span>
+			{attempt.message && (
+				<span className="min-w-0 max-w-full truncate text-zinc-400" title={attempt.message}>
+					{attempt.message}
+				</span>
+			)}
+			{attempt.runId && (
+				<Link
+					to="/runs/$runId"
+					params={{ runId: attempt.runId }}
+					className="text-violet-400 hover:text-violet-300 hover:underline"
+				>
+					{WIP_RESOLVE_PROBLEM_RUN_LABEL}
+				</Link>
+			)}
+		</div>
+	);
+}
+
 function WipTicketRow({ ticket, repository }: { ticket: WipTicket; repository: string }) {
 	const waitingOnOperator = ticket.state === 'waiting-on-operator';
 	return (
@@ -66,6 +104,7 @@ function WipTicketRow({ ticket, repository }: { ticket: WipTicket; repository: s
 						{WIP_ACTION_RUN_LABEL}
 					</Link>
 				)}
+				{waitingOnOperator && <ResolveProblemAttemptLine ticket={ticket} />}
 				{ticket.state === 'waiting-on-pipeline' && ticket.pipelineReason && (
 					<span className="text-zinc-400">{wipPipelineReasonLabel(ticket.pipelineReason)}</span>
 				)}

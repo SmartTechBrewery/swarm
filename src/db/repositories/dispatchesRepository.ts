@@ -483,6 +483,36 @@ export async function findDispatchByDedupKey(
 	return rows[0];
 }
 
+/** A non-terminal dispatch named by its dedup key ({@link listActiveDispatchesByDedupKeys}). */
+export interface ActiveDedupDispatch {
+	dedupKey: string;
+	createdAt: Date;
+}
+
+/**
+ * The non-terminal dispatches holding any of `dedupKeys` — the WIP panel's read of
+ * which Resolve problem attempts are queued for its waiting holders (issue #1428).
+ * `dedup_key` is unique, so this returns at most one row per key. An empty list is
+ * answered without a query.
+ */
+export async function listActiveDispatchesByDedupKeys(
+	dedupKeys: readonly string[],
+): Promise<ActiveDedupDispatch[]> {
+	if (dedupKeys.length === 0) return [];
+	const rows = await getDb()
+		.select({ dedupKey: dispatches.dedupKey, createdAt: dispatches.createdAt })
+		.from(dispatches)
+		.where(
+			and(
+				inArray(dispatches.dedupKey, [...dedupKeys]),
+				inArray(dispatches.state, [...ACTIVE_DISPATCH_STATES]),
+			),
+		);
+	return rows.flatMap((row) =>
+		row.dedupKey === null ? [] : [{ dedupKey: row.dedupKey, createdAt: row.createdAt }],
+	);
+}
+
 /**
  * Atomically claim a dispatch for execution: `pending`/`retry-scheduled` →
  * `leased`. Re-claiming a lease this owner already holds succeeds (a BullMQ
