@@ -797,6 +797,16 @@ describe('azure devops pull-request reads', () => {
 			expect(retry?.searchParams.get('api-version')).toBe('7.1');
 		});
 
+		// Issue #1429: a canceled build is a red head, so it is retried too.
+		it('retries a canceled build', async () => {
+			routeBuilds([createMockAzureDevOpsBuildResponse({ id: 42, result: 'canceled' })]);
+
+			await expect(
+				scoped(() => retryFailedAzureDevOpsBuilds(REPO, HEAD_SHA)),
+			).resolves.toHaveLength(1);
+			expect(retries().map((url) => url.pathname)).toEqual([`${BUILDS}/42`]);
+		});
+
 		it('retries nothing when every build is green or still running', async () => {
 			routeBuilds([
 				createMockAzureDevOpsBuildResponse({ id: 40 }),

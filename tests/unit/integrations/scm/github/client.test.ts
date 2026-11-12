@@ -258,6 +258,36 @@ describe('github client', () => {
 			]);
 		});
 
+		// Issue #1429: a job that hits its `timeout-minutes` reports `cancelled`, which
+		// is a red head, so the approved-head re-run policy must be able to re-run it.
+		it('re-runs a cancelled latest run', async () => {
+			paginate.mockImplementation(async (endpoint: unknown) =>
+				endpoint === listWorkflowRunsForRepo
+					? [
+							{
+								id: 7,
+								workflow_id: 100,
+								name: 'verify',
+								status: 'completed',
+								conclusion: 'cancelled',
+							},
+						]
+					: [],
+			);
+			reRunWorkflowFailedJobs.mockResolvedValue({ status: 201 });
+
+			const rerun = await withGitHubToken('tok', () =>
+				rerunFailedWorkflowRuns('jkwiecien', 'swarm', 'cafe'),
+			);
+
+			expect(rerun).toEqual(['verify']);
+			expect(reRunWorkflowFailedJobs).toHaveBeenCalledExactlyOnceWith({
+				owner: 'jkwiecien',
+				repo: 'swarm',
+				run_id: 7,
+			});
+		});
+
 		it('does not re-run a stale failed run of a workflow whose latest run is green', async () => {
 			paginate.mockImplementation(async (endpoint: unknown) =>
 				endpoint === listWorkflowRunsForRepo

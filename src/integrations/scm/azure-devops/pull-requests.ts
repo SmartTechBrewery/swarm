@@ -714,9 +714,11 @@ async function buildChecks(repo: string, sha: string): Promise<Map<string, Check
 }
 
 /**
- * Retry every failed build on `sha` (`PATCH …/_apis/build/builds/{id}?retry=true`,
- * Build Update with `retry`, which re-runs the build's failed stages), returning the
- * name of each build Azure accepted the retry of — empty when none failed.
+ * Retry every failed or canceled build on `sha` (`PATCH
+ * …/_apis/build/builds/{id}?retry=true`, Build Update with `retry`, which re-runs
+ * the build's failed and canceled stages), returning the name of each build Azure
+ * accepted the retry of — empty when none failed. A canceled build is a red head
+ * to the aggregate decision (issue #1429), so it is retried like a failed one.
  *
  * Builds are picked exactly as the aggregate picks them ({@link latestBuildsForCommit}),
  * so a stale failure a newer build of the same definition superseded is not retried.
@@ -728,7 +730,8 @@ export async function retryFailedAzureDevOpsBuilds(repo: string, sha: string): P
 	const { organization, project } = azureRepoCoordinates(repo);
 	const retried: string[] = [];
 	for (const { build, index } of (await latestBuildsForCommit(repo, sha)).values()) {
-		if (build.status !== 'completed' || build.result !== 'failed' || build.id === undefined) {
+		const retryable = build.result === 'failed' || build.result === 'canceled';
+		if (build.status !== 'completed' || !retryable || build.id === undefined) {
 			continue;
 		}
 		await azureDevOpsRequest<unknown>(

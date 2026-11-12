@@ -192,6 +192,7 @@ import {
 	rearmMergeAutomationForGreenHead,
 	requestConflictResolution,
 	requestMergeAutomation,
+	UPDATED_HEAD_CHECKS_GRACE_MS,
 } from '@/worker/merge-automation.js';
 
 function mockDispatchRow(overrides: Partial<DispatchRow> = {}): DispatchRow {
@@ -1011,6 +1012,73 @@ describe('processMergeAutomationDispatch: an approved head whose checks are not 
 		expect(outcome.result).toBe('not-eligible');
 	});
 
+	// Issue #1429 (under-control-platform#2215): the approved head's only check was
+	// cancelled by its job timeout while merge automation waited, and the head merged
+	// 8s later. A cancelled check is red, so the wait ends in the red-head refusal.
+	it('refuses a pending approved head whose check is then cancelled, naming the conclusion', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+		const commentOnPullRequest = commentSpy();
+		const hasCiNoFixRecovery = vi.fn(async () => false);
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest,
+			getAggregateCheckStatus: checksPending(),
+			commentOnPullRequest,
+			hasCiNoFixRecovery,
+		});
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: 1 }),
+			job,
+			project,
+			{
+				mergePullRequest,
+				getAggregateCheckStatus: checksConcluding('success', 'cancelled'),
+				commentOnPullRequest,
+				hasCiNoFixRecovery,
+			},
+		);
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		// The same path as a red head: the approved-head re-run policy is asked first.
+		expect(hasCiNoFixRecovery).toHaveBeenCalledExactlyOnceWith(project, '17', 'deadbeef');
+		const recorded = updateReviewMergeOutcome.mock.calls.at(-1)?.[1] as {
+			status: string;
+			message: string;
+		};
+		expect(recorded.status).toBe('not-eligible');
+		expect(recorded.message).toContain('check-1 (cancelled)');
+		expect(commentOnPullRequest.mock.calls[0]?.[2]).toContain('check-1 (cancelled)');
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	// Issue #1429 (under-control-platform#2206, #2211 — the latter a Resolve-conflicts
+	// head, which is an ordinary head here): approved on a head whose CI was cancelled.
+	it.each([
+		'cancelled',
+		'timed_out',
+		'action_required',
+		'stale',
+	])('never merges an approved head whose check concluded %s', async (conclusion) => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			job,
+			{ ...project, reviewChecks: 'if-present' },
+			{
+				mergePullRequest,
+				getAggregateCheckStatus: checksConcluding(conclusion),
+				commentOnPullRequest: commentSpy(),
+				hasCiNoFixRecovery: vi.fn(async () => false),
+			},
+		);
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(outcome.result).toBe('not-eligible');
+	});
+
 	it('bounds the wait, settling with the pending checks named once the wait is spent', async () => {
 		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
 
@@ -1124,6 +1192,8 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 				...job,
 				approvedHeadSha: 'merged-with-base',
 				baseUpdates: 1,
+				// When it advanced — what bounds the wait for its checks (issue #1429).
+				headAdvancedAt: expect.any(String),
 			}),
 		);
 		expect(input.waitReason).toBe('recheck');
@@ -1246,6 +1316,93 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 		);
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
 		expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+	});
+
+	// Issue #1429 (under-control-platform#2212): seconds after the update the
+	// provider lists no checks for the new head yet, which `if-present` alone reads
+	// as "no CI" — the head merged 9s after the update, its check still running.
+	it('holds an updated head with no checks yet under if-present until its checks pass', async () => {
+		const advanced: MergeAutomationJob = {
+			...job,
+			approvedHeadSha: 'merged-with-base',
+			baseUpdates: 1,
+			headAdvancedAt: new Date(Date.now() - 15_000).toISOString(),
+		};
+		const ifPresent = { ...project, reviewChecks: 'if-present' as const };
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+
+		const first = await processMergeAutomationDispatch(mockDispatchRow(), advanced, ifPresent, {
+			mergePullRequest,
+			getAggregateCheckStatus: vi.fn(async () => ({ totalCount: 0, checkRuns: [] })),
+		});
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(first.result).toBe('retry-scheduled');
+		const held = lastRetryInput() as ReturnType<typeof lastRetryInput> & { lastError: string };
+		expect(held.attempt).toBe(1);
+		expect(held.lastError).toContain(
+			'waiting for the checks on the head brought up to date with the base: no checks have reported yet',
+		);
+		expect(updateReviewMergeOutcome).toHaveBeenLastCalledWith(
+			'run-1',
+			expect.objectContaining({
+				status: 'not-ready',
+				message: expect.stringContaining('no checks have reported yet'),
+			}),
+		);
+
+		const running = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: 1 }),
+			advanced,
+			ifPresent,
+			{
+				mergePullRequest,
+				getAggregateCheckStatus: vi.fn(async () => ({
+					totalCount: 1,
+					checkRuns: [{ name: 'verify', status: 'in_progress', conclusion: null }],
+				})),
+			},
+		);
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(running.result).toBe('retry-scheduled');
+
+		const green = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: 2 }),
+			advanced,
+			ifPresent,
+			{ mergePullRequest, getAggregateCheckStatus: checksConcluding('success') },
+		);
+		expect(mergePullRequest).toHaveBeenCalledExactlyOnceWith(ifPresent, 17, 'merged-with-base');
+		expect(green.result).toBe('merged');
+	});
+
+	// A repository with no CI at all must still merge an updated head — once the
+	// grace window has passed, zero checks means what `if-present` says it means.
+	it('merges an updated head still at zero checks once the grace window has passed', async () => {
+		const advanced: MergeAutomationJob = {
+			...job,
+			approvedHeadSha: 'merged-with-base',
+			baseUpdates: 1,
+			headAdvancedAt: new Date(Date.now() - UPDATED_HEAD_CHECKS_GRACE_MS - 1_000).toISOString(),
+		};
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: 4 }),
+			advanced,
+			{ ...project, reviewChecks: 'if-present' },
+			{
+				mergePullRequest,
+				getAggregateCheckStatus: vi.fn(async () => ({ totalCount: 0, checkRuns: [] })),
+			},
+		);
+
+		expect(mergePullRequest).toHaveBeenCalledExactlyOnceWith(
+			expect.anything(),
+			17,
+			'merged-with-base',
+		);
+		expect(outcome.result).toBe('merged');
 	});
 
 	// Issue #1113: CI that never starts on the updated head (a self-hosted runner
@@ -1884,7 +2041,12 @@ describe('processMergeAutomationDispatch: a provider that cannot update a branch
 		expect(mergePullRequest).not.toHaveBeenCalled();
 		const input = lastRetryInput();
 		expect(input.jobPayload).toEqual(
-			onTurn({ ...job, approvedHeadSha: 'worker-merge', baseUpdates: 1 }),
+			onTurn({
+				...job,
+				approvedHeadSha: 'worker-merge',
+				baseUpdates: 1,
+				headAdvancedAt: expect.any(String),
+			}),
 		);
 		expect(input.attempt).toBe(0);
 		expect(claimReviewDispatch).toHaveBeenCalledWith(

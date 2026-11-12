@@ -683,6 +683,33 @@ describe('review trigger', () => {
 			});
 		});
 
+		// Issue #1429 (under-control-platform#2206, #2211 — the latter's head produced
+		// by Resolve-conflicts, an ordinary head here): a `checks completed` event whose
+		// only check was cancelled by its job timeout started a Review as if CI passed.
+		it.each([
+			['required', 'cancelled'],
+			['if-present', 'cancelled'],
+			['required', 'stale'],
+			['if-present', 'timed_out'],
+		] as const)('routes a %s head whose only check concluded %s to Respond-to-CI, not Review', async (policy, conclusion) => {
+			getAggregateCheckStatus.mockResolvedValue(
+				checkStatus([['Lint, typecheck, and test', 'completed', conclusion]]),
+			);
+			const project = createMockProjectConfig({ reviewChecks: policy });
+			const result = await handler.handle({
+				...ctx({ ...base, headSha: 'cafe', prBranch: 'issue-9', checkConclusion: conclusion }),
+				project,
+			});
+			expect(result).toEqual({
+				phase: 'respond-to-ci',
+				taskId: '9-ci',
+				prNumber: '9',
+				prBranch: 'issue-9',
+				headSha: 'cafe',
+			});
+			expect(reserveReviewVerdict).not.toHaveBeenCalled();
+		});
+
 		it('skips a PR on a SWARM-style branch with no Implementation run and logs warn', async () => {
 			hasRunForTask.mockResolvedValue(false);
 			getPullRequest.mockResolvedValueOnce({

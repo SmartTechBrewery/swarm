@@ -113,6 +113,26 @@ describe('deriveQueuedPhaseHint', () => {
 		expect(deriveQueuedPhaseHint(job)).toBe('respond-to-ci');
 	});
 
+	// Issue #1429: a cancelled (or timed-out) check is red, not a Review.
+	it.each([
+		'cancelled',
+		'timed_out',
+		'stale',
+	])('hints respond-to-ci for %s checks', (conclusion) => {
+		const job = createMockScmWebhookJob({
+			event: { ...createMockScmWebhookJob().event, kind: 'checks', checkConclusion: conclusion },
+		});
+		expect(deriveQueuedPhaseHint(job)).toBe('respond-to-ci');
+	});
+
+	// GitLab and Bitbucket carry an in-flight state through as the conclusion.
+	it('hints review for an in-flight checks state', () => {
+		const job = createMockScmWebhookJob({
+			event: { ...createMockScmWebhookJob().event, kind: 'checks', checkConclusion: 'running' },
+		});
+		expect(deriveQueuedPhaseHint(job)).toBe('review');
+	});
+
 	it('hints review for successful checks', () => {
 		const job = createMockScmWebhookJob({
 			event: {
