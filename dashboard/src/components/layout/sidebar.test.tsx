@@ -99,16 +99,16 @@ describe('Sidebar navigation', () => {
 		const entries = [...(container.querySelector('nav')?.querySelectorAll('a') ?? [])].map(
 			(link) => link.textContent,
 		);
-		expect(entries).toEqual(['Runs', 'Workers', 'Alpha', 'General']);
+		expect(entries).toEqual(['Runs', 'Workers', 'Alpha', 'Settings']);
 	});
 
-	it('labels the /settings link General under the Settings heading (issue #1426)', () => {
+	it('labels the /settings link Settings under the General heading', () => {
 		renderSidebar();
 
-		const link = screen.getByRole('link', { name: 'General' });
+		const link = screen.getByRole('link', { name: 'Settings' });
 		expect(link.getAttribute('href')).toBe('/settings');
-		expect(screen.queryByRole('link', { name: 'Settings' })).toBeNull();
-		expect(screen.getByText('Settings', { selector: 'div' })).toBeTruthy();
+		expect(screen.queryByRole('link', { name: 'General' })).toBeNull();
+		expect(screen.getByText('General', { selector: 'div' })).toBeTruthy();
 	});
 });
 

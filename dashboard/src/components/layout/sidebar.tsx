@@ -159,7 +159,7 @@ export function Sidebar() {
 					</div>
 
 					<div className="px-3 pt-4 pb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">
-						Settings
+						General
 					</div>
 					<Link
 						to="/settings"
@@ -170,7 +170,7 @@ export function Sidebar() {
 						}
 					>
 						<Settings className="h-4 w-4" />
-						General
+						Settings
 					</Link>
 
 					{/* CLI Quota is deliberately not linked here (issue #1229): the page is

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 /**
- * The tabs on the General screen (`/settings`, the sidebar's **General** link), in
+ * The tabs on the General screen (`/settings`, the sidebar's **Settings** link), in
  * display order (issue #250 added `appearance`, issue #769 `credentials`, issue #1151
  * `users`, issue #1284 `fleet`, issue #1390 `issues`). The administrator-only tabs stay
  * together, then the tabs every viewer sees: `issues` (SWARM's own bug reports) and
