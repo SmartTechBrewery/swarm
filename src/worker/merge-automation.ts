@@ -64,8 +64,9 @@
  * every attempt reads the head's aggregate checks first, with the classifier and
  * per-repository `reviewChecks` policy the pipeline itself uses: a red head is
  * refused terminally with a PR comment and left to Respond-to-CI, a pending one
- * waits on the ordinary bounded budget (keeping its merge-queue turn), and only a
- * green one is offered to the merge capability. A head refused while red, or
+ * waits (keeping its merge-queue turn) on the ordinary bounded budget and then,
+ * since issue #1432, on {@link MAX_PENDING_CHECKS_WAIT_MS} of wall clock, and only
+ * a green one is offered to the merge capability. A head refused while red, or
  * given up on while pending, is re-armed once when its checks later complete
  * green (issue #1128, {@link rearmMergeAutomationForGreenHead}).
  *
@@ -108,8 +109,10 @@
  *    the holder ({@link settleMergeDispatch}), with no retry budget spent and a
  *    {@link MERGE_QUEUED} outcome on the Review run naming the pull request ahead.
  *  - **Head-of-line blocking is bounded by the budgets that already exist**: each
- *    head gets {@link MAX_MERGE_RETRIES} retries and there are at most
- *    {@link MAX_BASE_UPDATES} + 1 heads, while every refusal settles at once.
+ *    head gets {@link MAX_MERGE_RETRIES} retries — or, while all it waits for is
+ *    that head's checks, up to {@link MAX_PENDING_CHECKS_WAIT_MS} (issue #1432) —
+ *    and there are at most {@link MAX_BASE_UPDATES} + 1 heads, while every refusal
+ *    settles at once.
  *  - **Dependencies cannot be inverted by arrival order**: Implementation's
  *    dependency gate does not start a blocked item until its blockers are done, so
  *    a dependent's pull request — let alone its approval — never exists before its
@@ -259,10 +262,32 @@ export type ReviewMergeOutcomeStatus =
  * from 15s up to a 5-minute ceiling: GitHub's own review-state propagation
  * typically clears within seconds, so seven total attempts (the immediate one
  * plus six retries) comfortably rides that out while staying bounded.
+ *
+ * That budget spans about 13 minutes, which a repository's CI can outlast. So a
+ * `not-ready` that is *only* the head's checks still running does not spend it
+ * out: past the last retry it keeps re-checking every
+ * {@link MERGE_RETRY_MAX_DELAY_MS} until {@link MAX_PENDING_CHECKS_WAIT_MS}
+ * (issue #1432). Every other `not-ready`, and a failing provider, still settles
+ * on the attempt that spends the budget.
  */
 export const MAX_MERGE_RETRIES = 6;
 const MERGE_RETRY_BASE_DELAY_MS = 15_000;
 const MERGE_RETRY_MAX_DELAY_MS = 5 * 60_000;
+
+/**
+ * How long one merge dispatch waits for the checks on the head it is about to
+ * merge to finish before giving up (issue #1432) — wall clock, measured from the
+ * first pending read on the *current* approved head (`checksPendingSince`), so a
+ * head brought up to date with its base starts a fresh wait. Coded, on
+ * {@link MAX_MERGE_RETRIES}'s precedent.
+ *
+ * An hour, because the budget alone gave up on a CI that took about 15 minutes
+ * while it was still running, and a pull request it walks away from that way
+ * needs a human or a later green event to merge. A holder keeps its merge-queue
+ * turn for the whole wait, so this is also how long one pull request's CI can hold
+ * up the merges behind it — a red or green conclusion inside it is decided at once.
+ */
+export const MAX_PENDING_CHECKS_WAIT_MS = 60 * 60_000;
 
 /**
  * How many times one merge dispatch may bring its pull request's head up to date
@@ -294,7 +319,11 @@ export const MERGE_QUEUE_RECHECK_MS = 60_000;
  * outlast the whole post-update merge budget: the retry after an update fires at
  * 15s and the six `not-ready` retries behind it span ~13 minutes
  * ({@link mergeRetryDelayMs}), so 15 minutes covers every attempt this dispatch
- * can still make, with margin. Sized here rather than shared with
+ * can still make, with margin. A wait for that head's checks that runs past the
+ * budget ({@link MAX_PENDING_CHECKS_WAIT_MS}) re-takes the TTL on every pending
+ * retry instead ({@link refreshUpdatedHeadClaimWhilePending}), and the retries are
+ * at most five minutes apart, so the claim outlives the whole extended wait without
+ * this growing to cover it. Sized here rather than shared with
  * `ci-no-fix-recovery.ts`'s own TTL: the two cover different waits and neither
  * should move because the other did.
  */
@@ -570,15 +599,28 @@ function retryableExhaustion(
  * reason too (issue #1113): there it is the fresh CI nothing else watches — a
  * self-hosted runner that is offline never starts it — and the reason names the
  * checks still pending, so the operator can tell a stuck runner from a moving
- * base or a red build. The existing budget still bounds that wait; nothing here
- * waits longer for it. The approved head's own checks (issue #1124) are waited
- * for on the same budget and named the same way.
+ * base or a red build. The approved head's own checks (issue #1124) are named the
+ * same way.
+ *
+ * A wait for pending checks no longer ends on the budget (issue #1432): it ends
+ * on {@link MAX_PENDING_CHECKS_WAIT_MS}, so `pendingWaitMs` — how long the checks
+ * on this head were waited for — is passed exactly then, and the message names
+ * the minutes rather than the attempts. The attempt-counted wording it replaces
+ * for the approved head can no longer be reached; every other case keeps its
+ * string byte-for-byte.
  */
 function exhaustionMessage(
 	job: MergeAutomationJob,
 	exhaustion: ReviewMergeOutcomeStatus,
 	lastMessage: string,
+	pendingWaitMs?: number,
 ): string {
+	if (pendingWaitMs !== undefined) {
+		const minutes = Math.round(pendingWaitMs / 60_000);
+		return baseUpdatesSpent(job) > 0
+			? `Merge automation brought this pull request's head up to date with its base and waited ${minutes} minutes for that head's checks to finish, then gave up; the pull request is approved but was left open for a manual merge. Last reason: ${lastMessage}`
+			: `Merge automation waited ${minutes} minutes for the approved head's checks to finish and gave up; the pull request is approved and left open, and SWARM merges it once its checks complete green. Last reason: ${lastMessage}`;
+	}
 	if (exhaustion === MERGE_PROVIDER_ERROR_EXHAUSTED)
 		return `Merge automation gave up after ${MAX_MERGE_RETRIES + 1} attempts against a source-control provider that kept failing; the pull request is approved but was left open for a manual merge. Last provider error: ${lastMessage}`;
 	// The worker-side update this dispatch asked for never landed (issue #1117) —
@@ -587,8 +629,6 @@ function exhaustionMessage(
 		return `Merge automation asked a SWARM worker to bring this pull request's head up to date with its base and gave up after ${MAX_MERGE_RETRIES + 1} attempts waiting for that update; the pull request is approved but was left open for a manual merge. Last reason: ${lastMessage}`;
 	if (baseUpdatesSpent(job) > 0)
 		return `Merge automation brought this pull request's head up to date with its base and gave up after ${MAX_MERGE_RETRIES + 1} attempts waiting for that head to become mergeable; the pull request is approved but was left open for a manual merge. Last reason: ${lastMessage}`;
-	if (lastMessage.startsWith(WAITING_FOR_APPROVED_HEAD_CHECKS))
-		return `Merge automation waited ${MAX_MERGE_RETRIES + 1} attempts for the approved head's checks to finish and gave up; the pull request is approved and left open, and SWARM merges it once its checks complete green. Last reason: ${lastMessage}`;
 	return 'Merge automation gave up after repeated not-ready results; the pull request is approved but was left open for a manual merge.';
 }
 
@@ -1814,6 +1854,12 @@ type MergeAttempt =
 			outcome: MergePullRequestOutcome;
 			/** Set only when the attempt refused because the head it was about to merge is red. */
 			redFreshChecks: RedFreshChecks | null;
+			/**
+			 * Set only when the `not-ready` is the head's checks still running — the one
+			 * wait {@link MAX_PENDING_CHECKS_WAIT_MS} extends past the retry budget
+			 * (issue #1432). A marker, so nothing has to recognise the message.
+			 */
+			pendingChecks?: true;
 	  }
 	/** There was no operator to merge as (issue #1249); `reason` says why. */
 	| { kind: 'no-operator'; reason: string };
@@ -1861,6 +1907,7 @@ async function attemptMerge(
 		if (freshChecks.kind === 'pending') {
 			// The head's own CI has not finished. Ordinary backoff — for an updated
 			// head the budget was reset when it advanced, so this is the wait it exists for.
+			// Marked, so the wait can outlast the budget (issue #1432, `retryOrExhaust`).
 			return {
 				kind: 'answered',
 				outcome: {
@@ -1870,6 +1917,7 @@ async function attemptMerge(
 						: `${WAITING_FOR_APPROVED_HEAD_CHECKS}: ${freshChecks.message}`,
 				},
 				redFreshChecks: null,
+				pendingChecks: true,
 			};
 		}
 		if (freshChecks.kind === 'red') {
@@ -2171,9 +2219,51 @@ async function refuseWithoutOperator(
 }
 
 /**
+ * When the checks on the head this dispatch waits for were first read pending
+ * (issue #1432): the payload's own stamp while it still names the current approved
+ * head, otherwise `now` — a stamp for a head the dispatch has since advanced from
+ * measures a wait that is over.
+ */
+function checksPendingSinceFor(
+	job: MergeAutomationJob,
+	now: Date,
+): NonNullable<MergeAutomationJob['checksPendingSince']> {
+	const stamped = job.checksPendingSince;
+	if (stamped?.headSha === job.approvedHeadSha) return stamped;
+	return { headSha: job.approvedHeadSha, at: now.toISOString() };
+}
+
+/**
+ * Keep holding the PR+SHA review-dispatch slot of a head this dispatch brought up
+ * to date while its checks are still pending (issue #1432): the wait for them can
+ * now outlast {@link UPDATED_HEAD_CLAIM_TTL_SEC}, and a claim that lapses mid-wait
+ * lets that head's own `checks completed` event start the redundant Review
+ * {@link claimUpdatedHeadReviewSlot} exists to hold off. Pending reads only — a red
+ * head is refused, never kept. Best-effort, like the refresh itself.
+ */
+async function refreshUpdatedHeadClaimWhilePending(
+	project: ProjectConfig,
+	job: MergeAutomationJob,
+): Promise<void> {
+	if (baseUpdatesSpent(job) === 0) return;
+	await refreshReviewDispatchClaim(
+		buildReviewDispatchKey(project.repo, job.prNumber, job.approvedHeadSha),
+		UPDATED_HEAD_CLAIM_TTL_SEC,
+	);
+}
+
+/**
  * A retryable outcome: schedule the next attempt on the bounded, doubling
  * backoff, or — on the attempt that spends the budget — settle with the
  * exhaustion outcome that names why.
+ *
+ * `pendingChecks` marks a `not-ready` that is only the head's checks still running
+ * (issue #1432). That wait is stamped onto the payload (`checksPendingSince`) and
+ * is not ended by the budget: past the last retry it re-checks every
+ * {@link MERGE_RETRY_MAX_DELAY_MS}, with the attempt held at
+ * {@link MAX_MERGE_RETRIES}, until {@link MAX_PENDING_CHECKS_WAIT_MS} has passed
+ * since the first pending read on this head — and only then settles
+ * {@link MERGE_RETRY_EXHAUSTED}, naming the wait.
  */
 async function retryOrExhaust(
 	dispatch: DispatchRow,
@@ -2182,13 +2272,22 @@ async function retryOrExhaust(
 	outcome: MergePullRequestOutcome,
 	retryExhaustion: ReviewMergeOutcomeStatus,
 	attempt: number,
+	pendingChecks = false,
 ): Promise<MergeAutomationSettledOutcome> {
+	const now = new Date();
+	const pendingSince = pendingChecks ? checksPendingSinceFor(job, now) : undefined;
+	const carried = pendingSince ? { ...job, checksPendingSince: pendingSince } : job;
+	const pendingWaitMs = pendingSince ? now.getTime() - Date.parse(pendingSince.at) : undefined;
 	const nextAttempt = attempt + 1;
-	if (nextAttempt > MAX_MERGE_RETRIES) {
+	const extendedWait =
+		nextAttempt > MAX_MERGE_RETRIES &&
+		pendingWaitMs !== undefined &&
+		pendingWaitMs < MAX_PENDING_CHECKS_WAIT_MS;
+	if (nextAttempt > MAX_MERGE_RETRIES && !extendedWait) {
 		await persistMergeOutcome(
 			job,
 			retryExhaustion,
-			exhaustionMessage(job, retryExhaustion, outcome.message),
+			exhaustionMessage(job, retryExhaustion, outcome.message, pendingWaitMs),
 			attempt,
 		);
 		logger.warn('Merge automation: retry budget exhausted, leaving the PR open', {
@@ -2197,6 +2296,7 @@ async function retryOrExhaust(
 			prNumber: job.prNumber,
 			outcome: retryExhaustion,
 			reason: outcome.message,
+			pendingWaitMs,
 		});
 		await settleMergeDispatch(dispatch, job, project, 'merge-retry-exhausted');
 		return {
@@ -2205,23 +2305,36 @@ async function retryOrExhaust(
 			prNumber: job.prNumber,
 		};
 	}
+	const scheduledAttempt = extendedWait ? MAX_MERGE_RETRIES : nextAttempt;
 	await persistMergeOutcome(job, outcome.status, outcome.message, attempt);
-	await scheduleMergeRetry(dispatch.id, job, nextAttempt, mergeRetryDelayMs(nextAttempt), {
-		waitReason: 'recheck',
-		// Replaces whatever the row last said — a `merge-queue` sentence included.
-		lastError: outcome.message,
-	});
+	if (pendingChecks) await refreshUpdatedHeadClaimWhilePending(project, job);
+	await scheduleMergeRetry(
+		dispatch.id,
+		carried,
+		scheduledAttempt,
+		extendedWait ? MERGE_RETRY_MAX_DELAY_MS : mergeRetryDelayMs(nextAttempt),
+		{
+			waitReason: 'recheck',
+			// Replaces whatever the row last said — a `merge-queue` sentence included.
+			lastError: outcome.message,
+		},
+	);
 	const scheduled = {
 		dispatchId: dispatch.id,
 		runId: job.reviewRunId,
 		prNumber: job.prNumber,
-		attempt: nextAttempt,
+		attempt: scheduledAttempt,
 		reason: outcome.message,
 	};
 	// A failing forge keeps the severity its terminal settle used to carry;
 	// a pull request that is simply not ready yet is ordinary progress.
 	if (outcome.status === 'provider-error') {
 		logger.error('Merge automation: provider failure — retry scheduled', scheduled);
+	} else if (extendedWait) {
+		logger.info('Merge automation: checks still pending past the retry budget — waiting on', {
+			...scheduled,
+			pendingWaitMs,
+		});
 	} else {
 		logger.info('Merge automation: pull request not ready — retry scheduled', scheduled);
 	}
@@ -2347,7 +2460,15 @@ export async function processMergeAutomationDispatch(
 	}
 
 	if (retryExhaustion) {
-		return retryOrExhaust(dispatch, job, project, outcome, retryExhaustion, attempt);
+		return retryOrExhaust(
+			dispatch,
+			job,
+			project,
+			outcome,
+			retryExhaustion,
+			attempt,
+			attempted.pendingChecks === true,
+		);
 	}
 
 	logger.warn('Merge automation: terminal non-merge outcome', {

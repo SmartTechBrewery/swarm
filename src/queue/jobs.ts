@@ -608,6 +608,21 @@ export const MergeAutomationJobSchema = jobBase.extend({
 	 */
 	queueTurnStartedAt: z.string().datetime().optional(),
 	/**
+	 * When this dispatch first read the checks on `headSha` as still pending
+	 * (issue #1432) — the start of the wall-clock wait `MAX_PENDING_CHECKS_WAIT_MS`
+	 * (`src/worker/merge-automation.ts`) bounds once the ordinary retry budget is
+	 * spent. Stamped by the dispatch, carried through every retry it schedules,
+	 * and meaningless once `approvedHeadSha` moves on, which is how a stale one is
+	 * recognised (the `workerCatchUp.requestedFor` pattern). Absent until the first
+	 * pending read, and on every row written before it existed.
+	 */
+	checksPendingSince: z
+		.object({
+			headSha: z.string().min(1),
+			at: z.string().datetime(),
+		})
+		.optional(),
+	/**
 	 * The worker-side branch update this dispatch asked for, when the provider
 	 * could not update the branch itself (issue #1117). `requestedFor` is the
 	 * approved head the catch-up was requested for — so a later attempt on the same

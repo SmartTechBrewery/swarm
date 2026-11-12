@@ -176,6 +176,7 @@ import {
 	adoptWorkerBranchUpdate,
 	MAX_BASE_UPDATES,
 	MAX_MERGE_RETRIES,
+	MAX_PENDING_CHECKS_WAIT_MS,
 	MERGE_NO_OPERATOR,
 	MERGE_PROVIDER_ERROR_EXHAUSTED,
 	MERGE_QUEUE_RECHECK_MS,
@@ -344,6 +345,15 @@ function checksConcluding(...conclusions: string[]) {
  */
 function onTurn(payload: MergeAutomationJob) {
 	return { ...payload, queueTurnStartedAt: expect.any(String) };
+}
+
+/**
+ * A `checksPendingSince` stamp (issue #1432) for `headSha`, first read pending
+ * `agoMs` before now — past {@link MAX_PENDING_CHECKS_WAIT_MS} the next pending
+ * read past the retry budget gives up.
+ */
+function pendingSince(headSha: string, agoMs: number) {
+	return { headSha, at: new Date(Date.now() - agoMs).toISOString() };
 }
 
 /** The retry input `scheduleDispatchRetry` was last called with. */
@@ -920,7 +930,11 @@ describe('processMergeAutomationDispatch: an approved head whose checks are not 
 		const input = lastRetryInput();
 		expect(input.attempt).toBe(1);
 		expect(input.waitReason).toBe('recheck');
-		expect(input.jobPayload).toEqual(onTurn(job));
+		// The first pending read starts the wait's wall clock (issue #1432).
+		expect(input.jobPayload).toEqual({
+			...onTurn(job),
+			checksPendingSince: { headSha: 'deadbeef', at: expect.any(String) },
+		});
 		const recorded = updateReviewMergeOutcome.mock.calls.at(-1)?.[1] as {
 			status: string;
 			message: string;
@@ -934,7 +948,7 @@ describe('processMergeAutomationDispatch: an approved head whose checks are not 
 	it('gives up on a head whose checks stay pending, saying SWARM merges it once they are green', async () => {
 		await processMergeAutomationDispatch(
 			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
-			job,
+			{ ...job, checksPendingSince: pendingSince('deadbeef', MAX_PENDING_CHECKS_WAIT_MS) },
 			project,
 			{ getAggregateCheckStatus: checksPending() },
 		);
@@ -1065,12 +1079,12 @@ describe('processMergeAutomationDispatch: an approved head whose checks are not 
 		expect(outcome.result).toBe('not-eligible');
 	});
 
-	it('bounds the wait, settling with the pending checks named once the budget is spent', async () => {
+	it('bounds the wait, settling with the pending checks named once the wait is spent', async () => {
 		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
 
 		const outcome = await processMergeAutomationDispatch(
 			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
-			job,
+			{ ...job, checksPendingSince: pendingSince('deadbeef', MAX_PENDING_CHECKS_WAIT_MS) },
 			project,
 			{ mergePullRequest, getAggregateCheckStatus: checksPending('queued', 'build') },
 		);
@@ -1395,6 +1409,7 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 			...job,
 			approvedHeadSha: 'merged-with-base',
 			baseUpdates: 1,
+			checksPendingSince: pendingSince('merged-with-base', MAX_PENDING_CHECKS_WAIT_MS),
 		};
 		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
 
@@ -1617,6 +1632,224 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 // Issue #1117: Bitbucket Cloud, gitlab.com and Azure DevOps Services declare
 // `updatePullRequestBranch` unsupported, so a SWARM worker does the update and
 // hands its result back to the dispatch waiting on it.
+// Issue #1432 — the retry budget spans ~13 minutes, and a CI that outlasted it
+// left an approved, updated pull request `retry-exhausted` while its checks were
+// still running. A wait that is only pending checks now runs on wall clock instead.
+describe("processMergeAutomationDispatch: waits for a head's pending checks past the retry budget (issue #1430)", () => {
+	const UPDATED = 'merged-with-base';
+	const advanced: MergeAutomationJob = { ...job, approvedHeadSha: UPDATED, baseUpdates: 1 };
+
+	/** A head whose only check is still running. */
+	function checksRunning() {
+		return vi.fn(
+			async (): Promise<AggregateCheckStatus> => ({
+				totalCount: 1,
+				checkRuns: [{ name: 'build', status: 'in_progress', conclusion: null }],
+			}),
+		);
+	}
+
+	function lastRecorded() {
+		return updateReviewMergeOutcome.mock.calls.at(-1)?.[1] as { status: string; message: string };
+	}
+
+	/** Approve → stale-base → update-branch, then pending reads through the whole budget. */
+	async function updatedHeadPendingPastBudget(): Promise<MergeAutomationJob> {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning(STALE_BASE),
+			updatePullRequestBranch: updateReturning({ status: 'updated', headSha: UPDATED }),
+		});
+		let input = lastRetryInput();
+		expect(input.jobPayload.approvedHeadSha).toBe(UPDATED);
+		// Attempts 0..MAX_MERGE_RETRIES: the immediate one plus every retry the budget has.
+		for (let pass = 0; pass <= MAX_MERGE_RETRIES; pass++) {
+			const outcome = await processMergeAutomationDispatch(
+				mockDispatchRow({ attempt: input.attempt }),
+				input.jobPayload,
+				project,
+				{ mergePullRequest: mergeReturning(STALE_BASE), getAggregateCheckStatus: checksRunning() },
+			);
+			expect(outcome.result).toBe('retry-scheduled');
+			input = lastRetryInput();
+		}
+		return input.jobPayload;
+	}
+
+	it('keeps waiting for an updated head past the last retry, stamping that head', async () => {
+		const before = Date.now();
+		const payload = await updatedHeadPendingPastBudget();
+
+		expect(completeDispatch).not.toHaveBeenCalled();
+		const input = lastRetryInput();
+		// Held at the budget, re-checked at the backoff's ceiling.
+		expect(input.attempt).toBe(MAX_MERGE_RETRIES);
+		expect(input.waitReason).toBe('recheck');
+		expect(input.availableAt.getTime() - Date.now()).toBeGreaterThan(4 * 60_000);
+		expect(input.availableAt.getTime() - Date.now()).toBeLessThanOrEqual(5 * 60_000);
+		expect(payload.checksPendingSince?.headSha).toBe(UPDATED);
+		expect(Date.parse(payload.checksPendingSince?.at ?? '')).toBeGreaterThanOrEqual(before - 1000);
+		expect(lastRecorded().status).toBe('not-ready');
+	});
+
+	it('refuses the updated head with its comment when the checks then turn red', async () => {
+		const payload = await updatedHeadPendingPastBudget();
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+		const commentOnPullRequest = vi.fn(async (_p: unknown, _n: number, _body: string) => 1);
+		refreshReviewDispatchClaim.mockClear();
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			payload,
+			project,
+			{
+				mergePullRequest,
+				getAggregateCheckStatus: checksConcluding('failure'),
+				commentOnPullRequest,
+			},
+		);
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(commentOnPullRequest).toHaveBeenCalledOnce();
+		expect(commentOnPullRequest.mock.calls[0]?.[2]).toContain('brought this pull request');
+		// A red head is refused, never kept claimed.
+		expect(refreshReviewDispatchClaim).not.toHaveBeenCalled();
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	it('merges the updated head when the checks then turn green', async () => {
+		const payload = await updatedHeadPendingPastBudget();
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			payload,
+			project,
+			{ mergePullRequest, getAggregateCheckStatus: checksConcluding('success') },
+		);
+
+		expect(mergePullRequest).toHaveBeenCalledExactlyOnceWith(project, 17, UPDATED);
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
+		expect(outcome.result).toBe('merged');
+	});
+
+	it('keeps the first pending read as the start of the wait', async () => {
+		const stamp = pendingSince('deadbeef', 20 * 60_000);
+
+		await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			{ ...job, checksPendingSince: stamp },
+			project,
+			{ getAggregateCheckStatus: checksRunning() },
+		);
+
+		expect(completeDispatch).not.toHaveBeenCalled();
+		expect(lastRetryInput().jobPayload.checksPendingSince).toEqual(stamp);
+	});
+
+	it('gives up once the checks have been pending for the whole wait, naming it', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			{
+				...advanced,
+				checksPendingSince: pendingSince(UPDATED, MAX_PENDING_CHECKS_WAIT_MS + 60_000),
+			},
+			project,
+			{ mergePullRequest, getAggregateCheckStatus: checksRunning() },
+		);
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-retry-exhausted');
+		const recorded = lastRecorded();
+		expect(recorded.status).toBe(MERGE_RETRY_EXHAUSTED);
+		expect(recorded.message).toContain('waited 61 minutes');
+		expect(recorded.message).toContain('up to date with its base');
+		expect(recorded.message).toContain('build');
+		expect(outcome.result).toBe(MERGE_RETRY_EXHAUSTED);
+	});
+
+	it('names the minutes waited for an approved head too', async () => {
+		await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			{ ...job, checksPendingSince: pendingSince('deadbeef', MAX_PENDING_CHECKS_WAIT_MS) },
+			project,
+			{ getAggregateCheckStatus: checksRunning() },
+		);
+
+		expect(lastRecorded().message).toMatch(
+			/^Merge automation waited 60 minutes for the approved head's checks to finish and gave up;/,
+		);
+	});
+
+	it('still gives up on a not-ready that is not pending checks at the end of the budget', async () => {
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			// Even with a fresh stamp for this head: only a pending read extends the wait.
+			{ ...job, checksPendingSince: pendingSince('deadbeef', 60_000) },
+			project,
+			{
+				mergePullRequest: mergeReturning({
+					status: 'not-ready',
+					message: 'mergeable state unknown',
+				}),
+				getAggregateCheckStatus: checksConcluding('success'),
+			},
+		);
+
+		expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-retry-exhausted');
+		expect(lastRecorded()).toMatchObject({
+			status: MERGE_RETRY_EXHAUSTED,
+			message:
+				'Merge automation gave up after repeated not-ready results; the pull request is approved but was left open for a manual merge.',
+		});
+		expect(outcome.result).toBe(MERGE_RETRY_EXHAUSTED);
+	});
+
+	it('ignores a stamp for the head the dispatch advanced from', async () => {
+		const before = Date.now();
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			{ ...advanced, checksPendingSince: pendingSince('deadbeef', 2 * MAX_PENDING_CHECKS_WAIT_MS) },
+			project,
+			{ getAggregateCheckStatus: checksRunning() },
+		);
+
+		expect(completeDispatch).not.toHaveBeenCalled();
+		expect(outcome.result).toBe('retry-scheduled');
+		const stamp = lastRetryInput().jobPayload.checksPendingSince;
+		expect(stamp?.headSha).toBe(UPDATED);
+		expect(Date.parse(stamp?.at ?? '')).toBeGreaterThanOrEqual(before - 1000);
+	});
+
+	it('re-takes the updated head’s review claim on each pending read', async () => {
+		await processMergeAutomationDispatch(mockDispatchRow({ attempt: 2 }), advanced, project, {
+			getAggregateCheckStatus: checksRunning(),
+		});
+
+		expect(refreshReviewDispatchClaim).toHaveBeenCalledExactlyOnceWith(
+			`${project.repo}:17:${UPDATED}`,
+			15 * 60,
+		);
+	});
+
+	it('takes no claim for an approved head it never updated, nor on a read that is not pending', async () => {
+		await processMergeAutomationDispatch(mockDispatchRow({ attempt: 2 }), job, project, {
+			getAggregateCheckStatus: checksRunning(),
+		});
+		await processMergeAutomationDispatch(mockDispatchRow({ attempt: 2 }), advanced, project, {
+			mergePullRequest: mergeReturning({ status: 'not-ready', message: 'mergeable state unknown' }),
+			getAggregateCheckStatus: checksConcluding('success'),
+		});
+
+		expect(refreshReviewDispatchClaim).not.toHaveBeenCalled();
+	});
+});
+
 describe('processMergeAutomationDispatch: a provider that cannot update a branch', () => {
 	const prAtHead = (headSha: string) =>
 		vi.fn(async () => ({ number: 17, headBranch: 'issue-12', headSha }) as PullRequestDetails);
