@@ -13,7 +13,12 @@
  *
  *  - if they pass, the green path continues as for any green head — a merge
  *    still waiting on the head is woken (issue #1173), and otherwise the head is
- *    reviewed and merged; nothing is merged here;
+ *    reviewed and merged; nothing is merged here. Which of the two the green
+ *    reaches is decided by merge automation's PR+SHA claim on the head: kept
+ *    while its merge still waits there (so the green wakes that merge and starts
+ *    no redundant Review), released once nothing waits — here when the re-run is
+ *    requested, or by merge automation itself when it gives up on the head
+ *    afterwards (`releaseUpdatedHeadClaimAfterRerun`);
  *  - if they fail again, or the re-run cannot be made (`unsupported`,
  *    `nothing-to-rerun`, `provider-error`, or no operator to re-run them as —
  *    the re-run is a write made for the pull request's author with the stored
@@ -38,6 +43,7 @@
  */
 
 import type { ProjectConfig } from '../config/schema.js';
+import { listMergeChecksWaits } from '../db/repositories/dispatchesRepository.js';
 import {
 	claimUpdatedHeadChecksRerun,
 	findUpdatedHeadReviewRun,
@@ -172,19 +178,46 @@ async function requestRerun(
 
 	if (outcome.status !== 'requested') return refused(input, runId, describeRerunRefusal(outcome));
 
-	// The re-run's own `checks completed` must be *decided*: merge automation holds
-	// this head's PR+SHA claim for its whole lease (`claimUpdatedHeadReviewSlot`),
-	// and a green re-run arriving on it would be dropped as a duplicate, leaving
-	// the approved pull request with nothing to review or merge it.
-	await releaseReviewDispatch(buildReviewDispatchKey(project.repo, prNumber, headSha));
+	const mergeWaiting = await mergeWaitingOnHead(project, headSha);
+	// The re-run's own `checks completed` must be *decided*. Merge automation holds
+	// this head's PR+SHA claim (`claimUpdatedHeadReviewSlot`) so that head's green
+	// starts no redundant Review. While its merge still waits on the head, keep
+	// that claim: the green re-run wakes the merge, which merges, and the claim
+	// drops the Review. Once nothing waits — the merge already gave up on the red
+	// — release it, or the green would be dropped as a duplicate and leave the
+	// approved pull request with nothing to review or merge it. A merge that gives
+	// up later releases the claim itself (`releaseUpdatedHeadClaimAfterRerun`).
+	if (!mergeWaiting) {
+		await releaseReviewDispatch(buildReviewDispatchKey(project.repo, prNumber, headSha));
+	}
 	logger.info('updated head: re-ran the failed checks once before Respond-to-CI', {
 		prNumber,
 		headSha,
 		runId,
 		failedChecks,
 		rerunChecks: outcome.checks,
+		mergeAutomationClaimKept: mergeWaiting,
 	});
 	return 'rerun-requested';
+}
+
+/**
+ * Whether a merge dispatch is still waiting on this head's checks
+ * (`listMergeChecksWaits`). Read *after* the re-run was claimed on the run row, so
+ * a merge that settles after this read finds the claim recorded and releases its
+ * own PR+SHA claim. A failed read answers `false` — release — since a redundant
+ * Review costs less than a green nothing acts on.
+ */
+async function mergeWaitingOnHead(project: ProjectConfig, headSha: string): Promise<boolean> {
+	try {
+		return (await listMergeChecksWaits(project.id, project.repo, headSha)).length > 0;
+	} catch (err) {
+		logger.warn('updated head: could not read whether a merge waits on the head — releasing', {
+			headSha,
+			error: describeError(err),
+		});
+		return false;
+	}
 }
 
 function refused(

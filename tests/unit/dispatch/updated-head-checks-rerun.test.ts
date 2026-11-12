@@ -14,6 +14,16 @@ vi.mock('@/db/repositories/runsRepository.js', () => ({
 		claimUpdatedHeadChecksRerun(runId, headSha),
 }));
 
+// The merge dispatches still waiting on the head's checks (issue #1173): none by
+// default, which is the retry-exhausted repro — merge automation already gave up.
+const listMergeChecksWaits = vi.fn(
+	async (_projectId: string, _repo: string, _headSha: string): Promise<unknown[]> => [],
+);
+vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
+	listMergeChecksWaits: (projectId: string, repo: string, headSha: string) =>
+		listMergeChecksWaits(projectId, repo, headSha),
+}));
+
 const releaseReviewDispatch = vi.fn(async (_key: string) => {});
 vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	buildReviewDispatchKey: (repo: string, prNumber: string, headSha: string) =>
@@ -86,6 +96,8 @@ beforeEach(() => {
 	claimUpdatedHeadChecksRerun.mockReset();
 	claimUpdatedHeadChecksRerun.mockResolvedValue(true);
 	releaseReviewDispatch.mockClear();
+	listMergeChecksWaits.mockReset();
+	listMergeChecksWaits.mockResolvedValue([]);
 	rerunFailedChecks.mockClear();
 	runAsPullRequestOperator.mockClear();
 	logger.warn.mockClear();
@@ -109,7 +121,7 @@ describe('rerunUpdatedHeadOnce', () => {
 		expect(rerunFailedChecks).not.toHaveBeenCalled();
 	});
 
-	it('re-runs the failed checks once, as the operator, and releases the head’s claim', async () => {
+	it('re-runs the failed checks once, as the operator, and releases the claim when merge automation has already settled', async () => {
 		expect(await rerunUpdatedHeadOnce(input())).toBe('rerun-requested');
 
 		expect(findUpdatedHeadReviewRun).toHaveBeenCalledWith({
@@ -121,6 +133,23 @@ describe('rerunUpdatedHeadOnce', () => {
 		expect(claimUpdatedHeadChecksRerun).toHaveBeenCalledWith('run-review', 'sha-updated');
 		expect(runAsPullRequestOperator).toHaveBeenCalledWith(PROJECT, '42', expect.any(Function));
 		expect(rerunFailedChecks).toHaveBeenCalledWith(PROJECT, 'sha-updated', 'implementer');
+		expect(listMergeChecksWaits).toHaveBeenCalledWith(PROJECT.id, PROJECT.repo, 'sha-updated');
+		expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:42:sha-updated`);
+	});
+
+	it('keeps merge automation’s claim when a merge dispatch is still waiting on the head', async () => {
+		listMergeChecksWaits.mockResolvedValue([{ id: 'dispatch-merge' }]);
+
+		expect(await rerunUpdatedHeadOnce(input())).toBe('rerun-requested');
+		expect(rerunFailedChecks).toHaveBeenCalledOnce();
+		// The green re-run wakes that merge; the held claim drops the redundant Review.
+		expect(releaseReviewDispatch).not.toHaveBeenCalled();
+	});
+
+	it('releases the claim when the waiting merges cannot be read', async () => {
+		listMergeChecksWaits.mockRejectedValue(new Error('db down'));
+
+		expect(await rerunUpdatedHeadOnce(input())).toBe('rerun-requested');
 		expect(releaseReviewDispatch).toHaveBeenCalledWith(`${PROJECT.repo}:42:sha-updated`);
 	});
 

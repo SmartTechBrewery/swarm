@@ -1023,9 +1023,14 @@ head it reviewed (its own dispatching event's `headSha`), claims
 `runs.review_merge_checks_rerun_head_sha` for that head by a conditional update
 (one re-run per run and head; a later advance onto a fresh head gets its own),
 and re-runs them through `rerunFailedChecks` as the pull request's operator. An
-accepted re-run dispatches nothing and releases the claim above, so the re-run's
-own `checks completed` is decided — green continues on the green path (a waiting
-merge is woken, or the head is reviewed and merged) — and a red read inside
+accepted re-run dispatches nothing. What its green reaches turns on the claim
+above: while a merge dispatch still waits on the head (`listMergeChecksWaits`,
+read after the run-row claim) the claim stays, so the green wakes that merge and
+starts no redundant Review; when none waits it is released, so the green is
+reviewed and merged rather than dropped as a duplicate; and a merge that settles
+on the head without merging after the re-run was recorded releases its own claim
+(`releaseUpdatedHeadClaimAfterRerun`, owner-fenced, so a CI fix that already took
+it over keeps it). A red read inside
 `RERUN_SETTLE_MS` of it is re-read after `RERUN_SETTLE_RECHECK_DELAY_MS`. A red
 after the window, or a re-run that cannot be made (`unsupported`,
 `nothing-to-rerun`, `provider-error`, no operator), goes on to the take-over and

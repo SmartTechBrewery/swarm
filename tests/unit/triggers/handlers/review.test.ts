@@ -177,8 +177,16 @@ vi.mock('@/identity/pull-request-operator.js', async (importOriginal) => ({
 	...(await importOriginal<typeof import('@/identity/pull-request-operator.js')>()),
 	runAsPullRequestOperator,
 }));
-const { getActiveDispatchByRunId } = vi.hoisted(() => ({ getActiveDispatchByRunId: vi.fn() }));
-vi.mock('@/db/repositories/dispatchesRepository.js', () => ({ getActiveDispatchByRunId }));
+const { getActiveDispatchByRunId, listMergeChecksWaits } = vi.hoisted(() => ({
+	getActiveDispatchByRunId: vi.fn(),
+	// The merges waiting on a head's checks, read by the updated-head re-run
+	// (issue #1433) to decide whether merge automation keeps its claim. None by default.
+	listMergeChecksWaits: vi.fn(),
+}));
+vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
+	getActiveDispatchByRunId,
+	listMergeChecksWaits,
+}));
 
 // The `review` disposition reserves a durable safety-cap slot before
 // dispatching (issue #235); mock the ledger so these tests need no database.
@@ -286,6 +294,8 @@ beforeEach(() => {
 	);
 	getActiveDispatchByRunId.mockReset();
 	getActiveDispatchByRunId.mockResolvedValue(undefined);
+	listMergeChecksWaits.mockReset();
+	listMergeChecksWaits.mockResolvedValue([]);
 	reserveReviewVerdict.mockReset();
 	reserveReviewVerdict.mockResolvedValue({ status: 'reserved', id: 'v1', ordinal: 1 });
 	abandonReviewVerdictOwnedBy.mockReset();
@@ -4228,5 +4238,60 @@ describe('review trigger — red on an updated head is re-run once first (issue 
 
 		expect(findUpdatedHeadReviewRun).not.toHaveBeenCalled();
 		expect(rerunFailedChecks).not.toHaveBeenCalled();
+	});
+
+	/**
+	 * The PR+SHA slot as Redis would hold it: taken by merge automation's update
+	 * (`claimUpdatedHeadReviewSlot`), freed by a release, won by the next claim.
+	 */
+	function slotHeldByMergeAutomation() {
+		let held = true;
+		claimReviewDispatch.mockImplementation(async () => {
+			if (held) return false;
+			held = true;
+			return true;
+		});
+		releaseReviewDispatch.mockImplementation(async () => {
+			held = false;
+		});
+	}
+
+	const green = () =>
+		getAggregateCheckStatus.mockResolvedValue(
+			checkStatus([['backend-integration', 'completed', 'success']]),
+		);
+
+	it('green re-run on an updated head with a waiting merge wakes the merge and dispatches no Review', async () => {
+		slotHeldByMergeAutomation();
+		listMergeChecksWaits.mockResolvedValue([{ id: 'dispatch-merge' }]);
+
+		// Red: the re-run is requested, and the waiting merge keeps its claim.
+		expect(await handler.handle(autoCtx())).toBeNull();
+		expect(rerunFailedChecks).toHaveBeenCalledOnce();
+		expect(releaseReviewDispatch).not.toHaveBeenCalled();
+
+		// The re-run's green wakes that merge; the held claim drops the Review.
+		green();
+		expect(await handler.handle(autoCtx())).toBeNull();
+		expect(promoteMergeChecksWaits).toHaveBeenCalledWith(
+			AUTO_MERGE.id,
+			AUTO_MERGE.repo,
+			'merged-with-base',
+		);
+		expect(reserveReviewVerdict).not.toHaveBeenCalled();
+	});
+
+	it('green re-run after merge automation gave up gets a Review', async () => {
+		slotHeldByMergeAutomation();
+
+		expect(await handler.handle(autoCtx())).toBeNull();
+		expect(releaseReviewDispatch).toHaveBeenCalledExactlyOnceWith(KEY);
+
+		green();
+		expect(await handler.handle(autoCtx())).toMatchObject({
+			phase: 'review',
+			prNumber: '42',
+			headSha: 'merged-with-base',
+		});
 	});
 });

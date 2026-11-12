@@ -55,9 +55,14 @@ const findApprovedReviewRunForRearm = vi.fn(
 		_outcomes: readonly string[],
 	): Promise<{ id: string; taskId: string } | undefined> => undefined,
 );
+// Whether the updated head's one checks re-run was spent on a head (issue #1433).
+// Never by default.
+const hasUpdatedHeadChecksRerun = vi.fn(async (_runId: string, _headSha: string) => false);
 vi.mock('@/db/repositories/runsRepository.js', () => ({
 	findApprovedReviewRunForRearm: (key: unknown, outcomes: readonly string[]) =>
 		findApprovedReviewRunForRearm(key, outcomes),
+	hasUpdatedHeadChecksRerun: (runId: string, headSha: string) =>
+		hasUpdatedHeadChecksRerun(runId, headSha),
 	updateReviewMergeOutcome: (runId: string, input: unknown) =>
 		updateReviewMergeOutcome(runId, input),
 	markReviewRunSuperseded: (runId: string) => markReviewRunSuperseded(runId),
@@ -111,6 +116,7 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 // #874) is asserted through these rather than against a real connection.
 const claimReviewDispatch = vi.fn(async (_key: string, _trigger: string, _ctx: unknown) => true);
 const refreshMergeAutomationClaim = vi.fn(async (_key: string, _ttl: number) => {});
+const releaseReviewDispatchHeldBy = vi.fn(async (_key: string, _owner: string) => {});
 vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	buildReviewDispatchKey: (repo: string, prNumber: string, headSha: string) =>
 		`${repo}:${prNumber}:${headSha}`,
@@ -118,6 +124,8 @@ vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 		claimReviewDispatch(key, trigger, ctx),
 	MERGE_AUTOMATION_CLAIM_OWNER: 'merge-automation',
 	refreshMergeAutomationClaim: (key: string, ttl: number) => refreshMergeAutomationClaim(key, ttl),
+	releaseReviewDispatchHeldBy: (key: string, owner: string) =>
+		releaseReviewDispatchHeldBy(key, owner),
 }));
 
 // The real GitHub adapter over a stubbed Octokit (issue #1113), for the one case
@@ -314,6 +322,9 @@ beforeEach(() => {
 		mockDispatchRow({ state: 'retry-scheduled' }),
 	);
 	runAsPullRequestOperator.mockClear();
+	hasUpdatedHeadChecksRerun.mockReset();
+	hasUpdatedHeadChecksRerun.mockResolvedValue(false);
+	releaseReviewDispatchHeldBy.mockClear();
 });
 
 /** The stale-base answer the merge capability gives for a head behind its base. */
@@ -1850,6 +1861,111 @@ describe("processMergeAutomationDispatch: waits for a head's pending checks past
 		});
 
 		expect(refreshMergeAutomationClaim).not.toHaveBeenCalled();
+	});
+});
+
+describe("processMergeAutomationDispatch: releasing an updated head's claim after its re-run (issue #1433)", () => {
+	const UPDATED = 'merged-with-base';
+	const advanced: MergeAutomationJob = { ...job, approvedHeadSha: UPDATED, baseUpdates: 1 };
+	const CLAIM_KEY = `${project.repo}:17:${UPDATED}`;
+
+	it('releases its own claim when it refuses a red updated head whose re-run was requested', async () => {
+		hasUpdatedHeadChecksRerun.mockResolvedValue(true);
+
+		await processMergeAutomationDispatch(mockDispatchRow(), advanced, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest: vi.fn(async () => 1),
+		});
+
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(hasUpdatedHeadChecksRerun).toHaveBeenCalledExactlyOnceWith('run-1', UPDATED);
+		// Owner-fenced: a CI fix that already took the claim over keeps it (#1430).
+		expect(releaseReviewDispatchHeldBy).toHaveBeenCalledExactlyOnceWith(
+			CLAIM_KEY,
+			'merge-automation',
+		);
+	});
+
+	it('releases its own claim when the pending wait runs out on a head whose re-run was requested', async () => {
+		hasUpdatedHeadChecksRerun.mockResolvedValue(true);
+
+		await processMergeAutomationDispatch(
+			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
+			{
+				...advanced,
+				checksPendingSince: {
+					headSha: UPDATED,
+					at: new Date(Date.now() - MAX_PENDING_CHECKS_WAIT_MS - 60_000).toISOString(),
+				},
+			},
+			project,
+			{
+				getAggregateCheckStatus: vi.fn(
+					async (): Promise<AggregateCheckStatus> => ({
+						totalCount: 1,
+						checkRuns: [{ name: 'build', status: 'in_progress', conclusion: null }],
+					}),
+				),
+			},
+		);
+
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-retry-exhausted');
+		expect(releaseReviewDispatchHeldBy).toHaveBeenCalledExactlyOnceWith(
+			CLAIM_KEY,
+			'merge-automation',
+		);
+	});
+
+	it('keeps its claim on a red updated head whose re-run was never requested', async () => {
+		await processMergeAutomationDispatch(mockDispatchRow(), advanced, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest: vi.fn(async () => 1),
+		});
+
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(releaseReviewDispatchHeldBy).not.toHaveBeenCalled();
+	});
+
+	it('keeps its claim when the re-run cannot be read', async () => {
+		hasUpdatedHeadChecksRerun.mockRejectedValue(new Error('db down'));
+
+		await processMergeAutomationDispatch(mockDispatchRow(), advanced, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest: vi.fn(async () => 1),
+		});
+
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(releaseReviewDispatchHeldBy).not.toHaveBeenCalled();
+	});
+
+	it('neither reads nor releases when it merges the updated head', async () => {
+		hasUpdatedHeadChecksRerun.mockResolvedValue(true);
+
+		await processMergeAutomationDispatch(mockDispatchRow(), advanced, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('success'),
+		});
+
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
+		expect(hasUpdatedHeadChecksRerun).not.toHaveBeenCalled();
+		expect(releaseReviewDispatchHeldBy).not.toHaveBeenCalled();
+	});
+
+	it('never touches a claim for the approved head itself', async () => {
+		hasUpdatedHeadChecksRerun.mockResolvedValue(true);
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest: vi.fn(async () => 1),
+		});
+
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(hasUpdatedHeadChecksRerun).not.toHaveBeenCalled();
+		expect(releaseReviewDispatchHeldBy).not.toHaveBeenCalled();
 	});
 });
 

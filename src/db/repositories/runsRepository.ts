@@ -2042,6 +2042,21 @@ export async function claimUpdatedHeadChecksRerun(
 }
 
 /**
+ * Whether this Review run's one updated-head re-run (issue #1433,
+ * {@link claimUpdatedHeadChecksRerun}) was spent on `headSha` — what merge
+ * automation reads when it settles on that head without merging, to release the
+ * claim it kept for the re-run's green.
+ */
+export async function hasUpdatedHeadChecksRerun(runId: string, headSha: string): Promise<boolean> {
+	const rows = await getDb()
+		.select({ id: runs.id })
+		.from(runs)
+		.where(and(eq(runs.id, runId), eq(runs.reviewMergeChecksRerunHeadSha, headSha)))
+		.limit(1);
+	return rows.length > 0;
+}
+
+/**
  * Stamp a Review run's approval as superseded by a head change (issue #1079) —
  * the run-row copy of the ledger's `markReviewVerdictSuperseded`, written by the
  * same merge-dispatch branch (`src/worker/merge-automation.ts`) so the runs list

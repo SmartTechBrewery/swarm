@@ -45,6 +45,7 @@ import {
 	hasLiveRunForTask,
 	hasResumableDeferredRun,
 	hasRunForTask,
+	hasUpdatedHeadChecksRerun,
 	type ListRunsFilter,
 	listResolveProblemAttempts,
 	listRunPassedOverWorkerIds,
@@ -3660,6 +3661,16 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 
 			expect(await claimUpdatedHeadChecksRerun(id, 'sha-other')).toBe(false);
 			expect((await findUpdatedHeadReviewRun(key))?.checksRerunHeadSha).toBeNull();
+		});
+
+		it('answers whether the re-run was spent on a head', async () => {
+			const id = await updatedRun();
+			expect(await hasUpdatedHeadChecksRerun(id, 'sha-updated')).toBe(false);
+
+			await claimUpdatedHeadChecksRerun(id, 'sha-updated');
+
+			expect(await hasUpdatedHeadChecksRerun(id, 'sha-updated')).toBe(true);
+			expect(await hasUpdatedHeadChecksRerun(id, 'sha-other')).toBe(false);
 		});
 
 		it('clears the re-run with the rest of the merge state when the run is retried', async () => {

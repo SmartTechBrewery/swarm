@@ -161,6 +161,7 @@ import {
 import { markReviewVerdictSuperseded } from '../db/repositories/reviewVerdictsRepository.js';
 import {
 	findApprovedReviewRunForRearm,
+	hasUpdatedHeadChecksRerun,
 	markReviewRunSuperseded,
 	updateReviewMergeOutcome,
 } from '../db/repositories/runsRepository.js';
@@ -213,6 +214,7 @@ import {
 	claimReviewDispatch,
 	MERGE_AUTOMATION_CLAIM_OWNER,
 	refreshMergeAutomationClaim,
+	releaseReviewDispatchHeldBy,
 } from '../triggers/review-dispatch-dedup.js';
 
 /**
@@ -967,7 +969,42 @@ async function settleMergeDispatch(
 	outcome: DispatchOutcome,
 ): Promise<void> {
 	await completeDispatch(dispatch.id, outcome);
+	if (outcome !== 'merged') await releaseUpdatedHeadClaimAfterRerun(job, project);
 	await promoteMergeQueueWaits(project.id, job.repo);
+}
+
+/**
+ * Give up this dispatch's PR+SHA claim on a head it brought up to date once it
+ * settles there without merging, **when that head's one checks re-run was
+ * requested** (issue #1433, `rerunUpdatedHeadOnce`). The re-run keeps the claim
+ * while this dispatch still waits on the head, so the re-run's green wakes the
+ * merge rather than starting a redundant Review; once this dispatch has given up
+ * (a red read before the re-run registered, or the pending wait running out) that
+ * green must be decided instead — reviewed and merged — and the claim would drop
+ * it as a duplicate. Owner-fenced, so a CI fix that already took the claim over
+ * (issue #1430) keeps it. Best-effort: a failed read keeps the claim, which the
+ * lease still reaps.
+ */
+async function releaseUpdatedHeadClaimAfterRerun(
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+): Promise<void> {
+	if (baseUpdatesSpent(job) === 0) return;
+	try {
+		if (!(await hasUpdatedHeadChecksRerun(job.reviewRunId, job.approvedHeadSha))) return;
+	} catch (err) {
+		logger.warn('Merge automation: could not read the updated head re-run — keeping its claim', {
+			runId: job.reviewRunId,
+			prNumber: job.prNumber,
+			headSha: job.approvedHeadSha,
+			error: describeError(err),
+		});
+		return;
+	}
+	await releaseReviewDispatchHeldBy(
+		buildReviewDispatchKey(project.repo, job.prNumber, job.approvedHeadSha),
+		MERGE_AUTOMATION_CLAIM_OWNER,
+	);
 }
 
 /**
