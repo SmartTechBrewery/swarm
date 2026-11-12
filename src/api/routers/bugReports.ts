@@ -2,7 +2,7 @@
  * The `bugReports` router (issue #1383) — SWARM's own bug-report store
  * (`../bug-reports.ts` for the statuses and rules, `bugReportsRepository.ts` for the
  * tables). The operator MCP server's five bug-report tools wrap these procedures
- * (`src/mcp/tools/bug-reports.ts`); the dashboard's Issues tab (phase 2) reads them.
+ * (`src/mcp/tools/bug-reports.ts`); the dashboard's bug reports page (`/bug-reports`) reads them and changes statuses through `setStatus`.
  *
  * **Authorization is `../authz.ts`'s alone**, as for every project-scoped procedure:
  *

@@ -1,6 +1,7 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router';
 import {
+	Bug,
 	CircleCheck,
 	CircleDashed,
 	CircleX,
@@ -15,6 +16,7 @@ import {
 import { useState } from 'react';
 import { ProjectCreateDialog } from '@/components/projects/project-create-dialog.js';
 import { logout } from '@/lib/auth.js';
+import { BUG_REPORTS_PATH } from '@/lib/bug-reports-nav.js';
 import { canViewInstanceWide } from '@/lib/instance-admin.js';
 import { trpc } from '@/lib/trpc.js';
 import { useCurrentUser } from '@/lib/use-current-user.js';
@@ -35,6 +37,13 @@ const CONNECTION_STATE_META = {
 		iconClassName: 'h-3.5 w-3.5 text-zinc-500',
 	},
 } as const;
+
+/** A nav entry's classes, highlighted while its page is open. */
+function navItemClass(active: boolean): string {
+	return active
+		? 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium bg-zinc-800/40 text-zinc-100'
+		: 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/40';
+}
 
 export function Sidebar() {
 	const currentPath = useRouterState({ select: (s) => s.location.pathname });
@@ -82,14 +91,7 @@ export function Sidebar() {
 					    is bounded server-side to the reader's own projects, so a member
 					    reaching it here sees their work across every project rather than
 					    one project at a time. */}
-					<Link
-						to="/runs"
-						className={
-							currentPath.startsWith('/runs')
-								? 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium bg-zinc-800/40 text-zinc-100'
-								: 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/40'
-						}
-					>
+					<Link to="/runs" className={navItemClass(currentPath.startsWith('/runs'))}>
 						<Play className="h-4 w-4" />
 						Runs
 					</Link>
@@ -98,14 +100,7 @@ export function Sidebar() {
 					    instance administrator (issue #647) — a worker owner reaches their
 					    own machines, scoped, through their project links below. */}
 					{canViewInstanceWide(currentUser.data) && (
-						<Link
-							to="/workers"
-							className={
-								currentPath.startsWith('/workers')
-									? 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium bg-zinc-800/40 text-zinc-100'
-									: 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/40'
-							}
-						>
+						<Link to="/workers" className={navItemClass(currentPath.startsWith('/workers'))}>
 							<Server className="h-4 w-4" />
 							Workers
 						</Link>
@@ -136,11 +131,7 @@ export function Sidebar() {
 									key={project.id}
 									to="/projects/$projectId"
 									params={{ projectId: project.id }}
-									className={
-										currentPath === `/projects/${project.id}`
-											? 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium bg-zinc-800/40 text-zinc-100'
-											: 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/40'
-									}
+									className={navItemClass(currentPath === `/projects/${project.id}`)}
 								>
 									<FolderGit2 className="h-4 w-4 shrink-0 text-zinc-400" />
 									<span className="truncate">{project.name}</span>
@@ -161,16 +152,20 @@ export function Sidebar() {
 					<div className="px-3 pt-4 pb-1 text-[10px] font-semibold uppercase tracking-widest text-zinc-500">
 						General
 					</div>
-					<Link
-						to="/settings"
-						className={
-							currentPath.startsWith('/settings')
-								? 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium bg-zinc-800/40 text-zinc-100'
-								: 'flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800/40'
-						}
-					>
+					<Link to="/settings" className={navItemClass(currentPath.startsWith('/settings'))}>
 						<Settings className="h-4 w-4" />
 						Settings
+					</Link>
+					{/* SWARM's own bug reports, directly below Settings (issue #1443) — once a
+					    tab inside the settings page (issue #1390). Offered to everyone:
+					    `bugReports.list` scopes what it lists to the reader's own projects,
+					    plus installation-wide reports for an instance administrator. */}
+					<Link
+						to={BUG_REPORTS_PATH}
+						className={navItemClass(currentPath.startsWith(BUG_REPORTS_PATH))}
+					>
+						<Bug className="h-4 w-4" />
+						Bug reports
 					</Link>
 
 					{/* CLI Quota is deliberately not linked here (issue #1229): the page is

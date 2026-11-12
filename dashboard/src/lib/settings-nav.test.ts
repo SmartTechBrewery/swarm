@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-	bugReportSearch,
+	legacyBugReportsRedirect,
 	resolveActiveSettingsTab,
 	settingsSearchSchema,
 	settingsTabNeedsAppSettings,
@@ -28,7 +28,8 @@ describe('settingsSearchSchema', () => {
 		expect(settingsSearchSchema.parse({ tab: 'agents', extra: 'x' })).toEqual({ tab: 'agents' });
 	});
 
-	it('parses the bug report the Issues tab shows (issue #1390)', () => {
+	// The bug reports' old home (issue #1390), kept parseable so its links redirect (issue #1443).
+	it('parses a legacy Issues-tab link with its report', () => {
 		const report = '00000000-0000-4000-8000-000000000001';
 		expect(settingsSearchSchema.parse({ tab: 'issues', report })).toEqual({
 			tab: 'issues',
@@ -51,17 +52,16 @@ describe('visibleSettingsTabs', () => {
 			'credentials',
 			'users',
 			'fleet',
-			'issues',
 			'appearance',
 		]);
 	});
 
 	it('hides Agent Defaults, Credentials, Users and Fleet from a non-administrator', () => {
-		expect(visibleSettingsTabs(NON_ADMIN)).toEqual(['issues', 'appearance']);
+		expect(visibleSettingsTabs(NON_ADMIN)).toEqual(['appearance']);
 	});
 
 	it('treats an unresolved viewer as a non-administrator', () => {
-		expect(visibleSettingsTabs(undefined)).toEqual(['issues', 'appearance']);
+		expect(visibleSettingsTabs(undefined)).toEqual(['appearance']);
 	});
 });
 
@@ -116,10 +116,10 @@ describe('resolveActiveSettingsTab', () => {
 		expect(resolveActiveSettingsTab({ tab: 'fleet' }, ADMIN)).toBe('fleet');
 	});
 
-	// Every signed-in user sees Issues; `bugReports.list` scopes what it lists (issue #1390).
-	it('honors ?tab=issues for a non-administrator, not degrading it to the fallback', () => {
-		expect(resolveActiveSettingsTab({ tab: 'issues' }, NON_ADMIN)).toBe('issues');
-		expect(resolveActiveSettingsTab({ tab: 'issues' }, ADMIN)).toBe('issues');
+	// Issues is no longer a tab (issue #1443); the route redirects it before this is asked.
+	it('renders no Issues tab for a legacy ?tab=issues', () => {
+		expect(resolveActiveSettingsTab({ tab: 'issues' }, NON_ADMIN)).toBe('appearance');
+		expect(resolveActiveSettingsTab({ tab: 'issues' }, ADMIN)).toBe('appearance');
 	});
 
 	it('treats an unresolved viewer as a non-administrator, so the section never flashes', () => {
@@ -135,7 +135,6 @@ describe('settingsTabNeedsAppSettings', () => {
 		expect(settingsTabNeedsAppSettings('appearance')).toBe(true);
 		expect(settingsTabNeedsAppSettings('credentials')).toBe(false);
 		expect(settingsTabNeedsAppSettings('users')).toBe(false);
-		expect(settingsTabNeedsAppSettings('issues')).toBe(false);
 	});
 });
 
@@ -145,9 +144,18 @@ describe('settingsTabSearch', () => {
 	});
 });
 
-describe('bugReportSearch', () => {
-	it('opens a report on the Issues tab, or returns to its list', () => {
-		expect(bugReportSearch('r1')).toEqual({ tab: 'issues', report: 'r1' });
-		expect(bugReportSearch(undefined)).toEqual({ tab: 'issues' });
+describe('legacyBugReportsRedirect', () => {
+	const report = '00000000-0000-4000-8000-000000000001';
+
+	it('sends a legacy Issues-tab link to the bug reports, keeping its report (issue #1443)', () => {
+		expect(legacyBugReportsRedirect(settingsSearchSchema.parse({ tab: 'issues' }))).toEqual({});
+		expect(legacyBugReportsRedirect(settingsSearchSchema.parse({ tab: 'issues', report }))).toEqual(
+			{ report },
+		);
+	});
+
+	it('leaves every other settings link alone', () => {
+		expect(legacyBugReportsRedirect({})).toBeUndefined();
+		expect(legacyBugReportsRedirect({ tab: 'appearance', report })).toBeUndefined();
 	});
 });
