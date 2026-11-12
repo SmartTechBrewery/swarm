@@ -174,11 +174,18 @@ async function listLatestWorkflowRuns(client: Octokit, owner: string, repo: stri
 }
 
 /**
- * Run conclusions a re-run of failed jobs can turn green — the failures of
- * `FAILURE_CONCLUSIONS` in `src/triggers/handlers/aggregate-check-decision.ts`,
- * less `action_required`, which is an approval gate rather than a failed job.
+ * Run conclusions a re-run of failed jobs can turn green — the non-passing
+ * conclusions of `src/triggers/handlers/aggregate-check-decision.ts` a job can
+ * actually be re-run from: a failed or timed-out job, and a `cancelled` one (a
+ * job that hit its `timeout-minutes` reports `cancelled`, issue #1429), which
+ * `rerun-failed-jobs` re-runs too. Not `action_required`, which is an approval
+ * gate rather than a failed job.
  */
-const RERUNNABLE_RUN_CONCLUSIONS: ReadonlySet<string> = new Set(['failure', 'timed_out']);
+const RERUNNABLE_RUN_CONCLUSIONS: ReadonlySet<string> = new Set([
+	'failure',
+	'timed_out',
+	'cancelled',
+]);
 
 /**
  * Re-run the failed jobs of every failed workflow run on `ref`

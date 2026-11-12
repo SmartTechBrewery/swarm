@@ -3,7 +3,7 @@
  * webhook ingress (`./webhook.ts`, phase 2/4) and the aggregate check read
  * (phase 3/4). Both a normalized event's `checkConclusion` and an API read's
  * conclusion end up in the *same* exact-match consumers — the queue read model
- * keys on `failure` (`src/queue/queued-runs.ts`) and
+ * keys on its red conclusions (`src/queue/queued-runs.ts`) and
  * `src/triggers/handlers/aggregate-check-decision.ts` classifies the rest — so a
  * second spelling of a status would split one pipeline into two answers. This is
  * the role `../bitbucket/commits.ts` plays for Bitbucket's build states.

@@ -299,9 +299,11 @@ interface GitLabPipeline {
 }
 
 /**
- * Retry every failed pipeline on `sha` (`POST /projects/:id/pipelines/:id/retry`,
- * which re-runs a pipeline's failed and canceled jobs), returning a name for each
- * pipeline GitLab accepted the retry of — empty when none failed.
+ * Retry every failed or canceled pipeline on `sha` (`POST
+ * /projects/:id/pipelines/:id/retry`, which re-runs a pipeline's failed and
+ * canceled jobs), returning a name for each pipeline GitLab accepted the retry of
+ * — empty when none failed. A canceled pipeline is a red head to the aggregate
+ * decision (issue #1429), so it is retried like a failed one.
  *
  * Only the **newest pipeline per `ref`** is considered — the listing is newest
  * first — on the rule `getGitLabCommitStatuses` applies when it keeps the newest
@@ -311,6 +313,8 @@ interface GitLabPipeline {
  * appears here. Throws on the first refusal; pipelines already accepted before it
  * stay accepted.
  */
+const RETRYABLE_PIPELINE_STATUSES: ReadonlySet<string> = new Set(['failed', 'canceled']);
+
 export async function retryFailedGitLabPipelines(repo: string, sha: string): Promise<string[]> {
 	const pipelines = await paginateGitLab<GitLabPipeline>(
 		`${projectPath(repo)}/pipelines?${new URLSearchParams({ sha })}`,
@@ -324,7 +328,8 @@ export async function retryFailedGitLabPipelines(repo: string, sha: string): Pro
 
 	const retried: string[] = [];
 	for (const pipeline of latestByRef.values()) {
-		if (pipeline.status !== 'failed' || pipeline.id === undefined) continue;
+		if (!RETRYABLE_PIPELINE_STATUSES.has(pipeline.status ?? '') || pipeline.id === undefined)
+			continue;
 		await gitlabRequest<unknown>('POST', `${projectPath(repo)}/pipelines/${pipeline.id}/retry`);
 		retried.push(
 			pipeline.name || `pipeline #${pipeline.id}${pipeline.ref ? ` (${pipeline.ref})` : ''}`,
