@@ -1,9 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import type { ActiveDispatchTaskRef } from '@/db/repositories/dispatchesRepository.js';
-import type { TaskActivityRow } from '@/db/repositories/runsRepository.js';
+import type {
+	TaskActivityRow,
+	WipResolveProblemAttemptRow,
+} from '@/db/repositories/runsRepository.js';
 import type { WipSlotRow } from '@/db/repositories/wipSlotsRepository.js';
 import { ITEM_STALL_AFTER_MS, type ItemLivenessPolicy } from '@/dispatch/item-liveness.js';
-import { toWipUsage, type WipUsageInput } from '@/queue/wip-usage.js';
+import {
+	resolveProblemDedupKey,
+	resolveProblemTicketDedupKey,
+} from '@/dispatch/resolve-problem-keys.js';
+import {
+	foldResolveProblemAttempts,
+	resolveProblemAttemptHolders,
+	toWipUsage,
+	type WipResolveProblemAttempts,
+	type WipUsageInput,
+} from '@/queue/wip-usage.js';
 
 const NOW = new Date('2026-10-29T12:00:00.000Z');
 /** Comfortably past the grace window, so a holder is judged on its hand-offs alone. */
@@ -490,5 +503,166 @@ describe('toWipUsage', () => {
 			activity: [makeActivity({ repository: 'acme/other', liveRunCount: 1 })],
 		});
 		expect(ticket.state).not.toBe('running');
+	});
+});
+
+describe('foldResolveProblemAttempts', () => {
+	const AFTER_SLOT = new Date(LONG_AGO.getTime() + 60_000);
+	const LATER = new Date(LONG_AGO.getTime() + 120_000);
+
+	function makeAttempt(
+		overrides: Partial<WipResolveProblemAttemptRow> = {},
+	): WipResolveProblemAttemptRow {
+		return {
+			id: 'attempt-1',
+			projectId: 'p1',
+			repository: REPO,
+			taskId: '103',
+			resolvesRunId: 'run-1',
+			status: 'running',
+			error: null,
+			startedAt: AFTER_SLOT,
+			completedAt: null,
+			...overrides,
+		};
+	}
+
+	/** A failed holder whose latest run is `run-1`. */
+	const failedHolder = () =>
+		usage({ slots: [makeSlot()], activity: [makeActivity({ status: 'failed' })] });
+	/** A stalled holder that never ran. */
+	const neverRanHolder = () => usage({ slots: [makeSlot()] });
+
+	function folded(
+		entries: ReturnType<typeof usage>,
+		attempts: Partial<WipResolveProblemAttempts> = {},
+	) {
+		const ticket = foldResolveProblemAttempts(entries, { runs: [], queued: [], ...attempts })[0]
+			?.tickets[0];
+		if (!ticket) throw new Error('unreachable');
+		return ticket;
+	}
+
+	it('names a waiting holder by its latest run, or by its slot when it never ran', () => {
+		const ran = resolveProblemAttemptHolders(failedHolder());
+		expect(ran).toEqual({
+			anchorRunIds: ['run-1'],
+			tickets: [],
+			dedupKeys: [resolveProblemDedupKey('run-1')],
+		});
+		const never = resolveProblemAttemptHolders(neverRanHolder());
+		expect(never.anchorRunIds).toEqual([]);
+		expect(never.tickets).toEqual([
+			{ projectId: 'p1', repository: REPO, taskId: '103', since: LONG_AGO },
+		]);
+		expect(never.dedupKeys).toEqual([
+			resolveProblemTicketDedupKey({
+				projectId: 'p1',
+				repository: REPO,
+				taskId: '103',
+				slotOpenedAt: LONG_AGO.toISOString(),
+			}),
+		]);
+	});
+
+	it('names no holder that is not waiting on the operator', () => {
+		const entries = usage({
+			slots: [makeSlot()],
+			activity: [makeActivity({ liveRunCount: 1, status: 'running' })],
+		});
+		expect(resolveProblemAttemptHolders(entries).dedupKeys).toEqual([]);
+	});
+
+	it('maps each run status onto what the attempt concluded', () => {
+		expect(folded(failedHolder(), { runs: [makeAttempt()] }).resolveProblem).toEqual({
+			runId: 'attempt-1',
+			state: 'running',
+			at: AFTER_SLOT.toISOString(),
+		});
+		expect(
+			folded(failedHolder(), {
+				runs: [makeAttempt({ status: 'completed', completedAt: LATER })],
+			}).resolveProblem,
+		).toEqual({ runId: 'attempt-1', state: 'resolved', at: LATER.toISOString() });
+		expect(
+			folded(failedHolder(), {
+				runs: [
+					makeAttempt({
+						status: 'failed',
+						completedAt: LATER,
+						error:
+							'Resolve problem could not resolve the stuck ticket: nope. Tried: no recovery action.',
+					}),
+				],
+			}).resolveProblem,
+		).toEqual({
+			runId: 'attempt-1',
+			state: 'unresolved',
+			message:
+				'Resolve problem could not resolve the stuck ticket: nope. Tried: no recovery action.',
+			at: LATER.toISOString(),
+		});
+		expect(
+			folded(failedHolder(), { runs: [makeAttempt({ status: 'deferred' })] }).resolveProblem?.state,
+		).toBe('queued');
+	});
+
+	it('reads a queued dispatch with no run yet as queued', () => {
+		const ticket = folded(failedHolder(), {
+			queued: [{ dedupKey: resolveProblemDedupKey('run-1'), createdAt: AFTER_SLOT }],
+		});
+		expect(ticket.resolveProblem).toEqual({ state: 'queued', at: AFTER_SLOT.toISOString() });
+		// A dispatch under another situation's key is not this holder's.
+		expect(
+			folded(failedHolder(), {
+				queued: [{ dedupKey: resolveProblemDedupKey('run-0'), createdAt: AFTER_SLOT }],
+			}).resolveProblem,
+		).toBeUndefined();
+	});
+
+	it('picks the newest attempt on the situation', () => {
+		const ticket = folded(failedHolder(), {
+			runs: [
+				makeAttempt({ id: 'older', status: 'failed', completedAt: AFTER_SLOT }),
+				makeAttempt({ id: 'newer', startedAt: LATER }),
+			],
+		});
+		expect(ticket.resolveProblem).toMatchObject({ runId: 'newer', state: 'running' });
+	});
+
+	it('ignores an attempt anchored to a previous latest run', () => {
+		const ticket = folded(failedHolder(), {
+			runs: [makeAttempt({ resolvesRunId: 'run-0', status: 'completed' })],
+		});
+		expect(ticket.resolveProblem).toBeUndefined();
+	});
+
+	it('matches an unanchored attempt on a never-ran holder only inside its current slot', () => {
+		const current = makeAttempt({ resolvesRunId: null, status: 'completed', completedAt: LATER });
+		expect(folded(neverRanHolder(), { runs: [current] }).resolveProblem).toMatchObject({
+			state: 'resolved',
+		});
+		const previousSlot = makeAttempt({
+			resolvesRunId: null,
+			startedAt: new Date(LONG_AGO.getTime() - 60_000),
+		});
+		expect(folded(neverRanHolder(), { runs: [previousSlot] }).resolveProblem).toBeUndefined();
+		const otherTask = makeAttempt({ resolvesRunId: null, taskId: '104' });
+		expect(folded(neverRanHolder(), { runs: [otherTask] }).resolveProblem).toBeUndefined();
+		// An anchored attempt is not a never-ran holder's, even on its own task.
+		expect(folded(neverRanHolder(), { runs: [makeAttempt()] }).resolveProblem).toBeUndefined();
+	});
+
+	it('leaves holders that are not waiting on the operator without the field', () => {
+		const entries = usage({
+			slots: [makeSlot()],
+			activity: [makeActivity({ liveRunCount: 1, status: 'running' })],
+		});
+		const ticket = folded(entries, {
+			runs: [makeAttempt()],
+			queued: [{ dedupKey: resolveProblemDedupKey('run-1'), createdAt: AFTER_SLOT }],
+		});
+		expect(ticket.state).toBe('running');
+		expect(ticket.resolveProblem).toBeUndefined();
 	});
 });

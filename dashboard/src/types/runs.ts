@@ -308,6 +308,10 @@ export type WipOperatorReason = z.infer<typeof wipOperatorReasonSchema>;
 export const wipPipelineReasonSchema = z.enum(['waiting-for-checks']);
 export type WipPipelineReason = z.infer<typeof wipPipelineReasonSchema>;
 
+/** Mirrors `WipResolveProblemStateSchema` (`src/queue/wip-usage.ts`, issue #1428). */
+export const wipResolveProblemStateSchema = z.enum(['queued', 'running', 'resolved', 'unresolved']);
+export type WipResolveProblemState = z.infer<typeof wipResolveProblemStateSchema>;
+
 /**
  * Mirrors the server `runs.wip` contract (`WipUsageEntrySchema`,
  * `src/queue/wip-usage.ts`, issue #1192) — one repository's WIP limit in use and the
@@ -338,6 +342,20 @@ export const wipUsageEntrySchema = z.object({
 			prNumber: z.string().optional(),
 			prUrl: z.string().optional(),
 			lastActivityAt: z.string().optional(),
+			/** The latest run in the deciding unit, when there is one (issue #1425). */
+			latestRunId: z.string().optional(),
+			/**
+			 * `waiting-on-operator` only: the Resolve problem attempt on the holder's
+			 * current situation, when one exists (issue #1428).
+			 */
+			resolveProblem: z
+				.object({
+					runId: z.string().optional(),
+					state: wipResolveProblemStateSchema,
+					message: z.string().optional(),
+					at: z.string(),
+				})
+				.optional(),
 		}),
 	),
 });
@@ -769,7 +787,8 @@ export interface RunRow {
 	/** Evidence-based terminal diagnosis; null for ordinary and historical runs. */
 	failureDiagnosis: FailureDiagnosis | null;
 	/**
-	 * The failed run this Resolve problem run is an attempt for (issue #1395) — the
+	 * The failed run this Resolve problem run is an attempt for (issue #1395), or a
+	 * ticket attempt's anchor — the ticket's latest run (issue #1425) — the
 	 * `runs.resolves_run_id` column. Null for every other run.
 	 */
 	resolvesRunId?: string | null;
@@ -778,6 +797,20 @@ export interface RunRow {
 	 * Returned by `runs.getById` only.
 	 */
 	resolveProblemAttempts?: ResolveProblemAttempt[];
+	/**
+	 * The stuck ticket a ticket-targeted Resolve problem run is about (issue #1428),
+	 * from its own stored job. Null for every other run; returned by `runs.getById`
+	 * only.
+	 */
+	resolveProblemTicket?: ResolveProblemTicketSubject | null;
+}
+
+/** Mirrors the server `ResolveProblemTicketSubject` (`src/api/routers/runs.ts`). */
+export interface ResolveProblemTicketSubject {
+	taskId: string;
+	reason: 'stalled';
+	/** ISO 8601 — when the ticket's slot opened. */
+	slotOpenedAt: string;
 }
 
 /** Mirrors the server `ResolveProblemAttempt` (`src/db/repositories/runsRepository.ts`). */

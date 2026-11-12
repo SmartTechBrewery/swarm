@@ -48,6 +48,7 @@ import {
 	hasUpdatedHeadChecksRerun,
 	type ListRunsFilter,
 	listResolveProblemAttempts,
+	listResolveProblemAttemptsForHolders,
 	listRunPassedOverWorkerIds,
 	listRunsFromDb,
 	listSnapshotRunsForProject,
@@ -4133,6 +4134,99 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 				runId: failed,
 				liveRunCount: 0,
 			});
+		});
+	});
+
+	describe('listResolveProblemAttemptsForHolders (issue #1428)', () => {
+		it('answers no holders without a query', async () => {
+			expect(await listResolveProblemAttemptsForHolders({ anchorRunIds: [], tickets: [] })).toEqual(
+				[],
+			);
+		});
+
+		it('reads the attempts anchored to a holder’s latest run', async () => {
+			const anchor = await createRun({ projectId: PROJECT_ID, taskId: '42', phase: 'review' });
+			const other = await createRun({ projectId: PROJECT_ID, taskId: '43', phase: 'review' });
+			const attempt = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '42',
+				phase: 'resolve-problem',
+				resolvesRunId: anchor,
+			});
+			await completeRun(attempt, { status: 'failed', error: 'could not resolve' });
+			await createRun({
+				projectId: PROJECT_ID,
+				taskId: '43',
+				phase: 'resolve-problem',
+				resolvesRunId: other,
+			});
+
+			const rows = await listResolveProblemAttemptsForHolders({
+				anchorRunIds: [anchor],
+				tickets: [],
+			});
+			expect(rows).toHaveLength(1);
+			expect(rows[0]).toMatchObject({
+				id: attempt,
+				projectId: PROJECT_ID,
+				repository: REPO,
+				taskId: '42',
+				resolvesRunId: anchor,
+				status: 'failed',
+				error: 'could not resolve',
+			});
+		});
+
+		it('reads an unanchored attempt on a never-ran holder only inside its slot', async () => {
+			const slotOpenedAt = new Date('2026-11-12T08:00:00.000Z');
+			const inside = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '50',
+				phase: 'resolve-problem',
+			});
+			const before = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '50',
+				phase: 'resolve-problem',
+			});
+			const otherRepo = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '50',
+				phase: 'resolve-problem',
+				repository: OTHER_REPO,
+			});
+			// Ticket work on the same task is not an attempt.
+			const work = await createRun({ projectId: PROJECT_ID, taskId: '50', phase: 'planning' });
+			await getDb()
+				.update(runs)
+				.set({ startedAt: new Date(slotOpenedAt.getTime() + 60_000) })
+				.where(inArray(runs.id, [inside, otherRepo, work]));
+			await getDb()
+				.update(runs)
+				.set({ startedAt: new Date(slotOpenedAt.getTime() - 60_000) })
+				.where(eq(runs.id, before));
+
+			const rows = await listResolveProblemAttemptsForHolders({
+				anchorRunIds: [],
+				tickets: [{ projectId: PROJECT_ID, repository: REPO, taskId: '50', since: slotOpenedAt }],
+			});
+			expect(rows.map((row) => row.id)).toEqual([inside]);
+			expect(rows[0]?.resolvesRunId).toBeNull();
+		});
+
+		it('leaves an anchored attempt out of a never-ran holder’s read', async () => {
+			const anchor = await createRun({ projectId: PROJECT_ID, taskId: '60', phase: 'review' });
+			await createRun({
+				projectId: PROJECT_ID,
+				taskId: '60',
+				phase: 'resolve-problem',
+				resolvesRunId: anchor,
+			});
+			const rows = await listResolveProblemAttemptsForHolders({
+				anchorRunIds: [],
+				tickets: [{ projectId: PROJECT_ID, repository: REPO, taskId: '60', since: new Date(0) }],
+			});
+			expect(rows).toEqual([]);
 		});
 	});
 });

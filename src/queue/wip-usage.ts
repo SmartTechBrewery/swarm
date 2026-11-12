@@ -63,14 +63,27 @@
  * 6. Liveness `stalled` → `waiting-on-operator` (`stalled`).
  * 7. Anything else (`handed-off`, `settling`, `merged`) → `waiting-on-pipeline`.
  *
+ * A `waiting-on-operator` holder also says whether Resolve problem has taken it on
+ * (issue #1428): {@link foldResolveProblemAttempts} folds the attempt on its current
+ * situation onto the classified entries. It runs after the classification, not
+ * inside it, because which attempts belong to a holder depends on what the
+ * classification decided — its state and its latest run — and an attempt is never
+ * ticket activity, so it cannot change that verdict.
+ *
  * Operator dismissals are deliberately **not** folded in: a dismissal hides a unit
  * from the Stalled view, but a ticket still holding a slot still blocks its
  * repository, and freeing that slot is exactly what the operator is needed for.
  */
 
 import { z } from 'zod';
-import type { ActiveDispatchTaskRef } from '../db/repositories/dispatchesRepository.js';
-import type { TaskActivityRow } from '../db/repositories/runsRepository.js';
+import type {
+	ActiveDedupDispatch,
+	ActiveDispatchTaskRef,
+} from '../db/repositories/dispatchesRepository.js';
+import type {
+	TaskActivityRow,
+	WipResolveProblemAttemptRow,
+} from '../db/repositories/runsRepository.js';
 import type { WipSlotRow } from '../db/repositories/wipSlotsRepository.js';
 import {
 	AwaitingHumanCauseSchema,
@@ -84,6 +97,10 @@ import {
 	type ItemLivenessUnit,
 	livenessUnitKeysForDispatch,
 } from '../dispatch/item-liveness.js';
+import {
+	resolveProblemDedupKey,
+	resolveProblemTicketDedupKey,
+} from '../dispatch/resolve-problem-keys.js';
 import type { FailureDiagnosisKind } from '../worker/failure-diagnosis.js';
 
 /** What one slot holder is doing, as the operator needs to read it. */
@@ -106,6 +123,25 @@ export type WipOperatorReason = z.infer<typeof WipOperatorReasonSchema>;
 /** Why a `waiting-on-pipeline` holder waits, when there is something more specific to say. */
 export const WipPipelineReasonSchema = z.enum(['waiting-for-checks']);
 export type WipPipelineReason = z.infer<typeof WipPipelineReasonSchema>;
+
+/** What a Resolve problem attempt on a waiting holder concluded (issue #1428). */
+export const WipResolveProblemStateSchema = z.enum(['queued', 'running', 'resolved', 'unresolved']);
+export type WipResolveProblemState = z.infer<typeof WipResolveProblemStateSchema>;
+
+/**
+ * The Resolve problem attempt made on a `waiting-on-operator` holder's *current*
+ * situation (issue #1428) — see {@link foldResolveProblemAttempts}.
+ */
+export const WipResolveProblemSchema = z.object({
+	/** The attempt run; absent while the attempt is only queued. */
+	runId: z.string().optional(),
+	state: WipResolveProblemStateSchema,
+	/** `unresolved` only: the run's own error — its summary and the actions it tried. */
+	message: z.string().optional(),
+	/** ISO 8601 — when the attempt was queued, started, or settled. */
+	at: z.string(),
+});
+export type WipResolveProblem = z.infer<typeof WipResolveProblemSchema>;
 
 /** One ticket holding a slot. */
 export const WipTicketSchema = z.object({
@@ -145,6 +181,11 @@ export const WipTicketSchema = z.object({
 	 * those are not ticket activity (`listTaskActivitySince`).
 	 */
 	latestRunId: z.string().optional(),
+	/**
+	 * `waiting-on-operator` only: the Resolve problem attempt on this situation, when
+	 * one exists (issue #1428). Folded on by {@link foldResolveProblemAttempts}.
+	 */
+	resolveProblem: WipResolveProblemSchema.optional(),
 });
 export type WipTicket = z.infer<typeof WipTicketSchema>;
 
@@ -402,4 +443,137 @@ export function toWipUsage(input: WipUsageInput): WipUsageEntry[] {
 		.sort(
 			(a, b) => a.projectId.localeCompare(b.projectId) || a.repository.localeCompare(b.repository),
 		);
+}
+
+/**
+ * The holders whose Resolve problem attempts the loader reads (issue #1428): every
+ * `waiting-on-operator` holder, named by its anchor exactly as the attempt is
+ * (issue #1425) — its latest run when it has one, else its slot (`since` = the
+ * instant the slot opened) — plus the dedup key a queued attempt on it holds.
+ */
+export interface WipResolveProblemHolders {
+	anchorRunIds: string[];
+	tickets: { projectId: string; repository: string; taskId: string; since: Date }[];
+	dedupKeys: string[];
+}
+
+/** The dedup key a Resolve problem attempt on this holder's situation is queued under. */
+function holderDedupKey(entry: WipUsageEntry, ticket: WipTicket): string {
+	return ticket.latestRunId
+		? resolveProblemDedupKey(ticket.latestRunId)
+		: resolveProblemTicketDedupKey({
+				projectId: entry.projectId,
+				repository: entry.repository,
+				taskId: ticket.taskId,
+				slotOpenedAt: ticket.openedAt,
+			});
+}
+
+export function resolveProblemAttemptHolders(
+	entries: readonly WipUsageEntry[],
+): WipResolveProblemHolders {
+	const holders: WipResolveProblemHolders = { anchorRunIds: [], tickets: [], dedupKeys: [] };
+	for (const entry of entries) {
+		for (const ticket of entry.tickets) {
+			if (ticket.state !== 'waiting-on-operator') continue;
+			if (ticket.latestRunId) holders.anchorRunIds.push(ticket.latestRunId);
+			else {
+				holders.tickets.push({
+					projectId: entry.projectId,
+					repository: entry.repository,
+					taskId: ticket.taskId,
+					since: new Date(ticket.openedAt),
+				});
+			}
+			holders.dedupKeys.push(holderDedupKey(entry, ticket));
+		}
+	}
+	return holders;
+}
+
+/** The loader's two reads for {@link foldResolveProblemAttempts}. */
+export interface WipResolveProblemAttempts {
+	/** Resolve problem runs on the holders (`listResolveProblemAttemptsForHolders`). */
+	runs: readonly WipResolveProblemAttemptRow[];
+	/** Non-terminal dispatches holding the holders' dedup keys. */
+	queued: readonly ActiveDedupDispatch[];
+}
+
+/** A run's status as the attempt's conclusion; a retry pending reads as queued again. */
+function attemptState(status: string): WipResolveProblemState {
+	switch (status) {
+		case 'completed':
+			return 'resolved';
+		case 'failed':
+			return 'unresolved';
+		case 'deferred':
+		case 'checkpointed':
+			return 'queued';
+		default:
+			return 'running';
+	}
+}
+
+function attemptFromRun(run: WipResolveProblemAttemptRow): WipResolveProblem {
+	const state = attemptState(run.status);
+	const at = state === 'running' ? run.startedAt : (run.completedAt ?? run.startedAt);
+	return {
+		runId: run.id,
+		state,
+		...(state === 'unresolved' && run.error ? { message: run.error } : {}),
+		at: at.toISOString(),
+	};
+}
+
+/**
+ * Fold Resolve problem attempts onto the `waiting-on-operator` holders (issue
+ * #1428), so the panel says whether one exists for the holder's **current** stuck
+ * situation and what it concluded. An attempt belongs to that situation only when
+ * it carries the same anchor the sweep would give it today: `resolves_run_id` = the
+ * holder's latest run, or — for a holder that has not run — no anchor, the holder's
+ * own `(project, repository, task)`, started no earlier than its slot opened. An
+ * attempt on an earlier latest run or an earlier slot is a previous situation and
+ * is not shown. The newest matching run wins; with none, a non-terminal dispatch
+ * under the holder's dedup key reads as `queued`. Every other holder is returned
+ * unchanged. Pure — the reads are the loader's (`../dispatch/wip-usage-loader.ts`).
+ */
+export function foldResolveProblemAttempts(
+	entries: readonly WipUsageEntry[],
+	attempts: WipResolveProblemAttempts,
+): WipUsageEntry[] {
+	const queued = new Map(attempts.queued.map((dispatch) => [dispatch.dedupKey, dispatch]));
+	return entries.map((entry) => ({
+		...entry,
+		tickets: entry.tickets.map((ticket) => {
+			if (ticket.state !== 'waiting-on-operator') return ticket;
+			const openedAt = Date.parse(ticket.openedAt);
+			const newest = attempts.runs
+				.filter((run) =>
+					ticket.latestRunId
+						? run.resolvesRunId === ticket.latestRunId
+						: run.resolvesRunId === null &&
+							run.projectId === entry.projectId &&
+							run.repository === entry.repository &&
+							run.taskId === ticket.taskId &&
+							run.startedAt.getTime() >= openedAt,
+				)
+				.reduce<WipResolveProblemAttemptRow | undefined>(
+					(best, run) =>
+						!best ||
+						run.startedAt.getTime() > best.startedAt.getTime() ||
+						(run.startedAt.getTime() === best.startedAt.getTime() && run.id > best.id)
+							? run
+							: best,
+					undefined,
+				);
+			if (newest) return { ...ticket, resolveProblem: attemptFromRun(newest) };
+			const dispatch = queued.get(holderDedupKey(entry, ticket));
+			return dispatch
+				? {
+						...ticket,
+						resolveProblem: { state: 'queued' as const, at: dispatch.createdAt.toISOString() },
+					}
+				: ticket;
+		}),
+	}));
 }

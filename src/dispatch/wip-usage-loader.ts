@@ -15,6 +15,7 @@ import { findProjectRepository, resolveWipLimit } from '../config/project-reposi
 import type { ProjectRecord } from '../config/schema.js';
 import {
 	countWipLimitWaitsByRepository,
+	listActiveDispatchesByDedupKeys,
 	listActiveDispatchTaskRefs,
 } from '../db/repositories/dispatchesRepository.js';
 import {
@@ -26,12 +27,19 @@ import {
 } from '../db/repositories/reviewVerdictsRepository.js';
 import {
 	getCompletedReviewRunForOrdinal,
+	listResolveProblemAttemptsForHolders,
 	listTaskActivitySince,
 } from '../db/repositories/runsRepository.js';
 import { listWipSlots, type WipSlotRow } from '../db/repositories/wipSlotsRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
-import { toWipUsage, type WipCappedPullRequest, type WipUsageEntry } from '../queue/wip-usage.js';
+import {
+	foldResolveProblemAttempts,
+	resolveProblemAttemptHolders,
+	toWipUsage,
+	type WipCappedPullRequest,
+	type WipUsageEntry,
+} from '../queue/wip-usage.js';
 import { ITEM_ACTIVITY_LOOKBACK_MS, type ItemLivenessPolicy } from './item-liveness.js';
 
 /**
@@ -180,10 +188,39 @@ export async function loadWipCappedPullRequests(
 }
 
 /**
+ * Fold each `waiting-on-operator` holder's Resolve problem attempt onto `entries`
+ * (issue #1428): two bounded reads — the attempt runs on the holders' anchors and
+ * the non-terminal dispatches under their dedup keys — folded by
+ * `foldResolveProblemAttempts`. Nothing is read when no holder waits on the
+ * operator. Best-effort: a failed read logs and returns the entries without the
+ * field rather than failing the view (or Resolve problem's own sweep).
+ */
+export async function withResolveProblemAttempts(
+	entries: WipUsageEntry[],
+): Promise<WipUsageEntry[]> {
+	const holders = resolveProblemAttemptHolders(entries);
+	if (holders.dedupKeys.length === 0) return entries;
+	try {
+		const [runs, queued] = await Promise.all([
+			listResolveProblemAttemptsForHolders(holders),
+			listActiveDispatchesByDedupKeys(holders.dedupKeys),
+		]);
+		return foldResolveProblemAttempts(entries, { runs, queued });
+	} catch (error) {
+		logger.warn('wip usage: Resolve problem attempt lookup failed; reporting holders without it', {
+			holders: holders.dedupKeys.length,
+			error: describeError(error),
+		});
+		return entries;
+	}
+}
+
+/**
  * Assemble the WIP-usage read model (issue #1192) for `projectIds` (every project
  * when absent) from its four bounded reads plus the review-cap ledger, classified
- * by `toWipUsage`. Pull requests are left unlinked: linking them is the API's
- * concern, and the sweep needs none.
+ * by `toWipUsage`, with each waiting holder's Resolve problem attempt folded on
+ * ({@link withResolveProblemAttempts}). Pull requests are left unlinked: linking
+ * them is the API's concern, and the sweep needs none.
  */
 export async function loadWipUsageEntries(
 	records: readonly ProjectRecord[],
@@ -202,7 +239,7 @@ export async function loadWipUsageEntries(
 				loadWipCappedPullRequests(slots),
 			])
 		: [[], [], []];
-	return toWipUsage({
+	const entries = toWipUsage({
 		slots,
 		waiters,
 		limitFor: wipLimitFrom(new Map(records.map((record) => [record.id, record]))),
@@ -213,4 +250,5 @@ export async function loadWipUsageEntries(
 			records.map((record) => [record.id, itemLivenessPolicyFor(record)]),
 		),
 	});
+	return withResolveProblemAttempts(entries);
 }

@@ -149,6 +149,7 @@ import {
 import {
 	normalizeStoredJobPayload,
 	type RecoveryMode,
+	ResolveProblemJobSchema,
 	repositoryForJob,
 	type ScmWebhookJob,
 	type SwarmJob,
@@ -1520,6 +1521,31 @@ export interface RunLateResultAccepted {
 	workerName: string | null;
 }
 
+/** The stuck ticket a ticket-targeted Resolve problem run is about (issue #1428). */
+export interface ResolveProblemTicketSubject {
+	taskId: string;
+	reason: 'stalled';
+	/** ISO 8601 — when the ticket's slot opened. */
+	slotOpenedAt: string;
+}
+
+/**
+ * The stuck ticket a Resolve problem run is about, read from the run's own stored
+ * job (`jobPayload.ticket`, issue #1425), or `null` for every run that is not a
+ * ticket attempt — a run attempt on a failed run, every other phase, and a stored
+ * payload that no longer parses.
+ */
+export function resolveProblemTicketOf(run: {
+	phase: string;
+	jobPayload: unknown;
+}): ResolveProblemTicketSubject | null {
+	if (run.phase !== 'resolve-problem' || !run.jobPayload) return null;
+	const parsed = ResolveProblemJobSchema.safeParse(run.jobPayload);
+	if (!parsed.success || !parsed.data.ticket) return null;
+	const { taskId, reason, slotOpenedAt } = parsed.data.ticket;
+	return { taskId, reason, slotOpenedAt };
+}
+
 /**
  * Resolve the run's recorded late-result machine, or `null` for every run that was
  * not settled with a late result. A failed lookup degrades to a null name rather
@@ -2367,8 +2393,11 @@ const runReadProcedures = {
 				reviewCapOverrideOutstanding: resolveReviewCapOverrideOutstanding(run, reviewCapSlots),
 				reviewCapStop: resolveReviewCapStop(run, reviewCapSlots),
 				// The Resolve problem attempts made on this run (issue #1395); the run's own
-				// `resolvesRunId` names the failed run when it is one of them.
+				// `resolvesRunId` names the failed run (or a ticket attempt's anchor) when it
+				// is one of them.
 				resolveProblemAttempts: await listResolveProblemAttempts(run.id),
+				// A ticket attempt's stuck ticket (issue #1428), from its own stored job.
+				resolveProblemTicket: resolveProblemTicketOf(run),
 			};
 		}),
 

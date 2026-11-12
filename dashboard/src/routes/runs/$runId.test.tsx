@@ -647,6 +647,47 @@ describe('ResolveProblemLinks (issue #1395)', () => {
 		expect(screen.getByText('failed-run-1').closest('a')).toBeTruthy();
 	});
 
+	it('names the stuck ticket a ticket attempt is about (issue #1428)', () => {
+		render(
+			<ResolveProblemLinks
+				run={makeReviewRun({
+					phase: 'resolve-problem',
+					resolvesRunId: null,
+					resolveProblemTicket: {
+						taskId: '1428',
+						reason: 'stalled',
+						slotOpenedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+					},
+				})}
+			/>,
+		);
+		const panel = screen.getByTestId('resolve-problem-links');
+		expect(panel.textContent).toContain(
+			'Resolving stuck ticket 1428 (stalled, slot held since 2h ago)',
+		);
+		expect(panel.textContent).not.toContain('Resolving run');
+	});
+
+	it('shows both the stuck ticket and its anchor run for an anchored ticket attempt', () => {
+		render(
+			<ResolveProblemLinks
+				run={makeReviewRun({
+					phase: 'resolve-problem',
+					resolvesRunId: 'latest-run-1',
+					resolveProblemTicket: {
+						taskId: '1428',
+						reason: 'stalled',
+						slotOpenedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+					},
+				})}
+			/>,
+		);
+		const panel = screen.getByTestId('resolve-problem-links');
+		expect(panel.textContent).toContain('Resolving stuck ticket 1428');
+		expect(panel.textContent).toContain('Resolving run latest-run-1');
+		expect(screen.getByText('latest-run-1').closest('a')).toBeTruthy();
+	});
+
 	it("lists a failed run's Resolve problem attempts with their outcomes", () => {
 		render(
 			<ResolveProblemLinks
