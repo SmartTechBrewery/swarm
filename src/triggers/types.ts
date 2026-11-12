@@ -23,7 +23,10 @@
 import { z } from 'zod';
 
 import type { ProjectConfig } from '../config/schema.js';
-import type { ResolveProblemFailedRun } from '../pipeline/prompts/resolve-problem.js';
+import type {
+	ResolveProblemFailedRun,
+	ResolveProblemStuckTicket,
+} from '../pipeline/prompts/resolve-problem.js';
 import type { PmEvent } from '../pm/events.js';
 import type { PMProvider, PMType, WorkItem } from '../pm/types.js';
 import type { MergeCatchUpRequest } from '../queue/jobs.js';
@@ -334,28 +337,34 @@ export type TriggerResult =
 	| (TriggerResultBase & {
 			/**
 			 * Resolve problem (issue #1395): an agent with the SWARM operator MCP
-			 * attached diagnoses one **failed run** and tries to get the pipeline
-			 * moving again. It is not ticket work — it holds no WIP slot, provisions no
-			 * worktree, never moves the board card, and is deduplicated on the failed
-			 * run rather than on the task. `taskId` is the failed run's task, carried
-			 * for display and the board-item failure comment only.
+			 * attached diagnoses one **failed run** — or, since issue #1425, one **stuck
+			 * ticket** (`ticket`) — and tries to get the pipeline moving again. It is not
+			 * ticket work — it holds no WIP slot, provisions no worktree, never moves the
+			 * board card, and is deduplicated on the failed run or the stuck situation
+			 * rather than on the task. `taskId` is the failed run's or the ticket's task,
+			 * carried for display and the board-item failure comment only.
 			 */
 			phase: 'resolve-problem';
-			/** The `runs` row this attempt is resolving (`runs.resolves_run_id`). */
-			failedRunId: string;
-			/** The pull request the failed run acted on, when it named one. */
+			/**
+			 * The `runs` row this attempt is about (`runs.resolves_run_id`): the failed
+			 * run, or a ticket attempt's anchor — absent for a ticket that never ran.
+			 */
+			failedRunId?: string;
+			/** The pull request the failed run or the ticket acted on, when it named one. */
 			prNumber?: string;
 			/**
-			 * The failed run's board card (`runs.work_item_id`), when it had one — where
-			 * an unresolved attempt's failure comment is posted. Never moved.
+			 * The failed run's or the ticket's board card (`runs.work_item_id`), when it
+			 * had one — where an unresolved attempt's failure comment is posted. Never moved.
 			 */
 			workItemId?: string;
 			/**
-			 * What SWARM recorded about the failed run, read at dispatch — the agent's
-			 * starting point, composed into the prompt on the control plane, which is
-			 * the side holding the run.
+			 * What SWARM recorded about the failed run (or a ticket attempt's anchor
+			 * run), read at dispatch — the agent's starting point, composed into the
+			 * prompt on the control plane, which is the side holding the run.
 			 */
-			failedRun: ResolveProblemFailedRun;
+			failedRun?: ResolveProblemFailedRun;
+			/** A ticket attempt (issue #1425): the stuck WIP slot holder it is about. */
+			ticket?: ResolveProblemStuckTicket;
 	  });
 
 export interface TriggerHandler {

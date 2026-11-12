@@ -31,8 +31,9 @@
  *    ledger rather than from its latest run, because that cap fires on a webhook
  *    (the `pr-review` trigger's cap gate skips) and records no run: the latest run
  *    is usually a later Resolve conflicts or Respond-to-CI that moved the head and
- *    completed, which rule 7 would read as the pipeline's. The API layer resolves
- *    the fact on exactly the terms the run-detail callout (`isCapSpentApproval`)
+ *    completed, which rule 7 would read as the pipeline's. The loader
+ *    (`../dispatch/wip-usage-loader.ts`, shared by the API and Resolve problem's
+ *    sweep since issue #1425) resolves the fact on exactly the terms the run-detail callout (`isCapSpentApproval`)
  *    is shown on — allowance spent, no outstanding grant, no review in flight
  *    above the last verdict, and that verdict an `approve` with merge outcome
  *    `not-eligible` — so this panel and the detail page cannot disagree. The
@@ -138,6 +139,12 @@ export const WipTicketSchema = z.object({
 	prUrl: z.string().optional(),
 	/** ISO 8601 — when the deciding unit last moved, when it has run at all. */
 	lastActivityAt: z.string().optional(),
+	/**
+	 * The latest run in the deciding unit, when there is one — what a Resolve problem
+	 * attempt on this holder anchors to (issue #1425). Never a Resolve problem run:
+	 * those are not ticket activity (`listTaskActivitySince`).
+	 */
+	latestRunId: z.string().optional(),
 });
 export type WipTicket = z.infer<typeof WipTicketSchema>;
 
@@ -165,7 +172,8 @@ export interface WipWaiterCount {
 
 /**
  * A pull request the review cap stopped on a refused approval (rule 2b, issue
- * #1379), resolved by the API layer from the pull request's review ledger.
+ * #1379), resolved by the loader (`../dispatch/wip-usage-loader.ts`) from the pull
+ * request's review ledger.
  */
 export interface WipCappedPullRequest {
 	projectId: string;
@@ -312,7 +320,7 @@ function toTicket(slot: WipSlotRow, verdict: HolderVerdict): WipTicket {
 		...(verdict.operatorReason ? { operatorReason: verdict.operatorReason } : {}),
 		...(verdict.pipelineReason ? { pipelineReason: verdict.pipelineReason } : {}),
 		...(verdict.actionRunId ? { actionRunId: verdict.actionRunId } : {}),
-		...(latest ? { phase: latest.phase } : {}),
+		...(latest ? { phase: latest.phase, latestRunId: latest.runId } : {}),
 		...(slot.prNumber ? { prNumber: slot.prNumber } : {}),
 		...(verdict.decidingUnit
 			? { lastActivityAt: verdict.decidingUnit.lastActivityAt.toISOString() }

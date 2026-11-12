@@ -21,15 +21,18 @@ import {
 	operatorMcpUrl,
 	RESOLVE_PROBLEM_TOKEN_GRACE_MS,
 	resolveProblemDedupKey,
+	resolveProblemTicketDedupKey,
 	resolveProblemTrigger,
 	revokeResolveProblemAccess,
 	scheduleResolveProblem,
+	scheduleResolveProblemForTicket,
 	verifyResolveProblemOutcome,
 } from '@/dispatch/resolve-problem.js';
 import type { AgentCliResult } from '@/harness/agent-cli.js';
 import { AgentRunError } from '@/harness/agent-failure.js';
 import type { ResolveProblemReport } from '@/pipeline/resolve-problem.js';
 import type { ResolveProblemJob } from '@/queue/jobs.js';
+import type { WipTicket } from '@/queue/wip-usage.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
 const PROJECT = createMockProjectConfig({
@@ -156,6 +159,192 @@ describe('resolveProblemTrigger', () => {
 	});
 });
 
+describe('scheduleResolveProblemForTicket (issue #1425)', () => {
+	const SLOT = {
+		projectId: PROJECT.id,
+		repository: PROJECT.repo,
+		taskId: '1425',
+		slotOpenedAt: '2026-11-10T08:00:00.000Z',
+	};
+
+	it('keys a ticket that ran on its latest run — the key a run attempt on it takes', async () => {
+		await scheduleResolveProblemForTicket({
+			...SLOT,
+			latestRunId: FAILED_RUN.id,
+			prNumber: '42',
+			workItemId: 'PVTI_card',
+		});
+		expect(createAndPublishDispatch).toHaveBeenCalledWith(
+			expect.objectContaining({
+				projectId: PROJECT.id,
+				dedupKey: resolveProblemDedupKey(FAILED_RUN.id),
+				phase: 'resolve-problem',
+				source: 'synthetic',
+				jobPayload: {
+					type: 'resolve-problem',
+					projectId: PROJECT.id,
+					repository: PROJECT.repo,
+					failedRunId: FAILED_RUN.id,
+					ticket: {
+						taskId: '1425',
+						reason: 'stalled',
+						slotOpenedAt: SLOT.slotOpenedAt,
+						prNumber: '42',
+						workItemId: 'PVTI_card',
+					},
+				},
+			}),
+		);
+		expect(createAndPublishDispatch.mock.calls[0][0]).not.toHaveProperty('taskId');
+	});
+
+	it('keys a ticket that never ran on its slot, so a re-opened slot is a new situation', async () => {
+		await scheduleResolveProblemForTicket(SLOT);
+		const input = createAndPublishDispatch.mock.calls[0][0] as {
+			dedupKey: string;
+			jobPayload: ResolveProblemJob;
+		};
+		expect(input.dedupKey).toBe(
+			`resolve-problem:slot:${PROJECT.id}:${PROJECT.repo}:1425:${Date.parse(SLOT.slotOpenedAt)}`,
+		);
+		expect(input.jobPayload).not.toHaveProperty('failedRunId');
+		expect(
+			resolveProblemTicketDedupKey({ ...SLOT, slotOpenedAt: '2026-11-11T08:00:00Z' }),
+		).not.toBe(input.dedupKey);
+	});
+});
+
+describe('resolveProblemTrigger — ticket attempts (issue #1425)', () => {
+	const OPENED_AT = '2026-11-10T08:00:00.000Z';
+	const NOW = new Date('2026-11-12T08:00:00Z');
+	const ANCHOR = {
+		...FAILED_RUN,
+		taskId: '1425',
+		phase: 'review',
+		status: 'completed',
+		resetStartedAt: null,
+		nextRetryAt: null,
+	} as unknown as RunRow;
+	const HELD: WipTicket = {
+		taskId: '1425',
+		workItemId: 'PVTI_card',
+		openedPhase: 'implementation',
+		openedAt: OPENED_AT,
+		state: 'waiting-on-operator',
+		operatorReason: 'stalled',
+		phase: 'review',
+		prNumber: '42',
+		latestRunId: ANCHOR.id,
+		lastActivityAt: '2026-11-10T09:00:00.000Z',
+	};
+	const TICKET_JOB: ResolveProblemJob = {
+		type: 'resolve-problem',
+		projectId: PROJECT.id,
+		repository: PROJECT.repo,
+		failedRunId: ANCHOR.id,
+		ticket: { taskId: '1425', reason: 'stalled', slotOpenedAt: OPENED_AT },
+	};
+	const resolve = (
+		held: WipTicket | undefined,
+		anchor: RunRow | undefined = ANCHOR,
+		job: ResolveProblemJob = TICKET_JOB,
+	) =>
+		resolveProblemTrigger(
+			job,
+			PROJECT,
+			async () => anchor,
+			async () => held,
+			() => NOW,
+		);
+
+	it('returns the ticket and its latest run while the ticket is unchanged', async () => {
+		expect(await resolve(HELD)).toEqual({
+			phase: 'resolve-problem',
+			taskId: '1425',
+			failedRunId: ANCHOR.id,
+			prNumber: '42',
+			workItemId: 'PVTI_card',
+			failedRun: {
+				id: ANCHOR.id,
+				phase: 'review',
+				taskId: '1425',
+				prNumber: null,
+				error: ANCHOR.error,
+				failureDiagnosis: null,
+			},
+			ticket: {
+				taskId: '1425',
+				repository: PROJECT.repo,
+				reason: 'stalled',
+				slotOpenedAt: OPENED_AT,
+				lastActivityAt: HELD.lastActivityAt,
+				prNumber: '42',
+				workItemId: 'PVTI_card',
+			},
+		});
+	});
+
+	it('runs a ticket that never ran without an anchor', async () => {
+		const { latestRunId: _, lastActivityAt: __, ...neverRan } = HELD;
+		const { failedRunId: ___, ...job } = TICKET_JOB;
+		const readRun = vi.fn(async () => ANCHOR);
+		const trigger = await resolveProblemTrigger(
+			job,
+			PROJECT,
+			readRun,
+			async () => neverRan,
+			() => NOW,
+		);
+		expect(trigger).toMatchObject({ phase: 'resolve-problem', taskId: '1425' });
+		expect(trigger).not.toHaveProperty('failedRunId');
+		expect(trigger).not.toHaveProperty('failedRun');
+		expect(readRun).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		['the ticket left its slot', undefined, /no longer holds a WIP slot/],
+		['it is running again', { ...HELD, state: 'running' as const }, /is running again/],
+		[
+			'it waits on the pipeline again',
+			{ ...HELD, state: 'waiting-on-pipeline' as const, operatorReason: undefined },
+			/is waiting-on-pipeline again/,
+		],
+		[
+			'it now waits for an excluded reason',
+			{ ...HELD, operatorReason: 'review-cap-reached' as const },
+			/review-cap-reached: The review cap is a safety stop/,
+		],
+		['a newer run moved it', { ...HELD, latestRunId: 'run-newer' }, /has moved/],
+		[
+			'it took a new slot',
+			{ ...HELD, openedAt: '2026-11-11T08:00:00.000Z' },
+			/took a new WIP slot/,
+		],
+	])('skips when %s', async (_label, held, message) => {
+		expect(await resolve(held)).toEqual({ skip: expect.stringMatching(message), taskId: '1425' });
+	});
+
+	it('skips while its anchor run is being Reset or retries by itself', async () => {
+		expect(
+			await resolve(HELD, { ...ANCHOR, resetStartedAt: new Date('2026-11-12T07:00:00Z') }),
+		).toEqual({ skip: expect.stringContaining('being Reset'), taskId: '1425' });
+		expect(
+			await resolve(HELD, { ...ANCHOR, nextRetryAt: new Date('2026-11-12T09:00:00Z') }),
+		).toEqual({ skip: expect.stringContaining('retry of its own'), taskId: '1425' });
+		expect(await resolve(HELD, { ...ANCHOR, phase: 'resolve-problem' })).toEqual({
+			skip: expect.stringContaining('itself a Resolve problem attempt'),
+			taskId: '1425',
+		});
+	});
+
+	it('skips a dispatch that names neither a failed run nor a ticket', async () => {
+		const { failedRunId: _, ...bare } = JOB;
+		expect(await resolveProblemTrigger(bare, PROJECT, async () => FAILED_RUN)).toEqual({
+			skip: expect.stringContaining('neither a failed run nor a ticket'),
+		});
+	});
+});
+
 describe('mintResolveProblemAccess / revokeResolveProblemAccess', () => {
 	it("mints a token held by the worker's owner, scoped to the project and run, capped and short-lived", async () => {
 		vi.stubEnv('WEBHOOK_CALLBACK_BASE_URL', 'https://swarm.example.com/');
@@ -244,6 +433,21 @@ describe('verifyResolveProblemOutcome', () => {
 		);
 		expect(error.message).toContain('could not resolve the failed run: The review cap stopped it.');
 		expect(error.message).toContain(`run_reset on ${FAILED_RUN.id} → restarted`);
+	});
+
+	it('names a stuck ticket as the subject of an unresolved ticket attempt (issue #1425)', async () => {
+		const error = await failureOf(
+			verifyResolveProblemOutcome(
+				{
+					runId: 'run-resolve',
+					report: { ...REPORT, outcome: 'unresolved', summary: 'The card needs a move.' },
+					agent: AGENT,
+					subject: 'ticket',
+				},
+				filed,
+			),
+		);
+		expect(error.message).toContain('could not resolve the stuck ticket: The card needs a move.');
 	});
 
 	it('fails a run that filed no bug report, even one claiming success', async () => {

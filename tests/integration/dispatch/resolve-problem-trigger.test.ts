@@ -3,6 +3,7 @@ import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { getDb } from '../../../src/db/client.js';
 import { createDispatch } from '../../../src/db/repositories/dispatchesRepository.js';
+import { getProjectByIdFromDb } from '../../../src/db/repositories/projectsRepository.js';
 import {
 	completeRun,
 	createRun,
@@ -12,13 +13,19 @@ import {
 import { dispatches } from '../../../src/db/schema/dispatches.js';
 import { projects } from '../../../src/db/schema/projects.js';
 import { runs } from '../../../src/db/schema/runs.js';
+import { wipSlots } from '../../../src/db/schema/wipSlots.js';
+import { ITEM_STALL_AFTER_MS } from '../../../src/dispatch/item-liveness.js';
+import { resolveProblemTrigger } from '../../../src/dispatch/resolve-problem.js';
 import {
 	dispatchResolveProblemForFailedRuns,
+	dispatchResolveProblemForWaitingTickets,
 	RESOLVE_PROBLEM_DELAY_MS,
 	RESOLVE_PROBLEM_LOOKBACK_MS,
 	resolveProblemWindow,
+	sweepResolveProblem,
 } from '../../../src/dispatch/resolve-problem-trigger.js';
-import type { SwarmJob } from '../../../src/queue/jobs.js';
+import { loadWipUsageEntries } from '../../../src/dispatch/wip-usage-loader.js';
+import type { ResolveProblemJob, SwarmJob } from '../../../src/queue/jobs.js';
 import { closeQueue } from '../../../src/queue/producer.js';
 import { createMockScmWebhookJob } from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
@@ -290,6 +297,140 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 			expect(passes.flat()).toEqual([id]);
 			expect(await dispatchResolveProblemForFailedRuns()).toEqual([]);
 			expect(await resolveProblemDispatches()).toHaveLength(1);
+		});
+	},
+);
+
+/** A WIP slot for task `taskId`, opened `minutesAgo` minutes ago. */
+async function heldSlot(taskId = '42', minutesAgo = ITEM_STALL_AFTER_MS / MINUTE + 10) {
+	const openedAt = new Date(Date.now() - minutesAgo * MINUTE);
+	await getDb().insert(wipSlots).values({
+		projectId: PROJECT_ID,
+		repository: REPO,
+		taskId,
+		openedPhase: 'implementation',
+		openedAt,
+	});
+	return openedAt;
+}
+
+describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
+	'Waiting-on-you holders as the sweep reads them (integration, issue #1425)',
+	() => {
+		beforeEach(async () => {
+			await truncateAll();
+			await seedProject({ id: PROJECT_ID, repo: REPO });
+		});
+
+		it('never lets a Resolve problem run change a holder or become its latest run', async () => {
+			await heldSlot();
+			await settledRun({ phase: 'resolve-problem', status: 'failed', minutesAgo: 30 });
+
+			const [entry] = await loadWipUsageEntries([], [PROJECT_ID]);
+			expect(entry?.tickets).toHaveLength(1);
+			expect(entry?.tickets[0]).toMatchObject({
+				state: 'waiting-on-operator',
+				operatorReason: 'stalled',
+			});
+			expect(entry?.tickets[0]?.latestRunId).toBeUndefined();
+		});
+	},
+);
+
+describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_REDIS_AVAILABLE)(
+	'dispatchResolveProblemForWaitingTickets (integration, Postgres + Redis, issue #1425)',
+	() => {
+		beforeEach(async () => {
+			await truncateAll();
+			await seedProject({ id: PROJECT_ID, repo: REPO });
+			await enableResolveProblem(PROJECT_ID);
+		});
+
+		afterAll(async () => {
+			await closeQueue();
+		});
+
+		async function resolveProblemDispatches() {
+			return getDb().select().from(dispatches).where(eq(dispatches.phase, 'resolve-problem'));
+		}
+
+		it('dispatches exactly one ticket attempt for a stalled slot that never ran', async () => {
+			const openedAt = await heldSlot();
+
+			expect(await dispatchResolveProblemForWaitingTickets()).toEqual([`${PROJECT_ID}/${REPO}#42`]);
+			expect(await dispatchResolveProblemForWaitingTickets()).toEqual([]);
+
+			const rows = await resolveProblemDispatches();
+			expect(rows).toHaveLength(1);
+			expect(rows[0]).toMatchObject({
+				dedupKey: `resolve-problem:slot:${PROJECT_ID}:${REPO}:42:${openedAt.getTime()}`,
+				source: 'synthetic',
+				taskId: null,
+			});
+			expect(rows[0]?.jobPayload).toEqual({
+				type: 'resolve-problem',
+				projectId: PROJECT_ID,
+				repository: REPO,
+				ticket: { taskId: '42', reason: 'stalled', slotOpenedAt: openedAt.toISOString() },
+			});
+
+			// Claimed while the ticket is still stuck, it runs — and the queued attempt
+			// itself does not move the ticket out of Waiting on you.
+			const project = await getProjectByIdFromDb(PROJECT_ID);
+			if (!project) throw new Error('unreachable');
+			expect(
+				await resolveProblemTrigger(rows[0]?.jobPayload as ResolveProblemJob, project),
+			).toMatchObject({
+				phase: 'resolve-problem',
+				taskId: '42',
+				ticket: { taskId: '42', repository: REPO, slotOpenedAt: openedAt.toISOString() },
+			});
+		});
+
+		it('dispatches a run attempt for a failed holder past the failed-run lookback', async () => {
+			await heldSlot('42', RESOLVE_PROBLEM_LOOKBACK_MS / MINUTE + 120);
+			const id = await settledRun({ minutesAgo: RESOLVE_PROBLEM_LOOKBACK_MS / MINUTE + 60 });
+
+			expect(await dispatchResolveProblemForWaitingTickets()).toEqual([id]);
+			const rows = await resolveProblemDispatches();
+			expect(rows).toHaveLength(1);
+			expect(rows[0]).toMatchObject({ dedupKey: `resolve-problem:${id}` });
+			expect(rows[0]?.jobPayload).toMatchObject({ type: 'resolve-problem', failedRunId: id });
+			expect(rows[0]?.jobPayload).not.toHaveProperty('ticket');
+		});
+
+		it('creates one dispatch for a failed run both legs see', async () => {
+			await heldSlot();
+			const id = await settledRun({ minutesAgo: 30 });
+
+			await sweepResolveProblem();
+			await sweepResolveProblem();
+
+			const rows = await resolveProblemDispatches();
+			expect(rows).toHaveLength(1);
+			expect(rows[0]).toMatchObject({ dedupKey: `resolve-problem:${id}` });
+		});
+
+		it('dispatches nothing for a holder the pipeline has a dispatch for', async () => {
+			await heldSlot();
+			await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+				taskId: '42',
+				phase: 'implementation',
+			});
+
+			expect(await dispatchResolveProblemForWaitingTickets()).toEqual([]);
+			expect(await resolveProblemDispatches()).toHaveLength(0);
+		});
+
+		it('dispatches nothing for a failed holder whose run is being Reset', async () => {
+			await heldSlot();
+			const id = await settledRun({ minutesAgo: 30 });
+			await markRunResetStarted(id);
+
+			expect(await dispatchResolveProblemForWaitingTickets()).toEqual([]);
 		});
 	},
 );
