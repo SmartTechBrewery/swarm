@@ -18,6 +18,7 @@ import {
 	buildReviewDispatchKey,
 	claimReviewDispatch,
 	MERGE_AUTOMATION_CLAIM_OWNER,
+	refreshMergeAutomationClaim,
 	refreshReviewDispatchClaim,
 	reviewDispatchClaimOwner,
 	takeOverMergeAutomationClaim,
@@ -115,6 +116,33 @@ describe.skipIf(!process.env.SWARM_TEST_REDIS_AVAILABLE)(
 				false,
 			);
 			expect(await redis.exists(REDIS_KEY)).toBe(0);
+		});
+		// Issue #1432's pending-checks wait keeps this claim alive past its first
+		// lease; doing so must leave it the merge-automation value a red looks for.
+		it('keeps the merge-automation owner across a pending-checks refresh', async () => {
+			expect(await claimAsMergeAutomation()).toBe(true);
+			await redis.expire(REDIS_KEY, 30);
+
+			await refreshMergeAutomationClaim(CLAIM_KEY, UPDATED_HEAD_CLAIM_TTL_SEC);
+
+			expect(await redis.get(REDIS_KEY)).toBe(MERGE_AUTOMATION_CLAIM_OWNER);
+			expect(await redis.ttl(REDIS_KEY)).toBeGreaterThan(UPDATED_HEAD_CLAIM_TTL_SEC - 10);
+			expect(await takeOverMergeAutomationClaim(CLAIM_KEY, reviewDispatchClaimOwner('d1'))).toBe(
+				true,
+			);
+		});
+
+		it('re-establishes a lapsed claim under its owner but leaves another holder alone', async () => {
+			await refreshMergeAutomationClaim(CLAIM_KEY, UPDATED_HEAD_CLAIM_TTL_SEC);
+			expect(await redis.get(REDIS_KEY)).toBe(MERGE_AUTOMATION_CLAIM_OWNER);
+
+			expect(await takeOverMergeAutomationClaim(CLAIM_KEY, reviewDispatchClaimOwner('d1'))).toBe(
+				true,
+			);
+			await redis.expire(REDIS_KEY, 30);
+			await refreshMergeAutomationClaim(CLAIM_KEY, UPDATED_HEAD_CLAIM_TTL_SEC);
+			expect(await redis.get(REDIS_KEY)).toBe('pr-review:d1');
+			expect(await redis.ttl(REDIS_KEY)).toBeLessThanOrEqual(30);
 		});
 	},
 );

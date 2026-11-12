@@ -377,3 +377,32 @@ describe('takeOverMergeAutomationClaim', () => {
 		).resolves.toBe(false);
 	});
 });
+
+/**
+ * Issue #1432 meets #1430 — keeping merge automation's updated-head claim alive
+ * while that head's checks are pending must not rewrite its owner token, or a red
+ * on the head could no longer take the claim over for its CI fix.
+ */
+describe('refreshMergeAutomationClaim', () => {
+	it('extends the namespaced key only under the merge-automation owner, never with a plain SET', async () => {
+		const { refreshMergeAutomationClaim } = await import('@/triggers/review-dispatch-dedup.js');
+
+		await refreshMergeAutomationClaim('acme/widgets:42:abc', 900);
+
+		expect(evalScript).toHaveBeenCalledWith(
+			expect.stringContaining("redis.call('expire', KEYS[1], ARGV[2])"),
+			1,
+			`${NS}acme/widgets:42:abc`,
+			'merge-automation',
+			'900',
+		);
+		expect(set).not.toHaveBeenCalled();
+	});
+
+	it('swallows a Redis failure', async () => {
+		evalScript.mockRejectedValue(new Error('ECONNREFUSED'));
+		const { refreshMergeAutomationClaim } = await import('@/triggers/review-dispatch-dedup.js');
+
+		await expect(refreshMergeAutomationClaim('acme/widgets:42:abc', 900)).resolves.toBeUndefined();
+	});
+});

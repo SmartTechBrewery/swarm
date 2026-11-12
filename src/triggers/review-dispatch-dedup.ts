@@ -422,3 +422,42 @@ export async function takeOverMergeAutomationClaim(key: string, owner: string): 
 		return false;
 	}
 }
+
+// Extend merge automation's (ARGV[1]) lease to ARGV[2] seconds while it holds the
+// slot, or re-establish it under that owner if it lapsed; a no-op on any other holder.
+const REFRESH_IF_HELD_BY = `local v = redis.call('get', KEYS[1]) if v == ARGV[1] then redis.call('expire', KEYS[1], ARGV[2]) return 1 elseif not v then redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2], 'NX') return 1 end return 0`;
+
+/**
+ * Keep merge automation's claim on a head its own branch update produced alive
+ * for another `ttlSec` while that head's checks are still pending (issue #1432),
+ * **without** rewriting its owner token. {@link refreshReviewDispatchClaim} would
+ * overwrite the value with its own, after which a red on that head could no
+ * longer find {@link MERGE_AUTOMATION_CLAIM_OWNER} and
+ * {@link takeOverMergeAutomationClaim} would drop the one CI fix it needs
+ * (issue #1430).
+ *
+ * Extends the lease while merge automation holds the slot, re-establishes it
+ * under that owner if it lapsed a moment ago, and leaves any other holder — a CI
+ * fix that already took it over, a Review — alone. One Lua script, so the read
+ * and the write cannot interleave with a take-over.
+ *
+ * Best-effort, like {@link refreshReviewDispatchClaim}: errors are logged, never
+ * thrown.
+ */
+export async function refreshMergeAutomationClaim(key: string, ttlSec: number): Promise<void> {
+	const namespacedKey = `${KEY_NS}${key}`;
+	try {
+		await getRedis().eval(
+			REFRESH_IF_HELD_BY,
+			1,
+			namespacedKey,
+			MERGE_AUTOMATION_CLAIM_OWNER,
+			String(ttlSec),
+		);
+	} catch (err) {
+		logger.warn('review-dispatch dedup: merge-automation claim refresh failed (TTL will reap)', {
+			reviewDispatchKey: key,
+			error: String(err),
+		});
+	}
+}
