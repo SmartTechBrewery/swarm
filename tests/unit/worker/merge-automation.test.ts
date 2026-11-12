@@ -3115,7 +3115,12 @@ describe('processMergeAutomationDispatch: an adjudicated red approved head (issu
 
 		expect(policy.hasCiNoFixRecovery).not.toHaveBeenCalled();
 		expect(policy.recoverAdjudicatedApprovedHead).not.toHaveBeenCalled();
-		expect(commentOnPullRequest.mock.calls[0]?.[2]).toContain('Each side is green on its own');
+		const body = commentOnPullRequest.mock.calls[0]?.[2];
+		expect(body).toContain('Each side is green on its own');
+		// Issue #1430: the red goes to Respond-to-CI, so the comment must not
+		// tell a human to fix the branch that agent is pushing to.
+		expect(body).toContain('Respond-to-CI');
+		expect(body).not.toContain('Fix the combination on this branch');
 	});
 
 	it('keeps the #1124 refusal when the adjudication cannot be read', async () => {

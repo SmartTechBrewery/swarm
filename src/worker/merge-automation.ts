@@ -45,7 +45,9 @@
  *    on the pull request* — refused rather than merged on stale evidence. A
  *    conflicting update also hands the pull request to Resolve-conflicts (issue
  *    #1264): a sibling that merged while it was in review has already had its
- *    fan-out, so nothing else would;
+ *    fan-out, so nothing else would. A red fresh CI goes to Respond-to-CI like
+ *    any red pull request's (issue #1430), so its comment says so rather than
+ *    asking a human to fix the branch that agent is pushing to;
  *  - a provider that cannot update a branch at all (Bitbucket Cloud, gitlab.com,
  *    Azure DevOps Services) has the update done on a SWARM worker instead (issue
  *    #1117): a catch-up pass of the Resolve-conflicts phase merges the base into
@@ -2046,6 +2048,9 @@ const ADJUDICATED_RED_MESSAGES: Record<
  *
  * For a head this dispatch produced that is the point of the whole exercise: the
  * reviewed diff and the current base are each fine and their combination is not.
+ * Its red is Respond-to-CI's too since issue #1430 — the `checks completed` event
+ * takes this head's merge-automation claim over — so the comment names that
+ * agent and asks for a hand fix only where it is not enabled.
  * For the approved head itself (issue #1124) the review approved a commit whose
  * CI failed; the failure belongs to Respond-to-CI, which the `pr-review` trigger
  * routes this head to on its own, so nothing here races it.
@@ -2109,7 +2114,7 @@ async function refuseRedHead(
 		updated
 			? mergeRefusalCommentBody(
 					`SWARM brought this pull request's head up to date with the base and the resulting commit fails its checks: ${failed}. Each side is green on its own; together they are not.`,
-					'Fix the combination on this branch — the failure is real, and it is what this pull request would have landed.',
+					'The failure is real — it is what this pull request would have landed. SWARM handles the failing checks the same way as for any red pull request (Respond-to-CI, when it is enabled for this repository), and a fixed head gets its own review before it can merge. Where Respond-to-CI is not enabled, the combination needs fixing by hand on this branch.',
 				)
 			: mergeRefusalCommentBody(
 					`The review approved head \`${job.approvedHeadSha}\`, but that head fails its checks: ${failed}.`,
