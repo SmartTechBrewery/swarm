@@ -40,7 +40,8 @@
  * or `opened` event the handler re-queries *every* check on the head SHA
  * (`SCMProvider.getAggregateCheckStatus`) and decides via
  * `decideAggregateCheckOutcome` (`aggregate-check-decision.ts`): review if all
- * complete and none failed, respond-to-ci if a check failed, or **defer** if some
+ * complete and every one passed (`success`/`neutral`/`skipped` — a cancelled or
+ * timed-out check is a failure, issue #1429), respond-to-ci if a check failed, or **defer** if some
  * check is still incomplete. Ported from Cascade's `check-suite-success`/`-failure`
  * triggers. A zero-check head defers too, under the default
  * `reviewChecks: 'required'` policy of the PR's repository (per repository since

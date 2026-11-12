@@ -236,6 +236,22 @@ export const QueuedRunSchema = z.object({
 export type QueuedRun = z.infer<typeof QueuedRunSchema>;
 
 /**
+ * The `checks` conclusions the hint reads as a red head (issue #1429): a cancelled
+ * or timed-out run is red to the handler's classifier
+ * (`src/triggers/handlers/aggregate-check-decision.ts`), not a Review. A positive
+ * list rather than "anything but a pass", because GitLab and Bitbucket carry an
+ * in-flight state (`running`, `pending`) through verbatim, and that is no red.
+ */
+const RED_CHECK_CONCLUSIONS: ReadonlySet<string> = new Set([
+	'failure',
+	'timed_out',
+	'action_required',
+	'cancelled',
+	'stale',
+	'startup_failure',
+]);
+
+/**
  * Derive a best-effort phase hint purely from the job's already-parsed event —
  * no GitHub network call. Mirrors (but does not replace) the authoritative
  * trigger-handler rules in `src/triggers/handlers/*.ts`, which re-check state
@@ -252,7 +268,9 @@ export function deriveQueuedPhaseHint(job: SwarmJob): QueuedPhaseHint {
 		case 'pull-request-review':
 			return event.reviewState === 'approved' ? 'review' : 'respond-to-review';
 		case 'checks':
-			return event.checkConclusion === 'failure' ? 'respond-to-ci' : 'review';
+			return event.checkConclusion !== undefined && RED_CHECK_CONCLUSIONS.has(event.checkConclusion)
+				? 'respond-to-ci'
+				: 'review';
 		case 'pull-request':
 			return event.action === 'closed' && event.merged === true ? 'resolve-conflicts' : 'review';
 		default:

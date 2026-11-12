@@ -592,6 +592,14 @@ export const MergeAutomationJobSchema = jobBase.extend({
 	 */
 	baseUpdates: z.number().int().min(0).optional(),
 	/**
+	 * When this dispatch last advanced `approvedHeadSha` by a base update (issue
+	 * #1429) — what bounds the wait for that head's checks to register before an
+	 * `if-present` repository's zero-check answer is believed
+	 * (`UPDATED_HEAD_CHECKS_GRACE_MS`, `src/worker/merge-automation.ts`). Absent on
+	 * a dispatch that never advanced, and on every row written before it existed.
+	 */
+	headAdvancedAt: z.string().datetime().optional(),
+	/**
 	 * When this dispatch first found itself at the head of its repository's merge
 	 * queue (issue #1114) — stamped by the dispatch, carried through every retry it
 	 * schedules, and read by the dispatches waiting behind it for the "has held the

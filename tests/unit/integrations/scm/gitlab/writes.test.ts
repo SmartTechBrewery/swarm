@@ -403,6 +403,21 @@ describe('gitlab merge-request writes', () => {
 			expect(new URL(String(fetchMock.mock.calls[0]?.[0])).searchParams.get('sha')).toBe(HEAD_SHA);
 		});
 
+		// Issue #1429: a canceled pipeline is a red head, so it is retried too.
+		it('retries a canceled newest pipeline', async () => {
+			fetchMock
+				.mockResolvedValueOnce(jsonResponse([{ id: 31, status: 'canceled', ref: 'issue-17' }]))
+				.mockResolvedValueOnce(jsonResponse({ id: 31, status: 'pending' }, 201));
+
+			await expect(scoped(() => retryFailedGitLabPipelines(REPO, HEAD_SHA))).resolves.toEqual([
+				'pipeline #31 (issue-17)',
+			]);
+			expect(requestSequence(fetchMock)).toEqual([
+				['GET', PIPELINES_PATH],
+				['POST', `${PIPELINES_PATH}/31/retry`],
+			]);
+		});
+
 		it('reports a pipeline by its configured name when it has one', async () => {
 			fetchMock
 				.mockResolvedValueOnce(

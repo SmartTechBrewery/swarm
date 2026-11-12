@@ -300,6 +300,20 @@ export const MERGE_QUEUE_RECHECK_MS = 60_000;
  */
 const UPDATED_HEAD_CLAIM_TTL_SEC = 15 * 60;
 
+/**
+ * How long after advancing onto an updated head a zero-check answer is read as
+ * "the checks have not registered yet" rather than "this repository has no CI"
+ * under `reviewChecks: if-present` (issue #1429). A provider registers a head's
+ * check suite seconds after the push, and the first retry after an update fires
+ * at 15s ({@link mergeRetryDelayMs}) — on GitHub the Actions read can return no
+ * runs (or a queued run with no jobs yet) at that moment, which `if-present`
+ * otherwise reads as green, so the head merged before its CI ever started. Three
+ * minutes covers several retries while staying well inside the ~13-minute
+ * post-update budget, so a repository that genuinely has no CI still merges.
+ * Coded, not configurable, on `RERUN_SETTLE_MS`'s precedent.
+ */
+export const UPDATED_HEAD_CHECKS_GRACE_MS = 3 * 60_000;
+
 /** The delay before retry attempt `attempt` (1-indexed; attempt 0 is the immediate one). */
 export function mergeRetryDelayMs(attempt: number): number {
 	return Math.min(
@@ -687,24 +701,56 @@ function baseUpdatesSpent(job: MergeAutomationJob): number {
  *
  * Judged with the *same* classifier and the same repository policy the `pr-review`
  * handler uses ({@link decideAggregateCheckOutcome}), so a head is never green
- * to merge automation and red to the pipeline. A repository that opts into
- * `if-present` accepts a zero-check answer here exactly as it does there.
+ * to merge automation and red to the pipeline — a `cancelled` or timed-out check
+ * included, which is red to both (issue #1429). A repository that opts into
+ * `if-present` accepts a zero-check answer here exactly as it does there, except
+ * on a head this dispatch advanced onto moments ago, whose checks have not had the
+ * time to register ({@link updatedHeadChecksNotReported}).
  */
 type FreshCheckVerdict =
 	| { kind: 'green' }
 	| { kind: 'pending'; message: string }
-	| { kind: 'red'; failedChecks: string[] };
+	| { kind: 'red'; checks: RedFreshChecks };
+
+/** The checks a red head fails: names for the re-run policy, named conclusions for messages. */
+interface RedFreshChecks {
+	names: string[];
+	details: string[];
+}
+
+/**
+ * One exception to "the same classifier, the same answer" (issue #1429): a head
+ * this dispatch advanced onto less than {@link UPDATED_HEAD_CHECKS_GRACE_MS} ago
+ * that reads zero checks under `if-present` is held, not merged — its checks have
+ * most likely not registered yet. `undefined` when the exception does not apply.
+ * A row written before `headAdvancedAt` existed keeps the plain classifier answer.
+ */
+function updatedHeadChecksNotReported(
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	totalCount: number,
+	now: Date,
+): string | undefined {
+	if (totalCount !== 0 || baseUpdatesSpent(job) === 0 || !job.headAdvancedAt) return undefined;
+	if ((project.reviewChecks ?? 'required') !== 'if-present') return undefined;
+	const sinceAdvanceMs = now.getTime() - new Date(job.headAdvancedAt).getTime();
+	if (sinceAdvanceMs >= UPDATED_HEAD_CHECKS_GRACE_MS) return undefined;
+	return `no checks have reported yet, ${Math.max(0, Math.round(sinceAdvanceMs / 1000))}s after the update`;
+}
 
 async function readFreshCheckVerdict(
 	job: MergeAutomationJob,
 	project: ProjectConfig,
 	capabilities: MergeAutomationCapabilities,
+	now = new Date(),
 ): Promise<FreshCheckVerdict> {
 	const read =
 		capabilities.getAggregateCheckStatus ?? scmCapability(project, 'getAggregateCheckStatus');
 	// Reviewer: every read the control plane makes runs as the project's reviewer
 	// credential (issue #1249) — stated explicitly, as `readBaseBranchHealth` does.
 	const checks = await read(project, job.approvedHeadSha, 'reviewer');
+	const notReported = updatedHeadChecksNotReported(job, project, checks.totalCount, now);
+	if (notReported) return { kind: 'pending', message: notReported };
 	const decision = decideAggregateCheckOutcome(
 		checks,
 		job.prNumber,
@@ -712,7 +758,10 @@ async function readFreshCheckVerdict(
 	);
 	if (decision.action === 'defer') return { kind: 'pending', message: decision.message };
 	if (decision.action === 'respond-to-ci')
-		return { kind: 'red', failedChecks: decision.failedChecks };
+		return {
+			kind: 'red',
+			checks: { names: decision.failedChecks, details: decision.failedCheckDetails },
+		};
 	return { kind: 'green' };
 }
 
@@ -1173,6 +1222,8 @@ async function advanceOntoUpdatedHead(
 		...rest,
 		approvedHeadSha: headSha,
 		baseUpdates: baseUpdatesSpent(job) + 1,
+		// What bounds the wait for this head's checks to register (issue #1429).
+		headAdvancedAt: new Date().toISOString(),
 	};
 	const where = source === 'worker' ? ' on a SWARM worker' : '';
 	const advancedMessage = `Brought the head up to date with the base${where} (${job.approvedHeadSha} → ${headSha}); the approval carries forward and the merge waits for this head's own checks.`;
@@ -1762,7 +1813,7 @@ type MergeAttempt =
 			kind: 'answered';
 			outcome: MergePullRequestOutcome;
 			/** Set only when the attempt refused because the head it was about to merge is red. */
-			redFreshChecks: string[] | null;
+			redFreshChecks: RedFreshChecks | null;
 	  }
 	/** There was no operator to merge as (issue #1249); `reason` says why. */
 	| { kind: 'no-operator'; reason: string };
@@ -1822,7 +1873,9 @@ async function attemptMerge(
 			};
 		}
 		if (freshChecks.kind === 'red') {
-			const failed = freshChecks.failedChecks.join(', ');
+			// Named with each conclusion, so a `cancelled` or timed-out check reads as
+			// such on the run and the dashboard rather than as a plain failure (#1429).
+			const failed = freshChecks.checks.details.join(', ');
 			return {
 				kind: 'answered',
 				outcome: {
@@ -1831,7 +1884,7 @@ async function attemptMerge(
 						? `the head brought up to date with the base fails its checks (${failed}); the reviewed diff and the current base do not combine cleanly`
 						: `the approved head fails its checks (${failed}); merge automation does not merge a head whose checks are red`,
 				},
-				redFreshChecks: freshChecks.failedChecks,
+				redFreshChecks: freshChecks.checks,
 			};
 		}
 		// The merge itself is the pull request author's write (issue #1249).
@@ -2007,11 +2060,12 @@ async function refuseRedHead(
 	job: MergeAutomationJob,
 	project: ProjectConfig,
 	message: string,
-	redFreshChecks: string[],
+	redChecks: RedFreshChecks,
 	attempt: number,
 	capabilities: MergeAutomationCapabilities,
 ): Promise<MergeAutomationSettledOutcome> {
-	const failed = redFreshChecks.join(', ');
+	const redFreshChecks = redChecks.names;
+	const failed = redChecks.details.join(', ');
 	const updated = baseUpdatesSpent(job) > 0;
 	const adjudication = await adjudicateRedApprovedHead(job, project, redFreshChecks, capabilities);
 	if (adjudication !== 'not-applicable') {

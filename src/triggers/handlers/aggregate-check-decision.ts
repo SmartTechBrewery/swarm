@@ -15,12 +15,30 @@
 import type { ReviewChecksPolicy } from '../../config/schema.js';
 import type { AggregateCheckStatus } from '../../scm/types.js';
 
-/** Conclusions that count as a failed check — a commit with any of these is not reviewable. */
-const FAILURE_CONCLUSIONS = new Set(['failure', 'timed_out', 'action_required']);
+/**
+ * The only conclusions a completed check passes with (issue #1429). An allow-list,
+ * not a list of failures: a deny-list read `cancelled` — a job that hit its
+ * `timeout-minutes` on an overloaded runner, or was cancelled by hand — as green,
+ * and so would any conclusion a provider adds later (`stale`, `startup_failure`,
+ * an unmapped value) or a completed check that reports none. A head is green only
+ * when every check it has completed with one of these.
+ */
+const PASSING_CONCLUSIONS: ReadonlySet<string> = new Set(['success', 'neutral', 'skipped']);
+
+/** Whether a check conclusion counts as passed — {@link PASSING_CONCLUSIONS}. */
+export function isPassingConclusion(conclusion: string | null | undefined): boolean {
+	return conclusion != null && PASSING_CONCLUSIONS.has(conclusion);
+}
 
 export type AggregateCheckDecision =
 	| { action: 'defer'; incompleteChecks: string[]; message: string }
-	| { action: 'respond-to-ci'; failedChecks: string[] }
+	| {
+			action: 'respond-to-ci';
+			/** The failed checks' names — what base-branch attribution and the re-run policy compare. */
+			failedChecks: string[];
+			/** The same checks with their conclusion, `"<name> (<conclusion>)"` — for messages only. */
+			failedCheckDetails: string[];
+	  }
 	| { action: 'review'; basis: 'checks-passed' | 'no-checks' };
 
 /**
@@ -29,11 +47,14 @@ export type AggregateCheckDecision =
  *  - `defer`  — some check hasn't reached `completed`. The caller schedules a
  *    coalesced re-check so a stale checks API (which can lag the webhook that
  *    woke us) is re-queried rather than trusted once.
- *  - `respond-to-ci` — every check completed and at least one failed. Routes
- *    the PR to the Respond-to-CI phase (`src/pipeline/respond-to-ci.ts`), which
- *    runs the implementer to fix the build — mirroring Cascade's respond-to-ci
- *    agent. `failedChecks` names the failing runs for the handler's log line.
- *  - `review` — every check completed and none failed. A zero-check result
+ *  - `respond-to-ci` — every check completed and at least one did not pass:
+ *    any conclusion outside {@link PASSING_CONCLUSIONS} — `failure`, `timed_out`,
+ *    `action_required`, `cancelled`, `stale`, an unknown value, or none at all —
+ *    is a failed check (issue #1429). Routes the PR to the Respond-to-CI phase
+ *    (`src/pipeline/respond-to-ci.ts`), which runs the implementer to fix the
+ *    build — mirroring Cascade's respond-to-ci agent. `failedChecks` names the
+ *    failing runs; `failedCheckDetails` adds each one's conclusion for messages.
+ *  - `review` — every check completed and every one passed. A zero-check result
  *    defers under the default `required` policy: the provider's checks API can
  *    temporarily return no runs just after a new commit, and treating that as
  *    green would bypass CI. A repository with no CI at all opts into `if-present`
@@ -75,11 +96,13 @@ export function decideAggregateCheckOutcome(
 		};
 	}
 
-	const failedChecks = checkStatus.checkRuns
-		.filter((cr) => cr.conclusion !== null && FAILURE_CONCLUSIONS.has(cr.conclusion))
-		.map((cr) => cr.name);
-	if (failedChecks.length > 0) {
-		return { action: 'respond-to-ci', failedChecks };
+	const failed = checkStatus.checkRuns.filter((cr) => !isPassingConclusion(cr.conclusion));
+	if (failed.length > 0) {
+		return {
+			action: 'respond-to-ci',
+			failedChecks: failed.map((cr) => cr.name),
+			failedCheckDetails: failed.map((cr) => `${cr.name} (${cr.conclusion ?? 'no conclusion'})`),
+		};
 	}
 
 	return { action: 'review', basis: 'checks-passed' };

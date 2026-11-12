@@ -71,7 +71,11 @@ describe('decideAggregateCheckOutcome', () => {
 			'9',
 			'if-present',
 		);
-		expect(decision).toEqual({ action: 'respond-to-ci', failedChecks: ['test'] });
+		expect(decision).toEqual({
+			action: 'respond-to-ci',
+			failedChecks: ['test'],
+			failedCheckDetails: ['test (failure)'],
+		});
 	});
 
 	it('reviews when a completed check is skipped/neutral (not a failure)', () => {
@@ -116,17 +120,63 @@ describe('decideAggregateCheckOutcome', () => {
 			]),
 			'9',
 		);
-		expect(decision).toEqual({ action: 'respond-to-ci', failedChecks: ['test'] });
+		expect(decision).toEqual({
+			action: 'respond-to-ci',
+			failedChecks: ['test'],
+			failedCheckDetails: ['test (failure)'],
+		});
 	});
 
+	// Issue #1429: an allow-list of passing conclusions, so a cancelled check (a job
+	// that hit its `timeout-minutes`) and any conclusion added later is red, never green.
 	it.each([
 		'failure',
 		'timed_out',
 		'action_required',
+		'cancelled',
+		'stale',
+		'startup_failure',
+		'something_new',
 	])('treats a %s conclusion as a failure → respond-to-ci', (conclusion) => {
 		expect(decideAggregateCheckOutcome(status([['test', 'completed', conclusion]]), '9')).toEqual({
 			action: 'respond-to-ci',
 			failedChecks: ['test'],
+			failedCheckDetails: [`test (${conclusion})`],
 		});
+	});
+
+	it('treats a cancelled check as red under the if-present policy too', () => {
+		expect(
+			decideAggregateCheckOutcome(
+				status([['Lint, typecheck, and test', 'completed', 'cancelled']]),
+				'9',
+				'if-present',
+			),
+		).toEqual({
+			action: 'respond-to-ci',
+			failedChecks: ['Lint, typecheck, and test'],
+			failedCheckDetails: ['Lint, typecheck, and test (cancelled)'],
+		});
+	});
+
+	it('treats a completed check with no conclusion as a failure', () => {
+		expect(decideAggregateCheckOutcome(status([['test', 'completed', null]]), '9')).toEqual({
+			action: 'respond-to-ci',
+			failedChecks: ['test'],
+			failedCheckDetails: ['test (no conclusion)'],
+		});
+	});
+
+	it('reviews when every check passed with success, neutral or skipped', () => {
+		expect(
+			decideAggregateCheckOutcome(
+				status([
+					['build', 'completed', 'success'],
+					['lint', 'completed', 'neutral'],
+					['optional', 'completed', 'skipped'],
+				]),
+				'9',
+			),
+		).toEqual({ action: 'review', basis: 'checks-passed' });
 	});
 });
