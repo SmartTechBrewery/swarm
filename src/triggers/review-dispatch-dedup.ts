@@ -86,6 +86,15 @@ export function buildReviewDispatchKey(repo: string, prNumber: string, headSha: 
 }
 
 /**
+ * The value merge automation's claim on a head its own branch update produced is
+ * stored under (`claimUpdatedHeadReviewSlot`, `src/worker/merge-automation.ts`).
+ * Named so the one reader that tells it apart from every other holder
+ * ({@link takeOverMergeAutomationClaim}, issue #1430) cannot drift from the
+ * writer.
+ */
+export const MERGE_AUTOMATION_CLAIM_OWNER = 'merge-automation';
+
+/**
  * The value a Review's claim is stored under — its owning dispatch (issue #1105),
  * so a hand-back can prove the claim it is about to release is still its own
  * ({@link releaseReviewDispatchHeldBy}).
@@ -101,6 +110,10 @@ export function reviewDispatchClaimOwner(dispatchId: string): string {
  *
  * `context.owner` is stored as the claim's value when given (otherwise the
  * trigger name is) — the token {@link releaseReviewDispatchHeldBy} compares.
+ * `context.ttlSec` overrides the default lease for a holder that knows up front
+ * it needs the slot for longer, so the claim and its lease are one atomic write
+ * and the owner token survives (a later {@link refreshReviewDispatchClaim}
+ * would overwrite it).
  *
  * Fails closed on Redis errors: logs and returns `false` so the caller skips the
  * dispatch rather than risk a duplicate review.
@@ -108,7 +121,7 @@ export function reviewDispatchClaimOwner(dispatchId: string): string {
 export async function claimReviewDispatch(
 	key: string,
 	triggerName: string,
-	context: { prNumber: string; headSha: string; owner?: string },
+	context: { prNumber: string; headSha: string; owner?: string; ttlSec?: number },
 ): Promise<boolean> {
 	const namespacedKey = `${KEY_NS}${key}`;
 	try {
@@ -116,7 +129,7 @@ export async function claimReviewDispatch(
 			namespacedKey,
 			context.owner ?? triggerName,
 			'EX',
-			DEDUP_TTL_SEC,
+			context.ttlSec ?? DEDUP_TTL_SEC,
 			'NX',
 		);
 		if (result === 'OK') {
@@ -360,5 +373,91 @@ export async function reviewClaimedWithoutChecksTtlSec(key: string): Promise<num
 			error: String(err),
 		});
 		return undefined;
+	}
+}
+
+// Compare-and-set: hand the slot to ARGV[2] only while merge automation (ARGV[1])
+// holds it, keeping its TTL; a no-op on any other holder or a missing key.
+const TAKE_OVER_IF_HELD_BY = `if redis.call('get', KEYS[1]) == ARGV[1] then redis.call('set', KEYS[1], ARGV[2], 'XX', 'KEEPTTL') return 1 end return 0`;
+
+/**
+ * Take the claim on `key` over for `owner` **only while merge automation holds
+ * it** for a head its own branch update produced ({@link MERGE_AUTOMATION_CLAIM_OWNER},
+ * issue #1430). Returns `true` when this caller now holds the slot.
+ *
+ * Merge automation takes that claim so the head's *green* checks start no
+ * redundant Review — it never guards against a CI fix, and the merge dispatch
+ * never dispatches one. A red that arrives while it is held is therefore not a
+ * duplicate of anything, and dropping it stranded the pull request: nothing
+ * re-fires `checks completed` for that head. Every other holder — a Review, a
+ * running CI fix, a held continuation — is left alone.
+ *
+ * One Lua script, so the take-over is atomic: of several sibling red events,
+ * exactly one finds the merge-automation value and wins; the value is then the
+ * winner's own token, so every later event reads an ordinary holder and drops.
+ * The lease is kept rather than reset — the CI fix extends it itself.
+ *
+ * Fails closed, like {@link claimReviewDispatch}: a Redis error logs and returns
+ * `false`, so the caller keeps the duplicate drop rather than risk a second fix.
+ */
+export async function takeOverMergeAutomationClaim(key: string, owner: string): Promise<boolean> {
+	const namespacedKey = `${KEY_NS}${key}`;
+	try {
+		const taken = await getRedis().eval(
+			TAKE_OVER_IF_HELD_BY,
+			1,
+			namespacedKey,
+			MERGE_AUTOMATION_CLAIM_OWNER,
+			owner,
+		);
+		return taken === 1;
+	} catch (err) {
+		logger.error(
+			'review-dispatch dedup: merge-automation claim take-over failed — failing closed',
+			{
+				reviewDispatchKey: key,
+				error: String(err),
+			},
+		);
+		return false;
+	}
+}
+
+// Extend merge automation's (ARGV[1]) lease to ARGV[2] seconds while it holds the
+// slot, or re-establish it under that owner if it lapsed; a no-op on any other holder.
+const REFRESH_IF_HELD_BY = `local v = redis.call('get', KEYS[1]) if v == ARGV[1] then redis.call('expire', KEYS[1], ARGV[2]) return 1 elseif not v then redis.call('set', KEYS[1], ARGV[1], 'EX', ARGV[2], 'NX') return 1 end return 0`;
+
+/**
+ * Keep merge automation's claim on a head its own branch update produced alive
+ * for another `ttlSec` while that head's checks are still pending (issue #1432),
+ * **without** rewriting its owner token. {@link refreshReviewDispatchClaim} would
+ * overwrite the value with its own, after which a red on that head could no
+ * longer find {@link MERGE_AUTOMATION_CLAIM_OWNER} and
+ * {@link takeOverMergeAutomationClaim} would drop the one CI fix it needs
+ * (issue #1430).
+ *
+ * Extends the lease while merge automation holds the slot, re-establishes it
+ * under that owner if it lapsed a moment ago, and leaves any other holder — a CI
+ * fix that already took it over, a Review — alone. One Lua script, so the read
+ * and the write cannot interleave with a take-over.
+ *
+ * Best-effort, like {@link refreshReviewDispatchClaim}: errors are logged, never
+ * thrown.
+ */
+export async function refreshMergeAutomationClaim(key: string, ttlSec: number): Promise<void> {
+	const namespacedKey = `${KEY_NS}${key}`;
+	try {
+		await getRedis().eval(
+			REFRESH_IF_HELD_BY,
+			1,
+			namespacedKey,
+			MERGE_AUTOMATION_CLAIM_OWNER,
+			String(ttlSec),
+		);
+	} catch (err) {
+		logger.warn('review-dispatch dedup: merge-automation claim refresh failed (TTL will reap)', {
+			reviewDispatchKey: key,
+			error: String(err),
+		});
 	}
 }

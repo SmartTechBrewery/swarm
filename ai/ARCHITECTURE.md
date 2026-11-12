@@ -1005,11 +1005,16 @@ during the update, the red head and the spent allowance each also post one
 best-effort comment on the pull request, in
 `scmCommentCiFixGaveUp`'s shape, so a refusal is visible where the work is and
 not only on the dashboard. (5) Before scheduling the retry the dispatch **claims
-the updated head's PR+SHA review-dispatch slot** (`claimReviewDispatch`, then
-refreshed to 15 minutes so it outlasts CI): without it the head's own `checks
-completed` event dispatches a Review, spending one of `REVIEW_VERDICT_CAP`'s
-three verdicts per update on an unchanged diff, and a pull request bumped twice
-would reach its merge unable to be reviewed at all. The update happens at the
+the updated head's PR+SHA review-dispatch slot** (`claimReviewDispatch` with a
+15-minute lease, so it outlasts CI, stored under `MERGE_AUTOMATION_CLAIM_OWNER`):
+without it the head's own `checks completed` event dispatches a Review, spending
+one of `REVIEW_VERDICT_CAP`'s three verdicts per update on an unchanged diff, and
+a pull request bumped twice would reach its merge unable to be reviewed at all.
+The claim holds off only that Review (issue #1430): a red on the head takes it
+over atomically (`takeOverMergeAutomationClaim`, a compare-and-set that matches
+no other holder) and goes to Respond-to-CI, so the red is neither dropped as a
+duplicate nor fixed twice — whether the merge dispatch is still waiting or has
+already settled `merge-retry-exhausted` with the claim still live. The update happens at the
 moment one pull request's own merge is attempted, never as a standing job, and
 only for the pull request holding its repository's merge queue (issue #1114,
 below) — and the outcome vocabulary needs no migration, since

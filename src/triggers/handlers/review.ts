@@ -240,6 +240,16 @@
  * re-checks the head once the claim lapses instead of being dropped as a
  * duplicate; the re-check must still win the claim, so one head never gets two CI
  * fixes. A repository with genuinely no CI is unaffected: no red ever arrives.
+ *
+ * **Nor does merge automation's claim on a head it produced** (issue #1430). A
+ * base update makes merge automation claim the new head's slot for fifteen
+ * minutes (`claimUpdatedHeadReviewSlot`) so that head's green checks start no
+ * redundant Review. That claim never stood for a CI fix, and it outlives the
+ * merge dispatch's own retry budget, so a red that met it was dropped and nothing
+ * ever acted on it again. A red event now takes that claim over atomically
+ * (`takeOverMergeAutomationClaim`) and dispatches the CI fix; one sibling wins,
+ * and every later event reads an ordinary holder and drops. A green on that head
+ * still meets the claim and starts no Review.
  */
 
 import type { ProjectConfig } from '../../config/schema.js';
@@ -295,6 +305,7 @@ import {
 	reviewClaimedWithoutChecksTtlSec,
 	reviewDispatchClaimOwner,
 	reviewDispatchClaimTtlSec,
+	takeOverMergeAutomationClaim,
 } from '../review-dispatch-dedup.js';
 import { checkRecheckCoalesceKey, mergeabilityRecheckCoalesceKey } from '../review-recheck-keys.js';
 import {
@@ -2217,10 +2228,70 @@ async function markClaimIfTakenWithoutChecks(
 }
 
 /**
+ * A red head whose PR+SHA slot is held by merge automation's claim on a head its
+ * own branch update produced (`claimUpdatedHeadReviewSlot`, issue #1430): take
+ * that claim over for this dispatch, so the red reaches Respond-to-CI instead of
+ * being dropped as a duplicate. Returns `true` only when this dispatch now holds
+ * the slot; any other disposition or holder returns `false` and keeps the drop.
+ *
+ * That claim exists only so the head's green checks start no redundant Review;
+ * merge automation never fixes CI, and it keeps the claim for its full fifteen
+ * minutes even after it has given up on the merge. Dropping the red there
+ * stranded the pull request, because nothing re-fires `checks completed` for that
+ * head. The take-over is atomic, so of several sibling red events exactly one
+ * wins, and the CI fix then extends the lease over its own run.
+ */
+async function takeOverUpdatedHeadClaimForCiFix(
+	ctx: ScmTriggerContext,
+	disposition: Exclude<ReviewDisposition, { kind: 'none' }>,
+	dispatchKey: string,
+	prNumber: string,
+	headSha: string,
+): Promise<boolean> {
+	if (disposition.kind !== 'respond-to-ci') return false;
+	const taken = await takeOverMergeAutomationClaim(
+		dispatchKey,
+		reviewDispatchClaimOwner(ctx.dispatchId),
+	);
+	if (taken) {
+		logger.info(
+			"review: red head held by merge automation's updated-head claim — taking the slot for the CI fix",
+			{ prNumber, headSha, reviewDispatchKey: dispatchKey },
+		);
+	}
+	return taken;
+}
+
+/**
+ * Take the PR+SHA slot for this dispatch: claim it, or — for a red head merge
+ * automation's updated-head claim holds — take that claim over
+ * ({@link takeOverUpdatedHeadClaimForCiFix}, issue #1430). `false` means another
+ * holder keeps it.
+ */
+async function winDispatchSlot(
+	ctx: ScmTriggerContext,
+	disposition: Exclude<ReviewDisposition, { kind: 'none' }>,
+	dispatchKey: string,
+	prNumber: string,
+	headSha: string,
+): Promise<boolean> {
+	const claimed = await claimReviewDispatch(dispatchKey, 'pr-review', {
+		prNumber,
+		headSha,
+		owner: reviewDispatchClaimOwner(ctx.dispatchId),
+	});
+	return (
+		claimed || takeOverUpdatedHeadClaimForCiFix(ctx, disposition, dispatchKey, prNumber, headSha)
+	);
+}
+
+/**
  * The PR+SHA claim is held by someone else: a red head held by a Review taken
  * without checks re-checks once that claim lapses (issue #1270); every other
  * collision is the duplicate drop, recorded so the operator need not diagnose it
- * off the board (issue #1019). Always `null`.
+ * off the board (issue #1019). (A red head held by merge automation never gets
+ * here — it takes the claim over first, {@link takeOverUpdatedHeadClaimForCiFix}.)
+ * Always `null`.
  */
 async function declineHeldDispatchClaim(
 	ctx: ScmTriggerContext,
@@ -2292,7 +2363,12 @@ export function createReviewTrigger(): TriggerHandler {
 			// Review holds this slot. That claim is marked as taken without checks, and
 			// a red event that collides with it re-checks once it lapses instead of
 			// being dropped ({@link recheckRedHeldByCheckLessReview}) — and still has to win
-			// the claim then, so one head never gets two CI fixes.
+			// the claim then, so one head never gets two CI fixes. The other holder that
+			// is no duplicate of a CI fix is merge automation's claim on a head its
+			// branch update produced (issue #1430): it only holds off that head's green
+			// Review, so a red takes it over atomically and goes on to the fix
+			// ({@link takeOverUpdatedHeadClaimForCiFix}) — exactly one sibling wins.
+			// The two holders never coexist, so the order between them decides nothing.
 			const dispatchKey = buildReviewDispatchKey(ctx.project.repo, prNumber, headSha);
 			// Two kinds of job arrive here already *holding* this PR+SHA claim, and
 			// both must reuse it rather than re-claim: re-claiming within the TTL would
@@ -2312,12 +2388,7 @@ export function createReviewTrigger(): TriggerHandler {
 					heldFor: heldClaim,
 				});
 			} else {
-				const claimed = await claimReviewDispatch(dispatchKey, 'pr-review', {
-					prNumber,
-					headSha,
-					owner: reviewDispatchClaimOwner(ctx.dispatchId),
-				});
-				if (!claimed) {
+				if (!(await winDispatchSlot(ctx, disposition, dispatchKey, prNumber, headSha))) {
 					return declineHeldDispatchClaim(ctx, disposition, dispatchKey, prNumber, headSha);
 				}
 			}

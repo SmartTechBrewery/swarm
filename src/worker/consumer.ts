@@ -6375,6 +6375,21 @@ export async function processJob(
 	}
 }
 
+/**
+ * Log a delivery no trigger dispatched. A recorded decline names why (issue
+ * #1430), so it is logged at `info` — the level production runs at — with its
+ * kind and reason; a delivery no handler had anything to say about stays at
+ * `debug`. The message is the same either way, so log searches keep matching.
+ */
+function logNoTrigger(fields: Record<string, unknown>, decline: TriggerDecline | undefined): void {
+	const message = 'Job matched no trigger — completing as a no-op';
+	if (!decline) {
+		logger.debug(message, fields);
+		return;
+	}
+	logger.info(message, { ...fields, declineKind: decline.kind, declineReason: decline.reason });
+}
+
 /** {@link processJob}'s body once the dispatch is claimed and the attempt is this process's own. */
 async function processClaimedDispatch(
 	dispatch: DispatchRow,
@@ -6461,12 +6476,15 @@ async function processClaimedDispatch(
 		});
 		const matched = await registry.dispatch(ctx);
 		if (!matched) {
-			logger.debug('Job matched no trigger — completing as a no-op', {
-				projectId: project.id,
-				source: ctx.source,
-				event: ctx.source === 'scm' ? ctx.event.kind : ctx.event.action,
-				deliveryId: job.deliveryId,
-			});
+			logNoTrigger(
+				{
+					projectId: project.id,
+					source: ctx.source,
+					event: ctx.source === 'scm' ? ctx.event.kind : ctx.event.action,
+					deliveryId: job.deliveryId,
+				},
+				decline,
+			);
 			return settleNoTriggerDelivery(job, project, dispatch, decline);
 		}
 		trigger = matched;

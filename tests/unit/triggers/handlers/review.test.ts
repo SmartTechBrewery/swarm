@@ -21,6 +21,7 @@ const {
 	reviewDispatchClaimTtlSec,
 	markReviewDispatchClaimedWithoutChecks,
 	reviewClaimedWithoutChecksTtlSec,
+	takeOverMergeAutomationClaim,
 } = vi.hoisted(() => ({
 	claimReviewDispatch: vi.fn(),
 	refreshReviewDispatchClaim: vi.fn(),
@@ -31,6 +32,9 @@ const {
 	// defaults to "not held by such a Review", the ordinary collision.
 	markReviewDispatchClaimedWithoutChecks: vi.fn(),
 	reviewClaimedWithoutChecksTtlSec: vi.fn(),
+	// The red event's take-over of merge automation's updated-head claim (issue
+	// #1430); defaults to "not held by merge automation", the ordinary collision.
+	takeOverMergeAutomationClaim: vi.fn(),
 }));
 vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	claimReviewDispatch,
@@ -38,6 +42,7 @@ vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	reviewDispatchClaimTtlSec,
 	markReviewDispatchClaimedWithoutChecks,
 	reviewClaimedWithoutChecksTtlSec,
+	takeOverMergeAutomationClaim,
 	reviewDispatchClaimOwner: (dispatchId: string) => `pr-review:${dispatchId}`,
 	buildReviewDispatchKey: (repo: string, prNumber: string, headSha: string) =>
 		`${repo}:${prNumber}:${headSha}`,
@@ -219,6 +224,8 @@ beforeEach(() => {
 	markReviewDispatchClaimedWithoutChecks.mockResolvedValue(undefined);
 	reviewClaimedWithoutChecksTtlSec.mockReset();
 	reviewClaimedWithoutChecksTtlSec.mockResolvedValue(undefined);
+	takeOverMergeAutomationClaim.mockReset();
+	takeOverMergeAutomationClaim.mockResolvedValue(false);
 	claimRespondToCiAttempt.mockReset();
 	claimRespondToCiAttempt.mockResolvedValue({ allowed: true, attempt: 1 });
 	claimConflictResolution.mockReset();
@@ -3899,5 +3906,124 @@ describe('review trigger — red after a Review taken without checks (issue #127
 
 		expect(await handler.handle(ctx(opened, { project: IF_PRESENT }))).toBeNull();
 		expect(markReviewDispatchClaimedWithoutChecks).not.toHaveBeenCalled();
+	});
+});
+
+/**
+ * A red check suite on a head merge automation's own branch update produced
+ * (issue #1430). Merge automation claims that head's PR+SHA slot for fifteen
+ * minutes so its green checks start no redundant Review, and keeps the claim even
+ * after its retry budget ran out with CI still running. The red that then arrived
+ * was dropped as a duplicate, and nothing ever acted on it again. The red event
+ * now takes that one holder's claim over and goes on to Respond-to-CI.
+ */
+describe('review trigger — red on a head merge automation brought up to date (issue #1430)', () => {
+	const KEY = `${PROJECT.repo}:42:merged-with-base`;
+	const checks = {
+		kind: 'checks',
+		action: 'completed',
+		workItemId: '42',
+		headSha: 'merged-with-base',
+		prBranch: 'issue-42',
+	} as const;
+
+	beforeEach(() => {
+		getPullRequest.mockResolvedValue({
+			number: 42,
+			headBranch: 'issue-42',
+			headSha: 'merged-with-base',
+			baseBranch: 'main',
+			baseSha: 'base123',
+			mergeable: true,
+			authorLogin: 'operator-human',
+			state: 'open',
+		});
+		// Merge automation holds the updated head's slot.
+		claimReviewDispatch.mockResolvedValue(false);
+	});
+
+	it('reaches Respond-to-CI: updated-head claim held → red suite → CI fix', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+		takeOverMergeAutomationClaim.mockResolvedValue(true);
+		const noteDecline = vi.fn();
+
+		expect(await handler.handle(ctx(checks, { noteDecline }))).toEqual({
+			phase: 'respond-to-ci',
+			taskId: '42-ci',
+			prNumber: '42',
+			prBranch: 'issue-42',
+			headSha: 'merged-with-base',
+		});
+
+		// Taken over for this dispatch, not merely read.
+		expect(takeOverMergeAutomationClaim).toHaveBeenCalledExactlyOnceWith(
+			KEY,
+			'pr-review:dispatch-1',
+		);
+		expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+		// The fix extends the lease over its own run.
+		expect(refreshReviewDispatchClaim).toHaveBeenCalledWith(KEY, expect.any(Number));
+		expect(noteDecline).not.toHaveBeenCalled();
+		expect(loggerInfo).toHaveBeenCalledWith(
+			expect.stringContaining("merge automation's updated-head claim"),
+			expect.objectContaining({ prNumber: '42', headSha: 'merged-with-base' }),
+		);
+	});
+
+	// The claim's whole purpose: the head's green checks spend no verdict slot.
+	it('still starts no Review on a green head while the claim is held', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'success']]));
+		const noteDecline = vi.fn();
+
+		expect(await handler.handle(ctx(checks, { noteDecline }))).toBeNull();
+
+		expect(takeOverMergeAutomationClaim).not.toHaveBeenCalled();
+		expect(reserveReviewVerdict).not.toHaveBeenCalled();
+		expect(noteDecline).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ kind: 'dispatch-claim-held' }),
+		);
+	});
+
+	// A sibling red already took the slot over, or another holder has it: one CI
+	// fix per head.
+	it('keeps the duplicate drop when the take-over loses', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+		const noteDecline = vi.fn();
+
+		expect(await handler.handle(ctx(checks, { noteDecline }))).toBeNull();
+
+		expect(takeOverMergeAutomationClaim).toHaveBeenCalledTimes(1);
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+		expect(refreshReviewDispatchClaim).not.toHaveBeenCalled();
+		expect(noteDecline).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ kind: 'dispatch-claim-held' }),
+		);
+	});
+
+	// Both run before the claim, so neither reaches the take-over.
+	it('leaves an adjudicated red on an approved head to the re-run policy (issue #1128)', async () => {
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+		hasCiNoFixRecovery.mockResolvedValue(true);
+		getApprovedHeadSlot.mockResolvedValue({ checksRerunAt: null });
+		takeOverMergeAutomationClaim.mockResolvedValue(true);
+		const autoMerge = createMockProjectConfig({ autoMerge: true });
+
+		expect(await handler.handle(ctx(checks, { project: autoMerge }))).toBeNull();
+
+		expect(recoverAdjudicatedApprovedHead).toHaveBeenCalledTimes(1);
+		expect(takeOverMergeAutomationClaim).not.toHaveBeenCalled();
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+	});
+
+	it('leaves a red the base branch explains to the base report (issue #873)', async () => {
+		getBranchHead.mockResolvedValue('base-head-sha');
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+		takeOverMergeAutomationClaim.mockResolvedValue(true);
+
+		expect(await handler.handle(ctx(checks))).toBeNull();
+
+		expect(takeOverMergeAutomationClaim).not.toHaveBeenCalled();
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
 	});
 });

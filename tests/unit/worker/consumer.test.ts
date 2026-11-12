@@ -1933,6 +1933,48 @@ describe('processJob', () => {
 			});
 		});
 
+		// Issue #1430: a red dropped as a duplicate logged only the generic line, at
+		// `debug`, so production never showed why no CI fix was dispatched.
+		describe('the no-trigger log names the decline (issue #1430)', () => {
+			const fresh = () =>
+				createMockScmWebhookJob({ event: createMockScmEvent({ headSha: 'deadbeef' }) });
+			const NO_TRIGGER = 'Job matched no trigger — completing as a no-op';
+
+			it('logs a recorded decline at info, with its kind and reason', async () => {
+				const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
+				try {
+					await processJob(fresh(), registryDecliningWithHeldClaim());
+
+					expect(info).toHaveBeenCalledWith(
+						NO_TRIGGER,
+						expect.objectContaining({
+							declineKind: 'dispatch-claim-held',
+							declineReason: HELD_CLAIM_REASON,
+						}),
+					);
+				} finally {
+					info.mockRestore();
+				}
+			});
+
+			it('keeps a delivery nothing declined at debug, with no decline fields', async () => {
+				const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
+				const debug = vi.spyOn(logger, 'debug').mockImplementation(() => {});
+				try {
+					await processJob(fresh(), registryReturning(null));
+
+					expect(info).not.toHaveBeenCalledWith(NO_TRIGGER, expect.anything());
+					const logged = debug.mock.calls.find(([message]) => message === NO_TRIGGER);
+					expect(logged).toBeDefined();
+					expect(logged?.[1]).not.toHaveProperty('declineKind');
+					expect(logged?.[1]).not.toHaveProperty('declineReason');
+				} finally {
+					info.mockRestore();
+					debug.mockRestore();
+				}
+			});
+		});
+
 		// Issue #856: the trigger takes the PR+SHA dedup claim and the durable
 		// review-verdict reservation in the router, before any run row exists, while
 		// every hand-back used to be keyed on `job.runId`. A dispatch deferred for

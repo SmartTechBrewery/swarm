@@ -110,13 +110,14 @@ vi.mock('@/dispatch/dispatcher.js', () => ({
 // The review-dispatch dedup is Redis-backed; the updated head's claim (issue
 // #874) is asserted through these rather than against a real connection.
 const claimReviewDispatch = vi.fn(async (_key: string, _trigger: string, _ctx: unknown) => true);
-const refreshReviewDispatchClaim = vi.fn(async (_key: string, _ttl: number) => {});
+const refreshMergeAutomationClaim = vi.fn(async (_key: string, _ttl: number) => {});
 vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	buildReviewDispatchKey: (repo: string, prNumber: string, headSha: string) =>
 		`${repo}:${prNumber}:${headSha}`,
 	claimReviewDispatch: (key: string, trigger: string, ctx: unknown) =>
 		claimReviewDispatch(key, trigger, ctx),
-	refreshReviewDispatchClaim: (key: string, ttl: number) => refreshReviewDispatchClaim(key, ttl),
+	MERGE_AUTOMATION_CLAIM_OWNER: 'merge-automation',
+	refreshMergeAutomationClaim: (key: string, ttl: number) => refreshMergeAutomationClaim(key, ttl),
 }));
 
 // The real GitHub adapter over a stubbed Octokit (issue #1113), for the one case
@@ -296,7 +297,6 @@ beforeEach(() => {
 	scheduleCoalescedDispatch.mockResolvedValue(undefined);
 	claimReviewDispatch.mockClear();
 	claimReviewDispatch.mockResolvedValue(true);
-	refreshReviewDispatchClaim.mockClear();
 	settleAbsorbedChildren.mockClear();
 	settleAbsorbedChildren.mockResolvedValue([]);
 	markReviewVerdictSuperseded.mockClear();
@@ -1229,15 +1229,18 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 			}),
 		});
 
+		// Held past the dedup module's five-minute default, which CI routinely
+		// outlasts — in the claim itself, so its merge-automation owner value (the
+		// one a red event may take over, issue #1430) is never rewritten by a refresh.
 		expect(claimReviewDispatch).toHaveBeenCalledExactlyOnceWith(
 			`${project.repo}:17:merged-with-base`,
 			'merge-automation',
-			{ prNumber: '17', headSha: 'merged-with-base' },
-		);
-		// Held past the dedup module's five-minute default, which CI routinely outlasts.
-		expect(refreshReviewDispatchClaim).toHaveBeenCalledExactlyOnceWith(
-			`${project.repo}:17:merged-with-base`,
-			15 * 60,
+			{
+				prNumber: '17',
+				headSha: 'merged-with-base',
+				owner: 'merge-automation',
+				ttlSec: 15 * 60,
+			},
 		);
 		expect(claimReviewDispatch.mock.invocationCallOrder[0]).toBeLessThan(
 			scheduleDispatchRetry.mock.invocationCallOrder[0],
@@ -1695,7 +1698,7 @@ describe("processMergeAutomationDispatch: waits for a head's pending checks past
 		const payload = await updatedHeadPendingPastBudget();
 		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
 		const commentOnPullRequest = vi.fn(async (_p: unknown, _n: number, _body: string) => 1);
-		refreshReviewDispatchClaim.mockClear();
+		refreshMergeAutomationClaim.mockClear();
 
 		const outcome = await processMergeAutomationDispatch(
 			mockDispatchRow({ attempt: MAX_MERGE_RETRIES }),
@@ -1713,7 +1716,7 @@ describe("processMergeAutomationDispatch: waits for a head's pending checks past
 		expect(commentOnPullRequest).toHaveBeenCalledOnce();
 		expect(commentOnPullRequest.mock.calls[0]?.[2]).toContain('brought this pull request');
 		// A red head is refused, never kept claimed.
-		expect(refreshReviewDispatchClaim).not.toHaveBeenCalled();
+		expect(refreshMergeAutomationClaim).not.toHaveBeenCalled();
 		expect(outcome.result).toBe('not-eligible');
 	});
 
@@ -1831,7 +1834,7 @@ describe("processMergeAutomationDispatch: waits for a head's pending checks past
 			getAggregateCheckStatus: checksRunning(),
 		});
 
-		expect(refreshReviewDispatchClaim).toHaveBeenCalledExactlyOnceWith(
+		expect(refreshMergeAutomationClaim).toHaveBeenCalledExactlyOnceWith(
 			`${project.repo}:17:${UPDATED}`,
 			15 * 60,
 		);
@@ -1846,7 +1849,7 @@ describe("processMergeAutomationDispatch: waits for a head's pending checks past
 			getAggregateCheckStatus: checksConcluding('success'),
 		});
 
-		expect(refreshReviewDispatchClaim).not.toHaveBeenCalled();
+		expect(refreshMergeAutomationClaim).not.toHaveBeenCalled();
 	});
 });
 
@@ -2049,7 +2052,7 @@ describe('processMergeAutomationDispatch: a provider that cannot update a branch
 		expect(claimReviewDispatch).toHaveBeenCalledWith(
 			`${project.repo}:17:worker-merge`,
 			'merge-automation',
-			{ prNumber: '17', headSha: 'worker-merge' },
+			expect.objectContaining({ prNumber: '17', headSha: 'worker-merge' }),
 		);
 		expect(updateReviewMergeOutcome).toHaveBeenCalledExactlyOnceWith('run-1', {
 			status: 'stale-base',
@@ -3274,7 +3277,12 @@ describe('processMergeAutomationDispatch: an adjudicated red approved head (issu
 
 		expect(policy.hasCiNoFixRecovery).not.toHaveBeenCalled();
 		expect(policy.recoverAdjudicatedApprovedHead).not.toHaveBeenCalled();
-		expect(commentOnPullRequest.mock.calls[0]?.[2]).toContain('Each side is green on its own');
+		const body = commentOnPullRequest.mock.calls[0]?.[2];
+		expect(body).toContain('Each side is green on its own');
+		// Issue #1430: the red goes to Respond-to-CI, so the comment must not
+		// tell a human to fix the branch that agent is pushing to.
+		expect(body).toContain('Respond-to-CI');
+		expect(body).not.toContain('Fix the combination on this branch');
 	});
 
 	it('keeps the #1124 refusal when the adjudication cannot be read', async () => {
