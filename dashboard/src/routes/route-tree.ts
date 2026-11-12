@@ -1,4 +1,5 @@
 import { rootRoute } from './__root.js';
+import { bugReportsRoute } from './bug-reports.js';
 import { indexRoute } from './index.js';
 import { loginRoute } from './login.js';
 import { profileRoute } from './profile.js';
@@ -25,6 +26,7 @@ export const routeTree = rootRoute.addChildren([
 	workersRoute,
 	workerDetailRoute,
 	settingsRoute,
+	bugReportsRoute,
 	quotaRoute,
 	profileRoute,
 ]);

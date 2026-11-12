@@ -5,10 +5,11 @@ import { render, screen } from '@testing-library/react';
 import type { AnchorHTMLAttributes, ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { navigate, pingQueryFn, projectsQueryFn } = vi.hoisted(() => ({
+const { navigate, pingQueryFn, projectsQueryFn, currentPath } = vi.hoisted(() => ({
 	navigate: vi.fn(),
 	pingQueryFn: vi.fn(),
 	projectsQueryFn: vi.fn(),
+	currentPath: { value: '/projects' },
 }));
 
 // A `Link` renders as a plain anchor so its destination is assertable without a
@@ -25,7 +26,7 @@ vi.mock('@tanstack/react-router', () => ({
 	),
 	useNavigate: () => navigate,
 	useRouterState: ({ select }: { select: (state: { location: { pathname: string } }) => string }) =>
-		select({ location: { pathname: '/projects' } }),
+		select({ location: { pathname: currentPath.value } }),
 }));
 
 vi.mock('@/lib/trpc.js', () => ({
@@ -59,6 +60,7 @@ function renderSidebar() {
 }
 
 beforeEach(() => {
+	currentPath.value = '/projects';
 	pingQueryFn.mockResolvedValue({ ok: true });
 	projectsQueryFn.mockResolvedValue([]);
 	vi.mocked(useCurrentUser).mockReturnValue(
@@ -99,7 +101,7 @@ describe('Sidebar navigation', () => {
 		const entries = [...(container.querySelector('nav')?.querySelectorAll('a') ?? [])].map(
 			(link) => link.textContent,
 		);
-		expect(entries).toEqual(['Runs', 'Workers', 'Alpha', 'Settings']);
+		expect(entries).toEqual(['Runs', 'Workers', 'Alpha', 'Settings', 'Bug reports']);
 	});
 
 	it('labels the /settings link Settings under the General heading', () => {
@@ -109,6 +111,47 @@ describe('Sidebar navigation', () => {
 		expect(link.getAttribute('href')).toBe('/settings');
 		expect(screen.queryByRole('link', { name: 'General' })).toBeNull();
 		expect(screen.getByText('General', { selector: 'div' })).toBeTruthy();
+	});
+
+	it.each([
+		{ role: 'an instance administrator', instanceAdmin: true },
+		{ role: 'a member', instanceAdmin: false },
+	])('offers $role the bug reports directly below Settings (issue #1443)', ({ instanceAdmin }) => {
+		signInAs(instanceAdmin);
+
+		const container = renderSidebar();
+
+		const link = screen.getByRole('link', { name: 'Bug reports' });
+		expect(link.getAttribute('href')).toBe('/bug-reports');
+		const entries = [...(container.querySelector('nav')?.querySelectorAll('a') ?? [])];
+		const settings = screen.getByRole('link', { name: 'Settings' });
+		expect(entries.indexOf(link as HTMLAnchorElement)).toBe(
+			entries.indexOf(settings as HTMLAnchorElement) + 1,
+		);
+		// Same group: nothing but the two links sits between the General heading and them.
+		expect(settings.nextElementSibling).toBe(link);
+	});
+
+	it('highlights Bug reports, and not Settings, while the bug reports are open', () => {
+		currentPath.value = '/bug-reports';
+
+		renderSidebar();
+
+		const link = screen.getByRole('link', { name: 'Bug reports' });
+		const settings = screen.getByRole('link', { name: 'Settings' });
+		expect(link.className).toContain('bg-zinc-800/40 text-zinc-100');
+		expect(settings.className).not.toContain('text-zinc-100');
+	});
+
+	it('highlights Settings, and not Bug reports, on /settings', () => {
+		currentPath.value = '/settings';
+
+		renderSidebar();
+
+		expect(screen.getByRole('link', { name: 'Settings' }).className).toContain('text-zinc-100');
+		expect(screen.getByRole('link', { name: 'Bug reports' }).className).not.toContain(
+			'text-zinc-100',
+		);
 	});
 });
 

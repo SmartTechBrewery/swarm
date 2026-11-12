@@ -9,8 +9,9 @@ vi.mock('@/components/theme/theme-provider.js', () => ({
 	useTheme: mockUseTheme,
 }));
 
-import { SETTINGS_TABS, visibleSettingsTabs } from '@/lib/settings-nav.js';
-import { AppearancePanel, SettingsPageTitle, SettingsTabBar } from './index.js';
+import { isRedirect } from '@tanstack/react-router';
+import { SETTINGS_TABS, settingsSearchSchema, visibleSettingsTabs } from '@/lib/settings-nav.js';
+import { AppearancePanel, SettingsPageTitle, SettingsTabBar, settingsRoute } from './index.js';
 
 describe('SettingsPageTitle', () => {
 	// The page reads "General"; the sidebar link that opens it reads "Settings" (issue #1390).
@@ -18,6 +19,45 @@ describe('SettingsPageTitle', () => {
 		render(<SettingsPageTitle />);
 
 		expect(screen.getByRole('heading', { level: 1 }).textContent).toBe('General');
+	});
+});
+
+describe('settingsRoute legacy bug-report links (issue #1443)', () => {
+	const REPORT = '00000000-0000-4000-8000-000000000001';
+
+	/** What the route's `beforeLoad` does for `rawSearch`: the redirect it throws, if any. */
+	function beforeLoadFor(rawSearch: Record<string, unknown>) {
+		const search = settingsSearchSchema.parse(rawSearch);
+		try {
+			// biome-ignore lint/suspicious/noExplicitAny: `beforeLoad` reads only `search`.
+			settingsRoute.options.beforeLoad?.({ search } as any);
+		} catch (thrown) {
+			return thrown;
+		}
+		return undefined;
+	}
+
+	it.each([
+		{ link: '?tab=issues', rawSearch: { tab: 'issues' }, search: {} },
+		{
+			link: '?tab=issues&report=<id>',
+			rawSearch: { tab: 'issues', report: REPORT },
+			search: { report: REPORT },
+		},
+	])('redirects $link to the bug reports page', ({ rawSearch, search }) => {
+		const thrown = beforeLoadFor(rawSearch);
+
+		expect(isRedirect(thrown)).toBe(true);
+		const options = (thrown as { options: { to: string; search: unknown; replace: boolean } })
+			.options;
+		expect(options.to).toBe('/bug-reports');
+		expect(options.search).toEqual(search);
+		expect(options.replace).toBe(true);
+	});
+
+	it('leaves every other settings link on the settings page', () => {
+		expect(beforeLoadFor({})).toBeUndefined();
+		expect(beforeLoadFor({ tab: 'appearance' })).toBeUndefined();
 	});
 });
 
@@ -32,19 +72,13 @@ describe('SettingsTabBar', () => {
 		);
 
 		const labels = screen.getAllByRole('button').map((button) => button.textContent);
-		expect(labels).toEqual([
-			'Agent Defaults',
-			'Credentials',
-			'Users',
-			'Fleet',
-			'Issues',
-			'Appearance',
-		]);
+		expect(labels).toEqual(['Agent Defaults', 'Credentials', 'Users', 'Fleet', 'Appearance']);
 		// The rendered order and the `?tab=` vocabulary must not drift apart.
 		expect(labels).toHaveLength(SETTINGS_TABS.length);
 	});
 
-	it('offers no admin-only tab to a non-administrator (issues #666, #769, #1151, #1284, #1390)', () => {
+	// Issues is no longer a tab: the bug reports have their own page (issue #1443).
+	it('offers no admin-only tab to a non-administrator (issues #666, #769, #1151, #1284)', () => {
 		render(
 			<SettingsTabBar
 				tabs={visibleSettingsTabs({ instanceAdmin: false })}
@@ -54,7 +88,7 @@ describe('SettingsTabBar', () => {
 		);
 
 		const labels = screen.getAllByRole('button').map((button) => button.textContent);
-		expect(labels).toEqual(['Issues', 'Appearance']);
+		expect(labels).toEqual(['Appearance']);
 	});
 
 	it('selects the tab that was clicked', () => {

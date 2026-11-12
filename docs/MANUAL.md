@@ -1985,18 +1985,34 @@ MCP server's `bug_report*` tools, by anyone with `member` on the project
 may file reports and add occurrences but not triage them. See
 [`docs/mcp.md`](./mcp.md#bug-reports).
 
-**The Issues tab shows them in the dashboard** (issue #1390). It is on the
-**General** page, which the sidebar's **Settings** link opens (`/settings?tab=issues`),
-and every signed-in user sees it: it lists the reports of the projects you can
-read, plus installation-wide ones if you are an installation admin. It starts on
-the open reports (`new`, `confirmed`, `environmental`, `ticketed`); the chips above
-the list switch to **All** or to one status. Each row shows the title, status,
-project (**Installation** for an installation-wide report), how many times it was
-seen, when it was first and last seen, and the GitHub issue once it is ticketed.
-Selecting a report opens its detail, with a link of its own
-(`/settings?tab=issues&report=<id>`): the description, who filed it and from which
+**The sidebar's Bug reports entry shows them in the dashboard** (issues #1390,
+#1443). It sits in the **General** group directly below **Settings** and opens
+`/bug-reports`; every signed-in user sees it: it lists the reports of the projects
+you can read, plus installation-wide ones if you are an installation admin. (The
+reports were the **Issues** tab of the settings page until issue #1443; old
+`/settings?tab=issues` and `/settings?tab=issues&report=<id>` links redirect to the
+new page.) It starts on the open reports (`new`, `confirmed`, `environmental`,
+`ticketed`); the chips above the list switch to **All** or to one status. Each row
+shows the title, status, project (**Installation** for an installation-wide report),
+how many times it was seen, when it was first and last seen, and the GitHub issue
+once it is ticketed. Selecting a report opens its detail, with a link of its own
+(`/bug-reports?report=<id>`): its ID, the description, who filed it and from which
 agent run, the report it duplicates, the GitHub issue, and every occurrence, each
-with a link to its run. The tab is read-only — filing and triage stay with MCP.
+with a link to its run.
+
+**Reports are triaged there as well as through MCP** (issue #1443), by whoever
+`bug_report_set_status` would allow — `member` on the report's project, or an
+installation admin for any report, installation-wide ones included; anyone else
+sees no status controls, and the server refuses the change regardless. A report's
+detail has a **Change status** form offering every status: `duplicate` asks for
+the ID of the report it duplicates, `ticketed` for the GitHub issue URL unless the
+report already has one, and a change that would change nothing is not offered. In
+the list, tick reports — or the header box for every one on the page — choose a
+status, and change them all at once. Each report is changed on its own: the result
+says how many changed and names every report that was refused, with the server's
+reason, and the refused ones stay selected. Either way the list and the detail
+show the new status straight away, and a report that no longer matches the
+filter leaves the list. Filing reports and adding occurrences stay with MCP.
 
 For a terminal recognised response stall, SWARM labels a task as **likely scope
 exceeded** only when it also observed substantial progress and the most recent

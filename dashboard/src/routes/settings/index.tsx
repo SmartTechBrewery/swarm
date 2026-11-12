@@ -1,7 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { createRoute, useNavigate } from '@tanstack/react-router';
+import { createRoute, redirect, useNavigate } from '@tanstack/react-router';
 import {
-	Bug,
 	Cpu,
 	KeyRound,
 	type LucideIcon,
@@ -14,14 +13,14 @@ import {
 } from 'lucide-react';
 import type React from 'react';
 import { useEffect, useMemo, useState } from 'react';
-import { BugReportsPanel } from '@/components/settings/bug-reports-panel.js';
 import { FleetUpdatesPanel } from '@/components/settings/fleet-updates-panel.js';
 import { InstanceCredentialsPanel } from '@/components/settings/instance-credentials-panel.js';
 import { UsersPanel } from '@/components/settings/users-panel.js';
 import { useTheme } from '@/components/theme/theme-provider.js';
 import { buttonClass } from '@/components/ui/button.js';
+import { BUG_REPORTS_PATH } from '@/lib/bug-reports-nav.js';
 import {
-	bugReportSearch,
+	legacyBugReportsRedirect,
 	resolveActiveSettingsTab,
 	type SettingsTab,
 	settingsSearchSchema,
@@ -304,7 +303,6 @@ const SETTINGS_TAB_ITEMS: ReadonlyArray<{ tab: SettingsTab; label: string; icon:
 	{ tab: 'credentials', label: 'Credentials', icon: KeyRound },
 	{ tab: 'users', label: 'Users', icon: UsersRound },
 	{ tab: 'fleet', label: 'Fleet', icon: RefreshCw },
-	{ tab: 'issues', label: 'Issues', icon: Bug },
 	{ tab: 'appearance', label: 'Appearance', icon: Palette },
 ];
 
@@ -349,7 +347,8 @@ export function SettingsTabBar({
 /**
  * The page title. The page is **General** while the sidebar link to it reads
  * **Settings** (issue #1390): the sidebar names the group of installation-wide
- * screens, the heading names this one.
+ * screens, the heading names this one. SWARM's bug reports, once a tab here, are the
+ * group's own **Bug reports** entry since issue #1443.
  */
 export function SettingsPageTitle() {
 	return (
@@ -375,9 +374,6 @@ function SettingsRouteComponent() {
 	const activeTab = resolveActiveSettingsTab(search, viewer);
 	const goToTab = (tab: SettingsTab) => {
 		navigate({ to: '/settings', search: settingsTabSearch(tab) });
-	};
-	const goToReport = (reportId: string | undefined) => {
-		navigate({ to: '/settings', search: bugReportSearch(reportId) });
 	};
 
 	const settingsQuery = useQuery(trpc.settings.get.queryOptions());
@@ -436,7 +432,7 @@ function SettingsRouteComponent() {
 		});
 	};
 
-	// Credentials, Users and Issues each own their query and remain usable if
+	// Credentials and Users each own their query and remain usable if
 	// `settings.get` fails; only the tabs that render from the settings blob wait on it.
 	const needsSettings = settingsTabNeedsAppSettings(activeTab);
 	if (needsSettings && settingsQuery.isLoading) {
@@ -479,10 +475,6 @@ function SettingsRouteComponent() {
 
 			{activeTab === 'fleet' && <FleetUpdatesPanel settings={settings ?? FALLBACK_SETTINGS} />}
 
-			{activeTab === 'issues' && (
-				<BugReportsPanel selectedReportId={search.report} onSelectReport={goToReport} />
-			)}
-
 			{activeTab === 'appearance' && <AppearancePanel />}
 		</div>
 	);
@@ -492,5 +484,11 @@ export const settingsRoute = createRoute({
 	getParentRoute: () => rootRoute,
 	path: '/settings',
 	validateSearch: (search) => settingsSearchSchema.parse(search),
+	// The bug reports were this page's Issues tab until issue #1443; a link already
+	// posted to one (`?tab=issues`, `&report=<id>`) opens them on their own page.
+	beforeLoad: ({ search }) => {
+		const target = legacyBugReportsRedirect(search);
+		if (target) throw redirect({ to: BUG_REPORTS_PATH, search: target, replace: true });
+	},
 	component: SettingsRouteComponent,
 });

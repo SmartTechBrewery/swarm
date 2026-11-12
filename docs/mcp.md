@@ -569,10 +569,13 @@ it and when. Filing a report records its first occurrence, so `occurrenceCount`
 always equals the occurrence rows, and `firstSeenAt`/`lastSeenAt` are the first
 and latest of them.
 
-The dashboard shows the same reports, read-only, on the **Issues** tab of the
-**General** page (sidebar **General → Settings**): `/settings?tab=issues`, or
-`/settings?tab=issues&report=<id>` for one report (see
-[`MANUAL.md`](./MANUAL.md)).
+The dashboard shows the same reports on its own page, the sidebar's **Bug reports**
+entry directly below **General → Settings**: `/bug-reports`, or
+`/bug-reports?report=<id>` for one report. Older `/settings?tab=issues` and
+`/settings?tab=issues&report=<id>` links, from before issue #1443, redirect there.
+A user `bug_report_set_status` would allow can also change a report's status there,
+one report on its detail or several selected in the list at once, through the same
+`bugReports.setStatus` procedure and rules (see [`MANUAL.md`](./MANUAL.md)).
 
 | Status | Meaning | Open |
 | --- | --- | --- |

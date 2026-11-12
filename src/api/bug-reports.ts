@@ -12,7 +12,7 @@
  *
  * Browser-safe on purpose: this module imports Zod alone — no database, no node
  * built-in, not even `@trpc/server` (the dashboard does not depend on it) — so the
- * dashboard's Issues tab (phase 2) reads the very same statuses and schemas the API
+ * dashboard's bug reports page reads the very same statuses and schemas the API
  * enforces. That is why {@link validateStatusChange} returns its refusal instead of
  * throwing a `TRPCError`; the router (`./routers/bugReports.ts`) throws it.
  */
