@@ -10828,6 +10828,42 @@ describe('processJob', () => {
 			expect(revokeRunBoundAgentTokens).toHaveBeenCalledWith('run-1');
 		});
 
+		// Issue #1441: the failure was already fixed outside SWARM — nothing to resolve.
+		it('completes an already-resolved attempt with its explanation as the run headline', async () => {
+			phaseImpl = async () => ({
+				agent: agentResult(),
+				resolveProblem: {
+					...REPORT,
+					outcome: 'already-resolved',
+					actions: [],
+					summary: 'PR #2219 was merged outside SWARM.',
+				},
+			});
+
+			const outcome = await processJob(RESOLVE_JOB, registryReturning(null));
+
+			expect(outcome).toMatchObject({ status: 'phase-succeeded', phase: 'resolve-problem' });
+			expect(completeRun).toHaveBeenCalledWith(
+				'run-1',
+				expect.objectContaining({
+					status: 'completed',
+					error:
+						'Resolve problem found nothing left to resolve — the failed run was already fixed: PR #2219 was merged outside SWARM. Tried: no recovery action.',
+				}),
+			);
+			expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'phase-succeeded');
+			expect(revokeRunBoundAgentTokens).toHaveBeenCalledWith('run-1');
+		});
+
+		it('records no headline on a resolved attempt', async () => {
+			await processJob(RESOLVE_JOB, registryReturning(null));
+
+			const settle = completeRun.mock.calls.find(
+				([, input]) => (input as { status?: string }).status === 'completed',
+			);
+			expect(settle?.[1]).not.toHaveProperty('error');
+		});
+
 		it('fails an attempt that filed no bug report', async () => {
 			findOccurrenceFiledByRun.mockResolvedValue(undefined);
 

@@ -172,6 +172,32 @@ describe('RunAttemptsTimeline (issue #1400)', () => {
 		).toBeDefined();
 	});
 
+	// Issue #1441: a completed Resolve problem attempt records why there was nothing
+	// to resolve — a note, not a failure.
+	it("styles a completed attempt's note as neutral and a failed attempt's error as red", () => {
+		const [deferred, failed] = attempts;
+		render(
+			<RunAttemptsTimeline
+				attempts={[
+					{
+						...deferred,
+						outcome: 'completed',
+						error: 'Resolve problem found nothing left to resolve',
+					},
+					failed,
+				]}
+			/>,
+		);
+
+		const note = within(screen.getByTestId('run-attempt-1')).getByText(
+			'Resolve problem found nothing left to resolve',
+		);
+		expect(note.classList.contains('text-zinc-300')).toBe(true);
+		expect(note.classList.contains('text-red-400')).toBe(false);
+		const error = within(screen.getByTestId('run-attempt-2')).getByText(/invalid reference/);
+		expect(error.classList.contains('text-red-400')).toBe(true);
+	});
+
 	it('renders nothing for a run with no recorded attempts', () => {
 		const { container } = render(<RunAttemptsTimeline attempts={[]} />);
 		expect(container.firstChild).toBeNull();

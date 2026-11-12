@@ -386,13 +386,25 @@ function describeActions(report: ResolveProblemReport): string {
 		.join('; ')}.`;
 }
 
+/** What a Resolve problem attempt that succeeded settles with. */
+export interface ResolveProblemSettle {
+	/**
+	 * The completed run's headline, when it has one to record: set only for an
+	 * `already-resolved` report (issue #1441), saying why there was nothing to resolve.
+	 */
+	headline?: string;
+}
+
 /**
  * Decide a finished Resolve problem run from the report its agent handed back. It
- * succeeds only when the report says `resolved` **and** the run filed a bug-report
- * occurrence (`filed_by_run_id` = this run) — checked here by a database read, never
- * taken from the report's own claim. Anything else throws a terminal `AgentRunError`
- * (`kind: 'error'`, so it is not retried) whose message is what the run and the
- * board item show: the summary and the actions tried, so an escalation reads as one.
+ * succeeds only when the report says `resolved` or `already-resolved` (issue #1441)
+ * **and** the run filed a bug-report occurrence (`filed_by_run_id` = this run) —
+ * checked here by a database read, never taken from the report's own claim, and for
+ * every outcome alike. An `already-resolved` success returns the headline the
+ * completed run records: the agent's own explanation of why the failure no longer
+ * blocks anything. Anything else throws a terminal `AgentRunError` (`kind: 'error'`,
+ * so it is not retried) whose message is what the run and the board item show: the
+ * summary and the actions tried, so an escalation reads as one.
  */
 export async function verifyResolveProblemOutcome(
 	input: {
@@ -403,7 +415,7 @@ export async function verifyResolveProblemOutcome(
 		subject?: 'failed-run' | 'ticket';
 	},
 	findOccurrence: typeof findOccurrenceFiledByRun = findOccurrenceFiledByRun,
-): Promise<void> {
+): Promise<ResolveProblemSettle> {
 	const { runId, report, agent } = input;
 	const fail = (message: string): never => {
 		throw new AgentRunError(message, { kind: 'error' }, agent);
@@ -416,9 +428,16 @@ export async function verifyResolveProblemOutcome(
 			`Resolve problem filed no bug report for this run — it must create one or add an occurrence with filedByRunId ${runId ?? '(unknown run)'}. Its own summary: ${verified.summary} ${describeActions(verified)}`,
 		);
 	}
+	const subject = input.subject === 'ticket' ? 'stuck ticket' : 'failed run';
 	if (verified.outcome === 'unresolved') {
 		fail(
-			`Resolve problem could not resolve the ${input.subject === 'ticket' ? 'stuck ticket' : 'failed run'}: ${verified.summary} ${describeActions(verified)}`,
+			`Resolve problem could not resolve the ${subject}: ${verified.summary} ${describeActions(verified)}`,
 		);
 	}
+	if (verified.outcome === 'already-resolved') {
+		return {
+			headline: `Resolve problem found nothing left to resolve — the ${subject} was already fixed: ${verified.summary} ${describeActions(verified)}`,
+		};
+	}
+	return {};
 }

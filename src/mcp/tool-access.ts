@@ -108,6 +108,7 @@ export const TOOL_ACCESS: Readonly<Record<string, ToolAccess>> = {
 	pipeline_snapshot: { minRole: 'contributor', scope: 'project', agentScoped: true },
 	dispatch_history: { minRole: 'contributor', scope: 'project', agentScoped: true },
 	pr_status: { minRole: 'contributor', scope: 'project', agentScoped: true },
+	pr_live_state: { minRole: 'contributor', scope: 'project', agentScoped: true },
 	pipeline_stats: { minRole: 'contributor', scope: 'project', agentScoped: true },
 	phase_agents_get: { minRole: 'contributor', scope: 'project', agentScoped: true },
 	consistency_check: { minRole: 'contributor', scope: 'project', agentScoped: true },

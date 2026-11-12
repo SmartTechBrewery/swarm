@@ -1323,12 +1323,14 @@ export interface MergeabilityRecheckResult {
 /**
  * Resolve the project scoped to `repository` and read the pull request from the
  * project's own provider. A repository the project does not own reads as not found;
- * a provider read that fails is an internal failure, since nothing can be keyed on a
- * base it never learnt.
+ * a provider read that fails is an internal failure, since nothing may be decided
+ * from a read that did not happen.
  */
-async function planMergeabilityRecheck(
-	input: MergeabilityRecheckInput,
-): Promise<MergeabilityRecheckPlan> {
+async function readProjectPullRequest(input: PullRequestStatusInput): Promise<{
+	project: ProjectConfig;
+	provider: SCMProvider;
+	details: PullRequestDetails;
+}> {
 	const record = await findProjectRecordByIdFromDb(input.projectId);
 	if (!record || !findProjectRepository(record, input.repository)) {
 		throw new TRPCError({
@@ -1338,15 +1340,56 @@ async function planMergeabilityRecheck(
 	}
 	const project = scopeProjectToRepository(record, input.repository);
 	const provider = requireProjectSCMProvider(project);
-	let details: PullRequestDetails;
 	try {
-		details = await provider.getPullRequest(project, input.prNumber);
+		return { project, provider, details: await provider.getPullRequest(project, input.prNumber) };
 	} catch (error) {
 		throw new TRPCError({
 			code: 'INTERNAL_SERVER_ERROR',
 			message: `Could not read pull request #${input.prNumber} in ${input.repository} from its provider: ${describeError(error)}`,
 		});
 	}
+}
+
+/**
+ * One pull request's current state as the project's source-control provider
+ * reports it (issue #1441) — the operator MCP server's `pr_live_state` tool. The
+ * provider's `closed` + `merged` pair is folded into the three states an operator
+ * names: `open`, `merged`, `closed` (closed without merging).
+ */
+export interface PullRequestLiveState {
+	projectId: string;
+	repository: string;
+	prNumber: number;
+	state: 'open' | 'merged' | 'closed';
+	headSha: string;
+	headBranch: string;
+	baseBranch: string;
+}
+
+/** The live state of one pull request, read from the project's own provider. */
+async function readPullRequestLiveState(
+	input: PullRequestLiveStateInput,
+): Promise<PullRequestLiveState> {
+	const { project, details } = await readProjectPullRequest(input);
+	return {
+		projectId: project.id,
+		repository: project.repo,
+		prNumber: input.prNumber,
+		state: details.merged ? 'merged' : details.state,
+		headSha: details.headSha,
+		headBranch: details.headBranch,
+		baseBranch: details.baseBranch,
+	};
+}
+
+/**
+ * Plan the conflict check for one pull request from its provider's live read
+ * ({@link readProjectPullRequest}): nothing can be keyed on a base it never learnt.
+ */
+async function planMergeabilityRecheck(
+	input: MergeabilityRecheckInput,
+): Promise<MergeabilityRecheckPlan> {
+	const { project, provider, details } = await readProjectPullRequest(input);
 	const prNumber = String(input.prNumber);
 	const coalesceKey = conflictCheckCoalesceKey(project.repo, prNumber, details.baseBranch);
 	const wouldRefuse =
@@ -2006,6 +2049,11 @@ export const PullRequestStatusInputSchema = z.object({
  * `runs.prStatus` names it.
  */
 export const MergeabilityRecheckInputSchema = PullRequestStatusInputSchema;
+export type PullRequestStatusInput = z.infer<typeof PullRequestStatusInputSchema>;
+
+/** `runs.prLiveState`'s input — one pull request of one project (issue #1441). */
+export const PullRequestLiveStateInputSchema = PullRequestStatusInputSchema;
+export type PullRequestLiveStateInput = z.infer<typeof PullRequestLiveStateInputSchema>;
 export type MergeabilityRecheckInput = z.infer<typeof MergeabilityRecheckInputSchema>;
 
 /** `runs.closeMergedWorkItem`'s input — one pull request of one project (issue #1351). */
@@ -2507,6 +2555,18 @@ export const runsRouter = router({
 				listActiveReviewSlotsForPullRequest(input.projectId, input.repository, prNumber),
 			]);
 			return toPullRequestStatus(run, slots);
+		}),
+
+	// One pull request's live state from the project's own source-control provider
+	// (issue #1441) — the operator MCP server's `pr_live_state` tool, which a Resolve
+	// problem agent reads to see a merge, close or push made outside SWARM. Read-only.
+	//
+	// Gated like `prStatus`, and like it deliberately not in `runReadProcedures`.
+	prLiveState: authedProcedure
+		.input(PullRequestLiveStateInputSchema)
+		.query(async ({ ctx, input }): Promise<PullRequestLiveState> => {
+			await assertProjectAccess(ctx.user, input.projectId, 'contributor');
+			return readPullRequestLiveState(input);
 		}),
 
 	// The stuck states SWARM will not leave by itself (issue #1344) — the operator

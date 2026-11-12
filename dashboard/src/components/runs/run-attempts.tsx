@@ -92,7 +92,16 @@ function AttemptEntry({ attempt, latest }: { attempt: RunAttempt; latest: boolea
 					{retryAt ? ` · retry was scheduled for ${retryAt}` : ''}
 				</p>
 				{attempt.error && (
-					<pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words p-2.5 bg-red-950/30 border border-red-900/30 text-xs text-red-400 rounded font-mono">
+					// A completed attempt's note is not a failure — a Resolve problem run that
+					// found nothing left to resolve records one (issue #1441) — so it reads
+					// neutral; every other outcome's error keeps the red box.
+					<pre
+						className={`max-h-32 overflow-auto whitespace-pre-wrap break-words p-2.5 border text-xs rounded font-mono ${
+							attempt.outcome === 'completed'
+								? 'bg-zinc-900/40 border-zinc-800 text-zinc-300'
+								: 'bg-red-950/30 border-red-900/30 text-red-400'
+						}`}
+					>
 						{attempt.error}
 					</pre>
 				)}

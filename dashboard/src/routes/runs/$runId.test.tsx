@@ -968,6 +968,52 @@ describe('CheckpointPanel (issue #504)', () => {
 	});
 });
 
+describe('RunDetailHeader for a Resolve problem run with nothing left to resolve (issue #1441)', () => {
+	function renderHeader(run: RunRow) {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		return render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={run} />
+			</QueryClientProvider>,
+		);
+	}
+
+	const HEADLINE =
+		'Resolve problem found nothing left to resolve — the failed run was already fixed: PR #2219 was merged outside SWARM.';
+
+	it('shows the headline as a green success callout, not a failure', () => {
+		renderHeader(
+			makeReviewRun({
+				phase: 'resolve-problem',
+				status: 'completed',
+				reviewVerdict: null,
+				reviewOrdinal: null,
+				reviewAutomationOutcome: null,
+				error: HEADLINE,
+			}),
+		);
+
+		const heading = screen.getByRole('heading', { name: 'Nothing left to resolve' });
+		expect(heading.classList.contains('text-emerald-200')).toBe(true);
+		expect(screen.getByText(HEADLINE)).toBeDefined();
+		expect(screen.queryByRole('heading', { name: /run failure error/i })).toBeNull();
+	});
+
+	it('shows nothing for a completed Resolve problem run without a headline', () => {
+		renderHeader(
+			makeReviewRun({
+				phase: 'resolve-problem',
+				status: 'completed',
+				reviewVerdict: null,
+				reviewOrdinal: null,
+				reviewAutomationOutcome: null,
+			}),
+		);
+
+		expect(screen.queryByRole('heading', { name: 'Nothing left to resolve' })).toBeNull();
+	});
+});
+
 describe('RunDetailHeader for a checkpointed run (issue #504)', () => {
 	function renderHeader(run: RunRow = makeCheckpointedRun()) {
 		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

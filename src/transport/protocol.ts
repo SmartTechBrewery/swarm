@@ -1005,7 +1005,8 @@ export const TaskExecutionResultSchema = z.object({
 	// Declared here rather than imported, like `mergeCatchUp`. Optional and additive.
 	resolveProblem: z
 		.object({
-			outcome: z.enum(['resolved', 'unresolved']),
+			// `already-resolved` (issue #1441): the failure was already fixed outside SWARM.
+			outcome: z.enum(['resolved', 'already-resolved', 'unresolved']),
 			bugReportId: z.string().min(1),
 			actions: z.array(z.object({ tool: z.string(), target: z.string(), result: z.string() })),
 			summary: z.string(),

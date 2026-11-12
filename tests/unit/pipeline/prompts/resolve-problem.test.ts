@@ -81,7 +81,7 @@ describe('buildResolveProblemPrompt (issue #1395)', () => {
 		expect(prompt).toContain('runId: "run-failed"');
 		expect(prompt).toContain('`environmental`');
 		expect(prompt).toContain(RESOLVE_PROBLEM_REPORT_FILENAME);
-		expect(prompt).toContain('"outcome": "resolved" | "unresolved"');
+		expect(prompt).toContain('"outcome": "resolved" | "already-resolved" | "unresolved"');
 	});
 
 	it("appends the project's custom prompt as a supplement", () => {
@@ -134,5 +134,46 @@ describe('buildResolveProblemPrompt — stuck tickets (issue #1425)', () => {
 		const prompt = buildResolveProblemPrompt(INPUT);
 		expect(prompt).not.toContain('THE STUCK TICKET');
 		expect(prompt).not.toContain('If no SWARM tool can move the ticket');
+	});
+});
+
+describe('buildResolveProblemPrompt — the pull request’s live state (issue #1441)', () => {
+	it('has a run attempt with a pull request read its live state and report already-resolved when it is gone', () => {
+		const prompt = buildResolveProblemPrompt({
+			...INPUT,
+			failedRun: { ...FAILED_RUN, prNumber: '2219' },
+		});
+		expect(prompt).toContain(
+			'`pr_live_state` (`projectId: "swarm"`, `repository: "SmartTechBrewery/swarm"`, `prNumber: 2219`)',
+		);
+		expect(prompt).toContain('before any remedy, and again before you write your report');
+		expect(prompt).toContain(
+			'If it is `merged` or `closed`, the failure no longer blocks anything',
+		);
+		expect(prompt).toContain('do not tell the operator to re-run, merge or push anything');
+		expect(prompt).toContain('report `already-resolved`');
+	});
+
+	it("has a ticket attempt read the ticket's own pull request in the ticket's repository", () => {
+		const prompt = buildResolveProblemPrompt({
+			...INPUT,
+			ticket: {
+				taskId: '1425',
+				repository: 'SmartTechBrewery/other',
+				reason: 'stalled',
+				slotOpenedAt: '2026-11-10T08:00:00.000Z',
+				prNumber: '42',
+			},
+		});
+		expect(prompt).toContain(
+			'`pr_live_state` (`projectId: "swarm"`, `repository: "SmartTechBrewery/other"`, `prNumber: 42`)',
+		);
+	});
+
+	it('names no live pull-request check for an attempt without a pull request', () => {
+		const prompt = buildResolveProblemPrompt(INPUT);
+		expect(prompt).not.toContain('pr_live_state');
+		// The outcome itself stays available: a newer run may already have done the work.
+		expect(prompt).toContain('`already-resolved` when the problem was already gone');
 	});
 });

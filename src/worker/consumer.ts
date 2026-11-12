@@ -6885,17 +6885,21 @@ async function processClaimedDispatch(
 		// The phase itself logs the scannable `Phase finished - <label>` line (it
 		// carries the run's result — PR URL, verdict, …); this is just the
 		// orchestration-level echo, kept at debug so success shows one finish line.
-		// A Resolve problem run succeeds only on a `resolved` report backed by a bug
-		// report it filed (issue #1395) — read here, where the database is. Anything
-		// else throws a terminal failure carrying the summary and the actions tried,
-		// which the shared failure path records on the run and the board item.
+		// A Resolve problem run succeeds only on a `resolved` or `already-resolved`
+		// report backed by a bug report it filed (issues #1395, #1441) — read here,
+		// where the database is. Anything else throws a terminal failure carrying the
+		// summary and the actions tried, which the shared failure path records on the
+		// run and the board item. An `already-resolved` settle carries a headline
+		// saying why there was nothing to resolve, recorded on the completed run.
+		let completedHeadline: string | undefined;
 		if (trigger.phase === 'resolve-problem') {
-			await verifyResolveProblemOutcome({
+			const settle = await verifyResolveProblemOutcome({
 				runId,
 				report: result.resolveProblem,
 				agent: result.agent,
 				subject: trigger.ticket ? 'ticket' : 'failed-run',
 			});
+			completedHeadline = settle.headline;
 		}
 		logger.debug('Job phase completed', {
 			projectId: project.id,
@@ -6925,6 +6929,7 @@ async function processClaimedDispatch(
 				// phase leaves the attribution column untouched (ADR-004 §4, issue #398).
 				producedPrUrl: result.prUrl,
 				planningScope: result.planningScope,
+				...(completedHeadline ? { error: completedHeadline } : {}),
 			},
 			result.agent,
 		);

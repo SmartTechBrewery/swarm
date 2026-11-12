@@ -701,6 +701,7 @@ describe('operator MCP — the handshake', () => {
 			'pm_board_discover',
 			'pm_board_set',
 			'pr_force_re_review',
+			'pr_live_state',
 			'pr_recheck_mergeability',
 			'pr_status',
 			'project_create',
@@ -753,6 +754,7 @@ const CONTRIBUTOR_TOOLS = [
 	'phase_agents_get',
 	'pipeline_snapshot',
 	'pipeline_stats',
+	'pr_live_state',
 	'pr_status',
 	'project_create',
 	'project_get',
@@ -841,6 +843,7 @@ const SCOPED_AGENT_TOOLS = [
 	'pipeline_stats',
 	'pm_board_discover',
 	'pr_force_re_review',
+	'pr_live_state',
 	'pr_recheck_mergeability',
 	'pr_status',
 	'project_get',
@@ -1551,6 +1554,72 @@ describe('operator MCP — pr_status', () => {
 		expect(result.content[0]?.text).toMatch(/^NOT_FOUND: /);
 		expect(getLatestCompletedReviewRunForPullRequest).not.toHaveBeenCalled();
 		expect(listActiveReviewSlotsForPullRequest).not.toHaveBeenCalled();
+	});
+});
+
+// Issue #1441 — the agent's view of a pull request merged or closed outside SWARM.
+describe('operator MCP — pr_live_state', () => {
+	const PR = { projectId: 'proj-a', repository: 'acme/widgets', prNumber: 2219 };
+	const getPullRequest = vi.fn();
+
+	function pullRequest(state: 'open' | 'closed', merged: boolean) {
+		return {
+			number: 2219,
+			headBranch: 'issue-2219',
+			headSha: 'abc123',
+			baseBranch: 'main',
+			baseSha: 'base',
+			mergeable: null,
+			authorLogin: 'someone',
+			state,
+			merged,
+		};
+	}
+
+	beforeEach(() => {
+		findProjectRecordByIdFromDb.mockResolvedValue(
+			createMockProjectRecord({ id: 'proj-a', repositories: [{ repo: 'acme/widgets' }] }),
+		);
+		getPullRequest.mockReset();
+		requireProjectSCMProvider.mockReturnValue({ type: 'github', getPullRequest });
+	});
+
+	it('shows a run-bound agent a pull request merged outside SWARM as merged, with its head', async () => {
+		getPullRequest.mockResolvedValue(pullRequest('closed', true));
+
+		const result = await callTool('pr_live_state', PR, 'run-bound-agent-token');
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toEqual({
+			projectId: 'proj-a',
+			repository: 'acme/widgets',
+			prNumber: 2219,
+			state: 'merged',
+			headSha: 'abc123',
+			headBranch: 'issue-2219',
+			baseBranch: 'main',
+		});
+		expect(getPullRequest).toHaveBeenCalledWith(
+			expect.objectContaining({ repo: 'acme/widgets' }),
+			2219,
+		);
+	});
+
+	it('shows a run-bound agent a pull request closed without merging as closed', async () => {
+		getPullRequest.mockResolvedValue(pullRequest('closed', false));
+
+		const result = await callTool('pr_live_state', PR, 'run-bound-agent-token');
+
+		expect(result.isError).toBeUndefined();
+		expect(result.structuredContent).toMatchObject({ state: 'closed', headSha: 'abc123' });
+	});
+
+	it('hides a project the caller is not a member of, asking no provider', async () => {
+		const result = await callTool('pr_live_state', PR, 'stranger-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^NOT_FOUND: /);
+		expect(getPullRequest).not.toHaveBeenCalled();
 	});
 });
 

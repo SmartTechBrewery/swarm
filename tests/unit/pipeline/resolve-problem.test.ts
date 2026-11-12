@@ -152,6 +152,17 @@ describe('runResolveProblem (issue #1395)', () => {
 		);
 	});
 
+	it('accepts an already-resolved report (issue #1441)', async () => {
+		const alreadyResolved: ResolveProblemReport = {
+			...REPORT,
+			outcome: 'already-resolved',
+			actions: [],
+			summary: 'PR #2219 was merged outside SWARM.',
+		};
+		const { report } = await run({ runAgent: fakeAgent(alreadyResolved) });
+		expect(report).toEqual(alreadyResolved);
+	});
+
 	it('fails on a report that does not match the contract', async () => {
 		await expect(run({ runAgent: fakeAgent('{not json') })).rejects.toThrow(/not valid JSON/);
 		await expect(run({ runAgent: fakeAgent({ ...REPORT, outcome: 'maybe' }) })).rejects.toThrow(
