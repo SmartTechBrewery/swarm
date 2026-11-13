@@ -25,9 +25,10 @@
  * Past it, the caller's *role ceiling* (their highest project role, or
  * installation admin) decides which tools `tools/list` shows and which may be
  * called (`TOOL_ACCESS`, `../mcp/tool-access.ts`), and each call is authorized per
- * project by the dashboard procedure the tool wraps. Agent access tokens are still
- * issued to installation administrators only (`MAY_USE_AGENT_ACCESS_TOKENS`), so a
- * non-admin connects with their `swarm login` session.
+ * project by the dashboard procedure the tool wraps. Since issue #1457 every
+ * signed-in user may hold agent access tokens (`MAY_USE_AGENT_ACCESS_TOKENS`); an
+ * unscoped one resolves to exactly the principal its holder's session does, so it
+ * reaches nothing that session could not.
  *
  * **A scoped agent credential** (issue #1385) — an agent access token issued with
  * `projectIds` — acts as its holder limited to those projects: every other project

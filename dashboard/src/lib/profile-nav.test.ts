@@ -36,9 +36,9 @@ const ADMIN = { instanceAdmin: true };
 const MEMBER = { instanceAdmin: false };
 
 describe('isProfileTabVisibleTo', () => {
-	it('shows the MCP tab to installation administrators only (issue #1362)', () => {
+	it('shows the MCP tab to every signed-in user (issues #1362, #1457)', () => {
 		expect(isProfileTabVisibleTo('mcp', ADMIN)).toBe(true);
-		expect(isProfileTabVisibleTo('mcp', MEMBER)).toBe(false);
+		expect(isProfileTabVisibleTo('mcp', MEMBER)).toBe(true);
 	});
 
 	it('shows every other delivered tab to everyone', () => {
@@ -81,9 +81,9 @@ describe('resolveActiveProfileTab', () => {
 		expect(resolveActiveProfileTab({ tab: 'security' }, MEMBER)).toBe('security');
 	});
 
-	it('honors the MCP tab for an admin and degrades it to Account for anyone else', () => {
+	it('honors the MCP tab for every signed-in user', () => {
 		expect(resolveActiveProfileTab({ tab: 'mcp' }, ADMIN)).toBe('mcp');
-		expect(resolveActiveProfileTab({ tab: 'mcp' }, MEMBER)).toBe('account');
+		expect(resolveActiveProfileTab({ tab: 'mcp' }, MEMBER)).toBe('mcp');
 	});
 
 	it('degrades a deep link to an unavailable tab to Account', () => {

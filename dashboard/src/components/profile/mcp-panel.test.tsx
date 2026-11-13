@@ -156,14 +156,16 @@ describe('McpPanel — issuing', () => {
 	});
 
 	it('shows a server refusal and keeps the name', async () => {
-		issueMutate.mockRejectedValue(new Error('Only installation administrators can hold tokens.'));
+		issueMutate.mockRejectedValue(
+			new Error('Your installation role cannot hold agent access tokens.'),
+		);
 		renderPanel();
 
 		fireEvent.change(await screen.findByLabelText('Token name'), { target: { value: 'laptop' } });
 		fireEvent.click(screen.getByRole('button', { name: 'Issue token' }));
 
 		expect(
-			await screen.findByText('Only installation administrators can hold tokens.'),
+			await screen.findByText('Your installation role cannot hold agent access tokens.'),
 		).toBeDefined();
 		expect((screen.getByLabelText('Token name') as HTMLInputElement).value).toBe('laptop');
 	});

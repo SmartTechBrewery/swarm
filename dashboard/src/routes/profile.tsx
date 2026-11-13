@@ -33,7 +33,7 @@ import { rootRoute } from './__root.js';
  * any other degrades to Account — so the navigation structure is stated once in
  * `lib/profile-nav.ts` while each follow-up ships its own tab. **Account**, **My
  * Workers** (issue #660), **My Projects** (issue #661), **Security** (issue #662)
- * and, for installation administrators only, **MCP** (issue #1362) are delivered.
+ * and **MCP** (issue #1362; every signed-in user's since issue #1457) are delivered.
  *
  * Each panel resolves its own subject from the session — either by fetching
  * (`My Workers`) or by taking the already-fetched `auth.me` user, which is the

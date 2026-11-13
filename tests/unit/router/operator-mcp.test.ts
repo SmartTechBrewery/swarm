@@ -306,6 +306,8 @@ const DRIVER = user('66666666-6666-4666-8666-666666666666', 'driver@example.com'
 const PROJECT_ADMIN = user('99999999-9999-4999-8999-999999999999', 'padmin@example.com', false);
 /** Signed in, with no project membership at all. */
 const NOBODY = user('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', 'nobody@example.com', false);
+/** `member` on `proj-a` and `projectAdmin` of `proj-z` — a non-admin scoped-token holder (issue #1457). */
+const WIDE = user('ffffffff-ffff-4fff-8fff-ffffffffffff', 'wide@example.com', false);
 const TOKENS: Record<string, SwarmUser> = {
 	'admin-token': ADMIN,
 	'member-token': MEMBER,
@@ -313,6 +315,7 @@ const TOKENS: Record<string, SwarmUser> = {
 	'driver-token': DRIVER,
 	'project-admin-token': PROJECT_ADMIN,
 	'nobody-token': NOBODY,
+	'wide-session-token': WIDE,
 };
 
 /** Every project membership the fixtures hold; the membership-service mocks read it. */
@@ -321,6 +324,8 @@ const MEMBERSHIPS: Array<{ userId: string; projectId: string; role: ProjectRole 
 	{ userId: DRIVER.id, projectId: 'proj-a', role: 'member' },
 	{ userId: PROJECT_ADMIN.id, projectId: 'proj-a', role: 'projectAdmin' },
 	{ userId: STRANGER.id, projectId: 'proj-z', role: 'projectAdmin' },
+	{ userId: WIDE.id, projectId: 'proj-a', role: 'member' },
+	{ userId: WIDE.id, projectId: 'proj-z', role: 'projectAdmin' },
 ];
 
 function membershipsOf(userId: string) {
@@ -416,6 +421,14 @@ const RUN_BOUND_TOKEN_ID = 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee';
 const AGENT_TOKENS: Record<string, LiveAgentAccessToken> = {
 	'admin-agent-token': { user: ADMIN, tokenId: ADMIN_AGENT_TOKEN_ID },
 	'member-agent-token': { user: MEMBER, tokenId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd' },
+	// Issue #1457: every signed-in user holds tokens, so these are non-admins' own.
+	'driver-agent-token': { user: DRIVER, tokenId: 'dddddddd-dddd-4ddd-8ddd-000000000001' },
+	'nobody-agent-token': { user: NOBODY, tokenId: 'dddddddd-dddd-4ddd-8ddd-000000000002' },
+	'wide-scoped-agent-token': {
+		user: WIDE,
+		tokenId: 'dddddddd-dddd-4ddd-8ddd-000000000003',
+		projectIds: ['proj-a'],
+	},
 	'scoped-agent-token': { user: ADMIN, tokenId: SCOPED_TOKEN_ID, projectIds: ['proj-a'] },
 	// Issue #1393: minted for one run, with a cap of two real writes.
 	'run-bound-agent-token': {
@@ -956,6 +969,97 @@ describe('operator MCP — a scoped agent credential (issue #1385)', () => {
 		expect(recordOperatorAction).toHaveBeenCalledWith(
 			expect.objectContaining({ credentialKind: 'user', agentTokenId: null }),
 		);
+	});
+});
+
+/** The tools a caller who holds no membership reaches: those needing only a sign-in. */
+const SIGNED_IN_TOOLS = [
+	'agent_models_list',
+	'cli_rate_limit_set',
+	'project_create',
+	'worker_remove',
+];
+
+// Issue #1457: a non-admin's own agent access token. An unscoped one is the same
+// principal as its holder's `swarm login` session, so it reaches exactly what that
+// session reaches; a scoped one is limited exactly as an admin's scoped one is.
+describe("operator MCP — a non-admin's agent access token (issue #1457)", () => {
+	it.each([
+		['a contributor', 'member-agent-token', 'member-token', CONTRIBUTOR_TOOLS],
+		['a member', 'driver-agent-token', 'driver-token', MEMBER_TOOLS],
+		['a user with no membership', 'nobody-agent-token', 'nobody-token', SIGNED_IN_TOOLS],
+	])('lists to %s exactly the tools their session is shown', async (_, token, session, expected) => {
+		const listed = await listedTools(token);
+
+		expect(listed).toEqual(expected);
+		expect(listed).toEqual(await listedTools(session));
+		expect(listed.every((tool) => TOOL_ACCESS[tool]?.minRole !== 'instanceAdmin')).toBe(true);
+	});
+
+	it("reads a run of the holder's project and another project's run as NOT_FOUND", async () => {
+		const own = await callTool('run_get', { runId: RUN_ID }, 'driver-agent-token');
+		const other = await callTool('run_get', { runId: OTHER_PROJECT_RUN_ID }, 'driver-agent-token');
+
+		expect(own.isError).toBeUndefined();
+		expect(other.content[0]?.text).toBe(
+			`NOT_FOUND: Run with ID "${OTHER_PROJECT_RUN_ID}" not found`,
+		);
+	});
+
+	it('lists runs of the holder’s own projects only', async () => {
+		const result = await callTool('runs_list', {}, 'driver-agent-token');
+
+		expect(result.isError).toBeUndefined();
+		expect(listRunsFromDb).toHaveBeenCalledWith(
+			expect.objectContaining({ projectIds: ['proj-a'] }),
+		);
+	});
+
+	it.each([
+		['workers_state', {}],
+		['cli_rate_limits', {}],
+		['control_plane_logs', { taskId: '7' }],
+	])('is refused the installation-wide form of %s', async (tool, args) => {
+		const result = await callTool(tool, args, 'driver-agent-token');
+
+		expect(result.isError).toBe(true);
+		expect(result.content[0]?.text).toMatch(/^FORBIDDEN: /);
+		expect(listDashboardWorkers).not.toHaveBeenCalled();
+	});
+
+	it('refuses a no-membership holder every tool past a sign-in, reading nothing', async () => {
+		const result = await callTool('runs_list', {}, 'nobody-agent-token');
+
+		expect(result.content[0]?.text).toMatch(/^FORBIDDEN: Tool "runs_list" needs /);
+		expect(listRunsFromDb).not.toHaveBeenCalled();
+	});
+
+	it("records an unscoped non-admin token's write as the account's own", async () => {
+		await callTool('run_reset', { runId: RUN_ID, reason: 'r', dryRun: true }, 'driver-agent-token');
+
+		expect(recordOperatorAction).toHaveBeenCalledWith(
+			expect.objectContaining({ userId: DRIVER.id, credentialKind: 'user', agentTokenId: null }),
+		);
+	});
+
+	// The holder is `projectAdmin` of `proj-z`, but the token is scoped to `proj-a`,
+	// where they are a `member`: the ceiling comes from `proj-a` alone.
+	it('takes a scoped token’s ceiling from its projects alone', async () => {
+		expect(await listedTools('wide-session-token')).toEqual(ALL_TOOLS);
+		expect(await listedTools('wide-scoped-agent-token')).toEqual(
+			SCOPED_AGENT_TOOLS.filter((tool) => TOOL_ACCESS[tool]?.minRole !== 'projectAdmin'),
+		);
+	});
+
+	it('reads a project outside the scoped token’s list as NOT_FOUND', async () => {
+		const result = await callTool(
+			'workers_state',
+			{ projectId: 'proj-z' },
+			'wide-scoped-agent-token',
+		);
+
+		expect(result.content[0]?.text).toBe('NOT_FOUND: Project with ID "proj-z" not found');
+		expect(listDashboardWorkers).not.toHaveBeenCalled();
 	});
 });
 

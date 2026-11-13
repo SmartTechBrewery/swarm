@@ -1,7 +1,7 @@
 /**
  * The **agent access token** (issue #1362) — the installation's second
- * credential, standing *beside* the session rather than changing it: an
- * installation administrator issues one to themselves, by name, so an MCP client
+ * credential, standing *beside* the session rather than changing it: a
+ * signed-in user issues one to themselves, by name, so an MCP client
  * (Claude Code and the like) can reach `/operator/mcp` without the `swarm` CLI's
  * login session. It is ported from Under Control's „Dostęp agenta”, whose
  * behaviour it deliberately matches.
@@ -39,10 +39,13 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 export const AGENT_ACCESS_TOKEN_USE_RECORD_INTERVAL_MS = 60 * 1000;
 
 /**
- * Who may hold agent access tokens — **installation administrators and nobody
- * else**. Total over {@link InstallationRole}, so a role added to
- * `InstallationRoleSchema` fails to compile here until it takes this decision
- * rather than inheriting a default branch.
+ * Who may hold agent access tokens — **every signed-in user** since issue #1457
+ * (installation administrators only before it, issue #1362). A token acts with
+ * exactly its holder's project roles, as their `swarm login` session does on
+ * `/operator/mcp`, so it reaches nothing that session could not. Total over
+ * {@link InstallationRole}, so a role added to `InstallationRoleSchema` fails to
+ * compile here until it takes this decision rather than inheriting a default
+ * branch.
  *
  * **One map for all three verbs** — issuing, listing one's own, revoking one —
  * because they are one lifecycle of one credential; splitting it would invite
@@ -50,7 +53,7 @@ export const AGENT_ACCESS_TOKEN_USE_RECORD_INTERVAL_MS = 60 * 1000;
  */
 export const MAY_USE_AGENT_ACCESS_TOKENS: Record<InstallationRole, boolean> = {
 	instanceAdmin: true,
-	user: false,
+	user: true,
 };
 
 /** Whether `user` may issue, list and revoke agent access tokens. */

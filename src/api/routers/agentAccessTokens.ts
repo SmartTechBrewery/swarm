@@ -30,10 +30,13 @@ import { authedProcedure, router } from '../trpc.js';
  * the issuing is `NOT_FOUND`, worded like a missing project so it reveals no
  * project's existence.
  *
- * **Installation administrators only** (`MAY_USE_AGENT_ACCESS_TOKENS`): any other
- * caller gets `FORBIDDEN` from all three before any query, so the refusal says
- * nothing about what is stored. Somebody else's token id revokes as `NOT_FOUND`,
- * exactly like one never issued.
+ * **Every signed-in user** since issue #1457 (`MAY_USE_AGENT_ACCESS_TOKENS`, a total
+ * map over the installation roles): a role it denies gets `FORBIDDEN` from all
+ * three before any query, so the refusal says nothing about what is stored — no
+ * role is denied today, and the check stays so a role added later has to decide.
+ * A token acts with exactly its holder's project roles on `/operator/mcp`, so it
+ * reaches nothing their `swarm login` session could not. Somebody else's token id
+ * revokes as `NOT_FOUND`, exactly like one never issued.
  *
  * The raw token is in the `issue` response and nowhere else — the list's shape
  * has no field for it, and the database holds a hash alone. Each token lives
@@ -43,7 +46,7 @@ import { authedProcedure, router } from '../trpc.js';
  * managing tokens stays on the dashboard's own session.
  */
 
-const FORBIDDEN_MESSAGE = 'Only installation administrators can hold agent access tokens.';
+const FORBIDDEN_MESSAGE = 'Your installation role cannot hold agent access tokens.';
 
 function forbidden(): TRPCError {
 	return new TRPCError({ code: 'FORBIDDEN', message: FORBIDDEN_MESSAGE });
