@@ -1320,7 +1320,14 @@ Review — no slot exists at such a head, so the reservation used to create a ne
 counted one, which is how `#2254` spent its third. The hand-back's inherited
 PR+SHA claim is released owner-fenced (`REFRESHED_CLAIM_OWNER`) so the head's
 next green event is not dropped, and a lookup that fails dispatches the Review as
-before.
+before. With the claim released and no approved slot at the head for the #1128
+check to find, a later unmarked red on it (a delayed sibling suite, a re-run that
+failed again) is settled by the same two facts instead — the recovery's own trace
+(`hasCiNoFixRecovery`) beside the approving run — with no dispatch
+(`settleSkippedNoFixUpdatedHead`), so it never reaches Respond-to-CI a second
+time. The skip saves the slot only while the head stays red: nothing re-arms the
+merge off the parked approval, so if that head later goes green it reserves a new,
+counted slot and is reviewed — the same slot the hand-back used to spend.
 
 A superseded slot stays `submitted` — the prior-review signal, the Force
 re-review slot read and the override grant all still need it — but frees both its

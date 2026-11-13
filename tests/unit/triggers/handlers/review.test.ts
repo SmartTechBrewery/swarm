@@ -3096,6 +3096,83 @@ describe('review trigger — the no-fix hand-back to Review (issue #841)', () =>
 			});
 			expect(releaseReviewDispatchHeldBy).not.toHaveBeenCalled();
 		});
+
+		// The skip released the claim and wrote no approved slot at the head, so
+		// neither the claim nor the #1128 check can stop a later unmarked red from
+		// reaching Respond-to-CI; the run-keyed routing guard must.
+		describe('a later unmarked red on that head', () => {
+			const AUTO_MERGE = createMockProjectConfig({ autoMerge: true });
+			/** The approval's updated-head re-run, spent well past the settle window. */
+			const SPENT = {
+				id: 'run-approve',
+				checksRerunHeadSha: 'cafe',
+				checksRerunAt: new Date(Date.now() - 10 * 60 * 1000),
+			};
+
+			beforeEach(() => {
+				findUpdatedHeadReviewRun.mockResolvedValue(SPENT);
+				claimUpdatedHeadChecksRerun.mockResolvedValue(false);
+				// The recovery's own trace: the CI agent declined this head's red.
+				hasCiNoFixRecovery.mockResolvedValue(true);
+				getApprovedHeadSlot.mockResolvedValue(undefined);
+			});
+
+			it('dispatches no Respond-to-CI on an updated head whose no-fix hand-back was skipped', async () => {
+				const noteDecline = vi.fn();
+
+				expect(await handler.handle(ctx(checks, { project: AUTO_MERGE, noteDecline }))).toBeNull();
+
+				expect(hasCiNoFixRecovery).toHaveBeenCalledWith(AUTO_MERGE, '9', 'cafe');
+				expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+				expect(claimReviewDispatch).not.toHaveBeenCalled();
+				expect(reserveReviewVerdict).not.toHaveBeenCalled();
+				expect(recoverAdjudicatedApprovedHead).not.toHaveBeenCalled();
+				expect(noteDecline).toHaveBeenCalledExactlyOnceWith(
+					expect.objectContaining({
+						kind: 'skipped',
+						reason: expect.stringContaining('no further CI fix was dispatched'),
+					}),
+				);
+			});
+
+			// The #841 delayed-sibling scenario, after the skip gave the claim up.
+			it('locks a delayed sibling out of a second CI fix once the skip released the claim', async () => {
+				const claims = new Set<string>([`${PROJECT.repo}:9:cafe`]);
+				claimReviewDispatch.mockImplementation(async (key: string) => {
+					if (claims.has(key)) return false;
+					claims.add(key);
+					return true;
+				});
+				releaseReviewDispatchHeldBy.mockImplementation(async (key: string) => {
+					claims.delete(key);
+				});
+
+				expect(
+					await handler.handle(ctx(checks, { project: AUTO_MERGE, ciNoFixRecovery: true })),
+				).toBeNull();
+				expect(claims.size).toBe(0);
+
+				expect(await handler.handle(ctx(checks, { project: AUTO_MERGE }))).toBeNull();
+				expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+				expect(reserveReviewVerdict).not.toHaveBeenCalled();
+			});
+
+			it('falls open to Respond-to-CI when the approving run cannot be read', async () => {
+				findUpdatedHeadReviewRun.mockRejectedValue(new Error('db down'));
+
+				expect(await handler.handle(ctx(checks, { project: AUTO_MERGE }))).toMatchObject({
+					phase: 'respond-to-ci',
+				});
+			});
+
+			it('leaves a head the CI agent never adjudicated to Respond-to-CI', async () => {
+				hasCiNoFixRecovery.mockResolvedValue(false);
+
+				expect(await handler.handle(ctx(checks, { project: AUTO_MERGE }))).toMatchObject({
+					phase: 'respond-to-ci',
+				});
+			});
+		});
 	});
 
 	it('still reserves the durable review-verdict slot, and a capped reservation still skips', async () => {

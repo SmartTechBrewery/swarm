@@ -157,6 +157,14 @@ export async function hasCiNoFixRecovery(
  * extended lease lapsed — a Redis restart. There the per-PR fix-attempt cap
  * (`src/triggers/respond-to-ci-attempts.ts`) is what bounds a duplicate fix, and
  * the recovery's own deterministic delivery id still keeps the Review single.
+ *
+ * One recovery gives the claim up early: on a head merge automation brought up
+ * to date for a still-counting approval, `pr-review` dispatches no Review and
+ * releases the claim (issue #1445), so the head's next green is not dropped.
+ * The delayed-sibling guarantee then rests on routing rather than the claim: an
+ * unmarked red on that head finds this module's own trace
+ * ({@link hasCiNoFixRecovery}) beside the approving run and settles with no
+ * dispatch (`settleSkippedNoFixUpdatedHead`) — durably, past any lease.
  */
 export async function scheduleCiNoFixRecovery({
 	project,
