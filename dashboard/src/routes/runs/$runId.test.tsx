@@ -1388,6 +1388,70 @@ describe('ReviewMergeCallout (issue #278)', () => {
 		expect(screen.getByRole('heading', { name: heading })).toBeDefined();
 		expect(screen.getByText('details here')).toBeDefined();
 	});
+
+	// Issue #1447: on the Review run a review cap stopped, the stored message is the
+	// last refusal — about a head SWARM will not act on again by itself — so the
+	// callout leads with the stop and keeps the refusal beneath it as history.
+	describe('on a run whose pull request a review cap stopped', () => {
+		const REFUSAL =
+			'Approved head is red; SWARM re-ran the failing checks moments ago; it merges this head once they pass';
+
+		it('leads with the cap stop and shows the refusal as the last merge refusal', () => {
+			render(
+				<ReviewMergeCallout
+					run={makeReviewRun({
+						reviewVerdict: 'approve',
+						reviewAutomationOutcome: null,
+						reviewMergeOutcome: 'not-eligible',
+						reviewMergeMessage: REFUSAL,
+						reviewCapStop: 'verdict-cap',
+					})}
+				/>,
+			);
+
+			expect(
+				screen.getByRole('heading', {
+					name: /^Stopped by the review cap \(verdict-cap: .*\) — waiting on the operator \(Force re-review\)\.$/,
+				}),
+			).toBeDefined();
+			expect(screen.getByText('Last merge refusal')).toBeDefined();
+			expect(screen.getByText(REFUSAL)).toBeDefined();
+			expect(screen.queryByRole('heading', { name: /no longer eligible/i })).toBeNull();
+		});
+
+		it('never presents a capped refusal as retrying automatically', () => {
+			render(
+				<ReviewMergeCallout
+					run={makeReviewRun({
+						reviewVerdict: 'approve',
+						reviewMergeOutcome: 'not-ready',
+						reviewMergeMessage: 'required checks are still pending',
+						reviewCapStop: 'superseded-bound',
+					})}
+				/>,
+			);
+
+			expect(
+				screen.getByRole('heading', { name: /^Stopped by the review cap \(superseded-bound: / }),
+			).toBeDefined();
+			expect(screen.queryByRole('heading', { name: /retrying automatically/i })).toBeNull();
+		});
+
+		it('keeps the merged callout for a run that merged on its last permitted verdict', () => {
+			render(
+				<ReviewMergeCallout
+					run={makeReviewRun({
+						reviewVerdict: 'approve',
+						reviewMergeOutcome: 'merged',
+						reviewMergeMessage: 'Pull Request successfully merged',
+						reviewCapStop: 'verdict-cap',
+					})}
+				/>,
+			);
+
+			expect(screen.getByRole('heading', { name: 'Merged automatically' })).toBeDefined();
+		});
+	});
 });
 
 describe('RunAttributionFields (issue #446)', () => {

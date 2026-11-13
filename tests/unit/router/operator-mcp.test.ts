@@ -1536,6 +1536,9 @@ describe('operator MCP — pr_status', () => {
 			lastReviewedHeadSha: 'head-3',
 			mergeOutcome: null,
 			mergeOutcomeMessage: null,
+			// The grant is outstanding, so the cap is not a stop yet (issue #1447).
+			lastMergeRefusalMessage: null,
+			waitingOnOperator: false,
 			verdictCount: 3,
 			verdictCap: 3,
 			supersededCount: 0,

@@ -2145,8 +2145,23 @@ export interface PullRequestStatus {
 	 * the run did not approve or merge automation is off.
 	 */
 	mergeOutcome: string | null;
-	/** The human-readable detail written with {@link mergeOutcome}. */
+	/**
+	 * The human-readable detail written with {@link mergeOutcome} — or, while
+	 * {@link waitingOnOperator}, the review-cap stop naming its bound (issue #1447).
+	 * A capped pull request's last refusal describes a head SWARM will not act on
+	 * again by itself ("it merges this head once they pass"), so it is not shown as
+	 * the current state; it stays readable as {@link lastMergeRefusalMessage}.
+	 */
 	mergeOutcomeMessage: string | null;
+	/** The detail recorded with {@link mergeOutcome}, verbatim, whatever the cap says. */
+	lastMergeRefusalMessage: string | null;
+	/**
+	 * Whether a review cap has stopped this pull request and only an operator can
+	 * move it (issue #1447): a bound is reached, no Force re-review grant is
+	 * outstanding, no Review is in flight above the last verdict, and the last
+	 * Review run did not merge it.
+	 */
+	waitingOnOperator: boolean;
 	/** Submitted verdicts counted toward {@link verdictCap} (superseded ones excluded). */
 	verdictCount: number;
 	verdictCap: number;
@@ -2191,20 +2206,53 @@ function toPullRequestStatus(
 	slots: readonly PullRequestReviewSlot[],
 ): PullRequestStatus {
 	const submitted = slots.filter((slot) => slot.state === 'submitted');
+	const verdictCount = submitted.filter((slot) => !slot.superseded).length;
+	const supersededCount = submitted.filter((slot) => slot.superseded).length;
+	const capBound = reviewCapBoundReached(slots);
+	const overrideOutstanding = hasOutstandingCapOverride(slots);
+	const storedMessage = run?.reviewMergeMessage ?? null;
+	const lastVerdictOrdinal = submitted.length
+		? Math.max(...submitted.map((slot) => slot.ordinal))
+		: null;
+	const waitingOnOperator =
+		capBound !== null &&
+		!overrideOutstanding &&
+		!hasReviewInFlightAbove(slots, lastVerdictOrdinal) &&
+		run?.reviewMergeOutcome !== 'merged';
 	return {
 		lastReviewRunId: run?.id ?? null,
 		lastReviewVerdict: run?.reviewVerdict ?? null,
 		lastReviewedHeadSha: latestSubmittedHeadSha(slots),
 		mergeOutcome: run?.reviewMergeOutcome ?? null,
-		mergeOutcomeMessage: run?.reviewMergeMessage ?? null,
-		verdictCount: submitted.filter((slot) => !slot.superseded).length,
+		mergeOutcomeMessage:
+			waitingOnOperator && capBound
+				? reviewCapStopMessage(capBound, { verdictCount, supersededCount })
+				: storedMessage,
+		lastMergeRefusalMessage: storedMessage,
+		waitingOnOperator,
+		verdictCount,
 		verdictCap: REVIEW_VERDICT_CAP,
-		supersededCount: submitted.filter((slot) => slot.superseded).length,
+		supersededCount,
 		supersededCap: REVIEW_SUPERSEDED_CAP,
 		capReached: hasSubmittedEveryPermittedVerdict(slots),
-		capBound: reviewCapBoundReached(slots),
-		overrideOutstanding: hasOutstandingCapOverride(slots),
+		capBound,
+		overrideOutstanding,
 	};
+}
+
+/**
+ * The stop a capped pull request reports in place of its last merge refusal
+ * (issue #1447), naming the bound with the counts the same answer carries.
+ */
+function reviewCapStopMessage(
+	bound: ReviewCapBound,
+	counts: { verdictCount: number; supersededCount: number },
+): string {
+	const reason =
+		bound === 'verdict-cap'
+			? `verdict-cap: ${counts.verdictCount}/${REVIEW_VERDICT_CAP} counted verdicts`
+			: `superseded-bound: ${counts.supersededCount}/${REVIEW_SUPERSEDED_CAP} approvals superseded by a head change`;
+	return `Stopped by the review cap (${reason}) — waiting on the operator (Force re-review).`;
 }
 
 /**

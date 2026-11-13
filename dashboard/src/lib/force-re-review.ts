@@ -204,6 +204,31 @@ export function canForceReviewOfSupersededHead(
 	return showsCapSpentApprovalCallout(run) && pipeline?.review?.enabled !== false;
 }
 
+/**
+ * The line the run-detail merge callout leads with when this run's pull request is
+ * stopped by a review cap (issue #1447) — `null` when it is not, or when the run
+ * merged. The stored merge message describes the head the refusal was about, and a
+ * forward-looking one ("it merges this head once they pass") reads as a promise
+ * about a pull request SWARM will not act on again by itself; so while the cap
+ * holds the stop is the current state and the refusal is history.
+ *
+ * `reviewCapStop` is the server's own ledger answer and stays set through a Force
+ * re-review, so the grant window gets its own ending rather than claiming the
+ * operator still has to act. Like the cap callout's copy, it names no numeric cap.
+ */
+export function reviewCapStopLine(run: ForceReReviewRunState): string | null {
+	if (!run.reviewCapStop || run.reviewMergeOutcome === 'merged') return null;
+	const bound =
+		run.reviewCapStop === 'superseded-bound'
+			? 'superseded-bound: the head moved out from under too many approvals'
+			: 'verdict-cap: every counted review verdict is spent';
+	const state =
+		run.reviewCapOverrideOutstanding === true
+			? 'an operator forced a re-review, which is scheduled and has not started'
+			: 'waiting on the operator (Force re-review)';
+	return `Stopped by the review cap (${bound}) — ${state}.`;
+}
+
 /** Confirm-button label: reads "Scheduling…" while the mutation is pending. */
 export function forceReReviewButtonLabel(isPending: boolean): string {
 	return isPending ? 'Scheduling…' : 'Force re-review';
