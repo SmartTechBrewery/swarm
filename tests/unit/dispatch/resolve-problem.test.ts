@@ -20,6 +20,7 @@ import {
 	mintResolveProblemAccess,
 	operatorMcpUrl,
 	RESOLVE_PROBLEM_TOKEN_GRACE_MS,
+	resolveProblemAnchorCancelled,
 	resolveProblemDedupKey,
 	resolveProblemTicketDedupKey,
 	resolveProblemTrigger,
@@ -157,6 +158,24 @@ describe('resolveProblemTrigger', () => {
 			taskId: '1395',
 		});
 	});
+
+	it('skips a failed run an operator cancelled, and still resolves one nobody did (issue #1453)', async () => {
+		const cancelled = {
+			...FAILED_RUN,
+			cancellation: { source: 'board-backlog', requestedAt: '2026-11-12T07:00:00.000Z' },
+		} as RunRow;
+		expect(await resolveProblemTrigger(JOB, PROJECT, readRun(cancelled))).toEqual({
+			skip: expect.stringContaining('cancelled by an operator (board-backlog)'),
+			taskId: '1395',
+		});
+		expect(
+			await resolveProblemTrigger(
+				JOB,
+				PROJECT,
+				readRun({ ...FAILED_RUN, cancellation: null } as RunRow),
+			),
+		).toMatchObject({ phase: 'resolve-problem', failedRunId: FAILED_RUN.id });
+	});
 });
 
 describe('scheduleResolveProblemForTicket (issue #1425)', () => {
@@ -211,6 +230,20 @@ describe('scheduleResolveProblemForTicket (issue #1425)', () => {
 		expect(
 			resolveProblemTicketDedupKey({ ...SLOT, slotOpenedAt: '2026-11-11T08:00:00Z' }),
 		).not.toBe(input.dedupKey);
+	});
+});
+
+describe('resolveProblemAnchorCancelled (issue #1453)', () => {
+	it('names the recorded origin of an operator cancellation, and nothing without one', () => {
+		expect(resolveProblemAnchorCancelled({ id: 'run-1', cancellation: null })).toBeUndefined();
+		for (const source of ['dashboard', 'api', 'board-backlog'] as const) {
+			expect(
+				resolveProblemAnchorCancelled({
+					id: 'run-1',
+					cancellation: { source, requestedAt: '2026-11-12T07:00:00.000Z' },
+				}),
+			).toBe(`Run run-1 was cancelled by an operator (${source}) — restarting it is their call`);
+		}
 	});
 });
 
@@ -333,6 +366,19 @@ describe('resolveProblemTrigger — ticket attempts (issue #1425)', () => {
 		).toEqual({ skip: expect.stringContaining('retry of its own'), taskId: '1425' });
 		expect(await resolve(HELD, { ...ANCHOR, phase: 'resolve-problem' })).toEqual({
 			skip: expect.stringContaining('itself a Resolve problem attempt'),
+			taskId: '1425',
+		});
+	});
+
+	it('skips when an operator cancelled its anchor run (issue #1453)', async () => {
+		expect(
+			await resolve(HELD, {
+				...ANCHOR,
+				status: 'failed',
+				cancellation: { source: 'dashboard', requestedAt: '2026-11-12T07:00:00.000Z' },
+			}),
+		).toEqual({
+			skip: expect.stringContaining('cancelled by an operator (dashboard)'),
 			taskId: '1425',
 		});
 	});
