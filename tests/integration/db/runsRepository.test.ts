@@ -50,6 +50,7 @@ import {
 	listParkedApprovalsAtMergeHead,
 	listResolveProblemAttempts,
 	listResolveProblemAttemptsForHolders,
+	listRunningBoardDrivenRunsForTask,
 	listRunPassedOverWorkerIds,
 	listRunsFromDb,
 	listSnapshotRunsForProject,
@@ -1481,6 +1482,58 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 
 		it('returns false for an unknown run id', async () => {
 			expect(await markRunUserTerminated('00000000-0000-0000-0000-000000000000', 'x')).toBe(false);
+		});
+	});
+
+	// Issue #1451 — what a card moved to Backlog terminates.
+	describe('listRunningBoardDrivenRunsForTask', () => {
+		async function seedRun(values: {
+			phase: string;
+			status?: string;
+			taskId?: string;
+			repository?: string;
+		}): Promise<string> {
+			const [row] = await getDb()
+				.insert(runs)
+				.values({
+					projectId: PROJECT_ID,
+					repository: values.repository ?? REPO,
+					taskId: values.taskId ?? '1451',
+					phase: values.phase,
+					status: values.status ?? 'running',
+				})
+				.returning({ id: runs.id });
+			return row.id;
+		}
+
+		it('returns only running Planning/Implementation runs of the exact project, repository and task', async () => {
+			const planning = await seedRun({ phase: 'planning' });
+			const implementation = await seedRun({ phase: 'implementation' });
+			// SCM-driven phases on the same task are never board-terminable.
+			await seedRun({ phase: 'review' });
+			await seedRun({ phase: 'respond-to-review' });
+			await seedRun({ phase: 'respond-to-ci' });
+			await seedRun({ phase: 'resolve-conflicts' });
+			// Not running.
+			await seedRun({ phase: 'implementation', status: 'completed' });
+			await seedRun({ phase: 'implementation', status: 'failed' });
+			await seedRun({ phase: 'planning', status: 'deferred' });
+			// Another task, and the same-numbered task in another repository.
+			await seedRun({ phase: 'implementation', taskId: '1452' });
+			await seedRun({ phase: 'implementation', repository: OTHER_REPO });
+
+			const found = await listRunningBoardDrivenRunsForTask(PROJECT_ID, REPO, '1451');
+
+			expect(found.map((run) => run.id).sort()).toEqual([planning, implementation].sort());
+			expect(found.find((run) => run.id === planning)?.phase).toBe('planning');
+		});
+
+		it('returns nothing when no board-driven phase is running', async () => {
+			await seedRun({ phase: 'review' });
+
+			await expect(listRunningBoardDrivenRunsForTask(PROJECT_ID, REPO, '1451')).resolves.toEqual(
+				[],
+			);
 		});
 	});
 

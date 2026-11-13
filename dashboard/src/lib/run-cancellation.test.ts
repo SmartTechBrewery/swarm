@@ -47,6 +47,15 @@ describe('describeCancellationOrigin', () => {
 		).toBe('Cancelled via API');
 	});
 
+	it('formats the board move to Backlog origin (issue #1451)', () => {
+		expect(
+			describeCancellationOrigin({
+				source: 'board-backlog',
+				requestedAt: '2026-11-13T00:00:00.000Z',
+			}),
+		).toBe('Cancelled because its board card was moved to Backlog');
+	});
+
 	it('returns null for no origin (marker-only cancellation or legacy row)', () => {
 		expect(describeCancellationOrigin(null)).toBeNull();
 		expect(describeCancellationOrigin(undefined)).toBeNull();

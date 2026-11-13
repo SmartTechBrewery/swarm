@@ -33,16 +33,31 @@
  * failure direction is "a stale phase survives", which is exactly today's
  * behaviour, whereas throwing would fail a board dispatch that is otherwise
  * perfectly good.
+ *
+ * **A move to Backlog also stops the phase that is already running** (issue
+ * #1451). Retirement only ever touches *waiting* dispatches; Backlog is the one
+ * column that says "stop working on this", so on that move alone
+ * {@link terminateRunningBoardPhases} asks for the dashboard's own Terminate on
+ * every `running` Planning/Implementation run of the card's task. It is the very
+ * request `runs.terminate` makes for a running run — `requestRunCancellation`,
+ * with an origin saying why — so settlement, worktree reconciliation, the pushed
+ * `task-cancel` to a federated worker, and the absence of any follow-on board
+ * move or pull request are Terminate's, not a second mechanism's. Review and the
+ * other SCM-driven phases are keyed on the pull request rather than the card's
+ * column and are never touched: the read filters on {@link BOARD_DRIVEN_PHASES}.
+ * It fails open the same way.
  */
 
 import {
 	listRetirableBoardDispatchesForTask,
 	retireWaitingDispatch,
 } from '../db/repositories/dispatchesRepository.js';
+import { listRunningBoardDrivenRunsForTask } from '../db/repositories/runsRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import { phaseLabel } from '../pipeline/phase-label.js';
 import { BOARD_DRIVEN_PHASES, type PipelinePhase } from '../pm/pipeline.js';
+import { requestRunCancellation } from '../queue/cancellation.js';
 import { removePendingJobById } from '../queue/producer.js';
 import { wakeJobId } from './dispatcher.js';
 
@@ -105,7 +120,8 @@ export async function retireSupersededBoardPhases(input: RetireBoardPhasesInput)
 		for (const row of stale) {
 			const settled = await retireWaitingDispatch(row.id, retirementReason(row.phase, keepPhase));
 			// `null` means a worker claimed it between the read and the conditional
-			// cancel — it is executing now, and stopping it stays Terminate's job.
+			// cancel — it is executing now, and stopping it is Terminate's job (which
+			// a move to Backlog asks for itself: `terminateRunningBoardPhases`).
 			if (!settled) continue;
 			// Best-effort, exactly as `cancelDispatchAndWake` and
 			// `scheduleCoalescedDispatch` do it: claim-time refusal covers any wake-up
@@ -137,6 +153,83 @@ export async function retireSupersededBoardPhases(input: RetireBoardPhasesInput)
 			keepPhase,
 			error: describeError(err),
 		});
+		return 0;
+	}
+}
+
+export interface TerminateBoardPhasesInput {
+	projectId: string;
+	/**
+	 * The run's own scoped repository (`project.repo`) — the card's task id is a
+	 * number only within it, and what this terminates must not be another
+	 * repository's same-numbered task.
+	 */
+	repository: string;
+	/** The card's own SCM artifact id — the worktree task id its phases share. */
+	taskId: string;
+}
+
+/**
+ * Terminate every board-driven phase (Planning, Implementation) **running** for
+ * this task, through the dashboard Terminate's own request — called when an
+ * operator moves the card to Backlog (issue #1451). Returns how many runs a
+ * termination was requested for (`0` when none were running, and `0` on a failed
+ * read). Never throws: a failure is logged and the board move proceeds.
+ *
+ * Each request is attempted on its own, so one failed Redis write does not spare
+ * the other run. The recorded origin (`board-backlog`) is what the settled run
+ * shows as its reason; the run's error stays the neutral cancellation message,
+ * exactly as for a dashboard Terminate.
+ */
+export async function terminateRunningBoardPhases(
+	input: TerminateBoardPhasesInput,
+): Promise<number> {
+	const { projectId, repository, taskId } = input;
+	try {
+		const running = await listRunningBoardDrivenRunsForTask(projectId, repository, taskId);
+		if (running.length === 0) return 0;
+
+		const terminated: { runId: string; phase: string }[] = [];
+		for (const run of running) {
+			try {
+				await requestRunCancellation(
+					run.id,
+					{ source: 'board-backlog', requestedAt: new Date().toISOString() },
+					{ action: 'terminate', projectId, taskId, phase: run.phase },
+				);
+				terminated.push({ runId: run.id, phase: run.phase });
+			} catch (err) {
+				logger.warn(
+					'pm-status: could not terminate a running board-driven phase for a card moved to Backlog',
+					{
+						projectId,
+						repository,
+						taskId,
+						runId: run.id,
+						phase: run.phase,
+						error: describeError(err),
+					},
+				);
+			}
+		}
+
+		if (terminated.length > 0) {
+			logger.info(
+				'pm-status: terminating running board-driven phases — the card was moved to Backlog',
+				{
+					projectId,
+					repository,
+					taskId,
+					terminated,
+				},
+			);
+		}
+		return terminated.length;
+	} catch (err) {
+		logger.warn(
+			'pm-status: running board-driven phase termination failed (leaving the runs as they were)',
+			{ projectId, repository, taskId, error: describeError(err) },
+		);
 		return 0;
 	}
 }

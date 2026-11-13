@@ -5,10 +5,20 @@ import type {
 	listRetirableBoardDispatchesForTask as ListRetirable,
 	retireWaitingDispatch as RetireWaiting,
 } from '@/db/repositories/dispatchesRepository.js';
+import type { listRunningBoardDrivenRunsForTask as ListRunning } from '@/db/repositories/runsRepository.js';
+import type { requestRunCancellation as RequestCancellation } from '@/queue/cancellation.js';
 
 vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 	listRetirableBoardDispatchesForTask: vi.fn<typeof ListRetirable>(),
 	retireWaitingDispatch: vi.fn<typeof RetireWaiting>(),
+}));
+
+vi.mock('@/db/repositories/runsRepository.js', () => ({
+	listRunningBoardDrivenRunsForTask: vi.fn<typeof ListRunning>(),
+}));
+
+vi.mock('@/queue/cancellation.js', () => ({
+	requestRunCancellation: vi.fn<typeof RequestCancellation>(),
 }));
 
 vi.mock('@/queue/producer.js', () => ({
@@ -26,7 +36,12 @@ import {
 	listRetirableBoardDispatchesForTask,
 	retireWaitingDispatch,
 } from '@/db/repositories/dispatchesRepository.js';
-import { retireSupersededBoardPhases } from '@/dispatch/board-phase-retirement.js';
+import { listRunningBoardDrivenRunsForTask } from '@/db/repositories/runsRepository.js';
+import {
+	retireSupersededBoardPhases,
+	terminateRunningBoardPhases,
+} from '@/dispatch/board-phase-retirement.js';
+import { requestRunCancellation } from '@/queue/cancellation.js';
 import { removePendingJobById } from '@/queue/producer.js';
 
 /** A waiting board-driven dispatch row, only the columns this module reads. */
@@ -166,5 +181,60 @@ describe('retireSupersededBoardPhases', () => {
 				expect(reason).not.toMatch(/ToDo|Backlog|In progress|In review|Done|Ready/i);
 			}
 		});
+	});
+});
+
+describe('terminateRunningBoardPhases (issue #1451)', () => {
+	const TERMINATE = { projectId: 'proj-1', repository: 'acme/app', taskId: '21' };
+
+	beforeEach(() => {
+		vi.mocked(listRunningBoardDrivenRunsForTask).mockReset().mockResolvedValue([]);
+		vi.mocked(requestRunCancellation).mockReset().mockResolvedValue(undefined);
+	});
+
+	it('requests Terminate for every running board-driven run, with the Backlog origin', async () => {
+		vi.mocked(listRunningBoardDrivenRunsForTask).mockResolvedValue([
+			{ id: 'run-plan', phase: 'planning' },
+			{ id: 'run-impl', phase: 'implementation' },
+		]);
+
+		expect(await terminateRunningBoardPhases(TERMINATE)).toBe(2);
+
+		expect(listRunningBoardDrivenRunsForTask).toHaveBeenCalledWith('proj-1', 'acme/app', '21');
+		expect(requestRunCancellation).toHaveBeenCalledTimes(2);
+		expect(requestRunCancellation).toHaveBeenCalledWith(
+			'run-plan',
+			{ source: 'board-backlog', requestedAt: expect.any(String) },
+			{ action: 'terminate', projectId: 'proj-1', taskId: '21', phase: 'planning' },
+		);
+		expect(requestRunCancellation).toHaveBeenCalledWith(
+			'run-impl',
+			{ source: 'board-backlog', requestedAt: expect.any(String) },
+			{ action: 'terminate', projectId: 'proj-1', taskId: '21', phase: 'implementation' },
+		);
+	});
+
+	it('requests nothing when no board-driven phase is running', async () => {
+		expect(await terminateRunningBoardPhases(TERMINATE)).toBe(0);
+		expect(requestRunCancellation).not.toHaveBeenCalled();
+	});
+
+	it('a failed request for one run still requests the others', async () => {
+		vi.mocked(listRunningBoardDrivenRunsForTask).mockResolvedValue([
+			{ id: 'run-a', phase: 'planning' },
+			{ id: 'run-b', phase: 'implementation' },
+		]);
+		vi.mocked(requestRunCancellation).mockRejectedValueOnce(new Error('redis down'));
+
+		expect(await terminateRunningBoardPhases(TERMINATE)).toBe(1);
+		expect(requestRunCancellation).toHaveBeenCalledTimes(2);
+		expect(vi.mocked(requestRunCancellation).mock.calls[1][0]).toBe('run-b');
+	});
+
+	it('fails open on a failed read', async () => {
+		vi.mocked(listRunningBoardDrivenRunsForTask).mockRejectedValue(new Error('db down'));
+
+		await expect(terminateRunningBoardPhases(TERMINATE)).resolves.toBe(0);
+		expect(requestRunCancellation).not.toHaveBeenCalled();
 	});
 });
