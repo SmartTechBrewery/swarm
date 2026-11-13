@@ -286,6 +286,37 @@ describe('RunStatusBadge', () => {
 		});
 	});
 
+	describe('cancelled runs (issue #1453)', () => {
+		it('renders a cancelled failure as an orange "Canceled" badge, not "Failed"', () => {
+			render(<RunStatusBadge status="failed" cancelled />);
+			const badge = screen.getByText('Canceled');
+			expect(badge.className).toContain('text-orange-400');
+			expect(badge.getAttribute('title')).toMatch(/on purpose/);
+			expect(screen.queryByText('Failed')).toBeNull();
+		});
+
+		it('keeps a genuine failure red "Failed"', () => {
+			render(<RunStatusBadge status="failed" />);
+			const badge = screen.getByText('Failed');
+			expect(badge.className).toContain('text-red-400');
+			expect(screen.queryByText('Canceled')).toBeNull();
+		});
+
+		it('names the cancellation over a timeout flag on the same run', () => {
+			render(<RunStatusBadge status="failed" cancelled timedOut />);
+			expect(screen.getByText('Canceled')).not.toBeNull();
+			expect(screen.queryByText('Timed out')).toBeNull();
+		});
+
+		it('keeps the lifecycle badge for a non-failed status', () => {
+			const { rerender } = render(<RunStatusBadge status="completed" cancelled />);
+			expect(screen.getByText('Completed')).not.toBeNull();
+			rerender(<RunStatusBadge status="running" cancelled />);
+			expect(screen.getByText('Running')).not.toBeNull();
+			expect(screen.queryByText('Canceled')).toBeNull();
+		});
+	});
+
 	describe('lifecycle status is kept where a verdict must not show', () => {
 		it('shows "Completed" for a completed non-Review run even if a verdict slipped through', () => {
 			render(<RunStatusBadge status="completed" phase="implementation" reviewVerdict="approve" />);

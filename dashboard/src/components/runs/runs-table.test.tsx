@@ -437,6 +437,52 @@ describe('RunsTable', () => {
 		});
 	});
 
+	// Issue #1453 — a run an operator stopped on purpose reads "Canceled", not "Failed".
+	describe('cancelled runs', () => {
+		const failedRun: RunRow = { ...baseRun, status: 'failed', exitCode: 1 };
+
+		it('shows "Canceled" in both the desktop row and the mobile card', () => {
+			const { container } = renderTable(
+				<RunsTable
+					runs={[
+						{
+							...failedRun,
+							cancellation: { source: 'board-backlog', requestedAt: '2026-07-17T10:04:00.000Z' },
+						},
+					]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const table = container.querySelector('table') as HTMLElement;
+			expect(within(table).getByText('Canceled')).not.toBeNull();
+			expect(within(table).queryByText('Failed')).toBeNull();
+
+			const card = screen.getByTestId('run-card');
+			expect(within(card).getByText('Canceled')).not.toBeNull();
+			expect(within(card).queryByText('Failed')).toBeNull();
+		});
+
+		it('leaves a failed run with no recorded origin reading "Failed"', () => {
+			renderTable(
+				<RunsTable
+					runs={[{ ...failedRun, cancellation: null }]}
+					totalCount={1}
+					currentPage={1}
+					pageSize={25}
+					onPageChange={vi.fn()}
+				/>,
+			);
+
+			const card = screen.getByTestId('run-card');
+			expect(within(card).getByText('Failed')).not.toBeNull();
+			expect(within(card).queryByText('Canceled')).toBeNull();
+		});
+	});
+
 	// Issue #1080 — two approvals on one pull request, only one of which counted
 	// toward the review cap, must not read as two identical "Approved" rows.
 	describe('superseded approvals', () => {
