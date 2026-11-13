@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { retireSupersededBoardPhases as RetireSuperseded } from '@/dispatch/board-phase-retirement.js';
+import type {
+	retireSupersededBoardPhases as RetireSuperseded,
+	terminateRunningBoardPhases as TerminateRunning,
+} from '@/dispatch/board-phase-retirement.js';
 import type { promoteDependencyWaits as PromoteDependencyWaits } from '@/dispatch/dispatcher.js';
 import type { releaseTicketSlot as ReleaseTicketSlot } from '@/dispatch/wip-limit.js';
 import type { PmEvent } from '@/pm/events.js';
@@ -8,6 +11,7 @@ import type { PMProvider, WorkItem } from '@/pm/types.js';
 vi.mock('@/triggers/pm-status-dedup.js', () => ({ recordStatusAndDetectChange: vi.fn() }));
 vi.mock('@/dispatch/board-phase-retirement.js', () => ({
 	retireSupersededBoardPhases: vi.fn<typeof RetireSuperseded>(),
+	terminateRunningBoardPhases: vi.fn<typeof TerminateRunning>(),
 }));
 vi.mock('@/dispatch/dispatcher.js', () => ({
 	promoteDependencyWaits: vi.fn<typeof PromoteDependencyWaits>(),
@@ -20,7 +24,10 @@ vi.mock('@/dispatch/wip-limit.js', () => ({
 // is populated by the integrations entrypoint at module load — import it so the
 // `github-projects` manifest (and its real `isStatusChange`) is registered.
 import '@/integrations/entrypoint.js';
-import { retireSupersededBoardPhases } from '@/dispatch/board-phase-retirement.js';
+import {
+	retireSupersededBoardPhases,
+	terminateRunningBoardPhases,
+} from '@/dispatch/board-phase-retirement.js';
 import { promoteDependencyWaits } from '@/dispatch/dispatcher.js';
 import { releaseTicketSlot } from '@/dispatch/wip-limit.js';
 import { buildPreplanContract, embedPreplanMarker, PLANNED_LABEL } from '@/pipeline/preplan.js';
@@ -44,6 +51,8 @@ beforeEach(() => {
 	vi.mocked(recordStatusAndDetectChange).mockResolvedValue(true);
 	vi.mocked(retireSupersededBoardPhases).mockReset();
 	vi.mocked(retireSupersededBoardPhases).mockResolvedValue(0);
+	vi.mocked(terminateRunningBoardPhases).mockReset();
+	vi.mocked(terminateRunningBoardPhases).mockResolvedValue(0);
 	vi.mocked(promoteDependencyWaits).mockReset();
 	vi.mocked(promoteDependencyWaits).mockResolvedValue([]);
 	vi.mocked(releaseTicketSlot).mockReset();
@@ -622,6 +631,86 @@ describe('pm-status trigger', () => {
 			expect(await trigger.handle(ctx(workItem))).toBeNull();
 			expect(retireSupersededBoardPhases).toHaveBeenCalledWith(
 				expect.objectContaining({ taskId: '10', keepPhase: 'planning' }),
+			);
+		});
+	});
+
+	// Issue #1451 — Backlog is "stop working on this": a running Planning or
+	// Implementation for the card is terminated, as the dashboard's Terminate would.
+	describe('terminating a running board phase when the card is moved to Backlog', () => {
+		const BACKLOG = 'f75ad846';
+
+		it('terminates for the card’s task in this run’s repository, after retiring', async () => {
+			const workItem = createMockWorkItem({
+				statusId: BACKLOG,
+				url: 'https://github.com/SmartTechBrewery/swarm/issues/12',
+			});
+
+			expect(await trigger.handle(ctx(workItem))).toBeNull();
+
+			expect(terminateRunningBoardPhases).toHaveBeenCalledExactlyOnceWith({
+				projectId: PROJECT.id,
+				repository: PROJECT.repo,
+				taskId: '12',
+			});
+			// #909's retirement of the waiting phases still runs, and runs first.
+			expect(retireSupersededBoardPhases).toHaveBeenCalledWith(
+				expect.objectContaining({ taskId: '12', keepPhase: undefined }),
+			);
+			expect(vi.mocked(retireSupersededBoardPhases).mock.invocationCallOrder[0]).toBeLessThan(
+				vi.mocked(terminateRunningBoardPhases).mock.invocationCallOrder[0],
+			);
+		});
+
+		it.each([
+			['Planning', '61e4505c'],
+			['ToDo', '3121a97d'],
+			['In progress', '47fc9ee4'],
+			['In review', 'df73e18b'],
+			['Done', '98236657'],
+		])('does not terminate on a move to %s', async (_name, statusId) => {
+			await trigger.handle(ctx(createMockWorkItem({ statusId })));
+
+			expect(terminateRunningBoardPhases).not.toHaveBeenCalled();
+		});
+
+		it('does not terminate on an unchanged Backlog status', async () => {
+			vi.mocked(recordStatusAndDetectChange).mockResolvedValue(false);
+
+			await trigger.handle(ctx(createMockWorkItem({ statusId: BACKLOG })));
+
+			expect(terminateRunningBoardPhases).not.toHaveBeenCalled();
+		});
+
+		it('does not terminate on a resumed PM phase', async () => {
+			await trigger.handle({
+				...ctx(createMockWorkItem({ statusId: BACKLOG })),
+				resumePmPhase: 'implementation',
+			});
+
+			expect(terminateRunningBoardPhases).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['a draft card', { taskRef: undefined }],
+			['a card linked in another repository', { taskRepository: 'acme/other' }],
+		])('does not terminate for %s', async (_name, linkage) => {
+			await trigger.handle(
+				ctx(createMockWorkItem({ statusId: BACKLOG, taskRef: '10', ...linkage })),
+			);
+
+			expect(terminateRunningBoardPhases).not.toHaveBeenCalled();
+		});
+
+		it('still processes the move when nothing was terminated', async () => {
+			vi.mocked(terminateRunningBoardPhases).mockResolvedValue(0);
+
+			expect(await trigger.handle(ctx(createMockWorkItem({ statusId: BACKLOG })))).toBeNull();
+			expect(releaseTicketSlot).toHaveBeenCalledExactlyOnceWith(
+				PROJECT.id,
+				PROJECT.repo,
+				'10',
+				'board-backlog',
 			);
 		});
 	});

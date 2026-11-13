@@ -44,6 +44,7 @@ import type { WorkerUpdateStatus } from '../../lib/build-identity.js';
 import type { Checkpoint } from '../../pipeline/checkpoint.js';
 import type { ProposedScope } from '../../pipeline/planning.js';
 import type { ReviewAutomationOutcome, ReviewVerdict } from '../../pipeline/review.js';
+import { BOARD_DRIVEN_PHASES } from '../../pm/pipeline.js';
 import type { CancellationOrigin } from '../../queue/cancellation.js';
 import type { SwarmJob } from '../../queue/jobs.js';
 import type { ReviewAbsorbed } from '../../scm/delivery.js';
@@ -1375,6 +1376,39 @@ export async function countRunningRunsForProject(
 			),
 		);
 	return rows[0].total;
+}
+
+/**
+ * The `running` board-driven runs (Planning, Implementation) of one project task
+ * **in one repository** — what a card moved to Backlog terminates (issue #1451).
+ *
+ * Phase-filtered on {@link BOARD_DRIVEN_PHASES} because that is the whole rule
+ * keeping Review and the other SCM-driven phases (Respond-to-review,
+ * Respond-to-CI, Resolve-conflicts) out of reach of a board move: they share the
+ * task id but are keyed on the pull request, not on the card's column.
+ * Repository-scoped, exactly as {@link getLatestRunForTask}, because the answer
+ * is *terminated*: a same-numbered task in another of the project's repositories
+ * is a different card's work (issue #1108). Pipeline runs only, like every other
+ * task-keyed read here.
+ */
+export async function listRunningBoardDrivenRunsForTask(
+	projectId: string,
+	repository: string,
+	taskId: string,
+): Promise<{ id: string; phase: string }[]> {
+	return getDb()
+		.select({ id: runs.id, phase: runs.phase })
+		.from(runs)
+		.where(
+			and(
+				eq(runs.kind, PIPELINE_RUN_KIND),
+				eq(runs.projectId, projectId),
+				eq(runs.repository, repository),
+				eq(runs.taskId, taskId),
+				eq(runs.status, 'running'),
+				inArray(runs.phase, [...BOARD_DRIVEN_PHASES]),
+			),
+		);
 }
 
 /**

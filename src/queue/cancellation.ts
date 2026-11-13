@@ -45,7 +45,8 @@ import { parseRedisUrl } from '../lib/redis.js';
 const CANCELLATION_SET_KEY = 'swarm:run-cancellations';
 /**
  * Companion hash of `runId -> CancellationOrigin` JSON, recorded only by the
- * supported dashboard/API `terminate` path (issue #308). A run id present in
+ * supported dashboard/API `terminate` path (issue #308) and by the board move to
+ * Backlog that reuses it (issue #1451). A run id present in
  * {@link CANCELLATION_SET_KEY} with no matching field here is a marker-only
  * cancellation (an operator/process wrote the set entry directly) and must be
  * treated as unknown/external — this hash is never used to *decide* whether a
@@ -101,12 +102,15 @@ return removed
  * alongside the neutral {@link RUN_CANCELLED_MESSAGE}. At minimum distinguishes
  * the supported dashboard/API termination action from an unknown/external
  * marker; never inferred from the mere existence of the durable set entry.
+ * `board-backlog` (issue #1451) is the same Terminate request made because an
+ * operator moved the run's board card to Backlog while its board-driven phase
+ * was running (`terminateRunningBoardPhases`, `src/dispatch/board-phase-retirement.ts`).
  * `actor` is only ever set when real caller identity was available at the API
  * boundary (there is no per-user auth today — see `terminate` in
  * `src/api/routers/runs.ts`), so it stays absent rather than guessed.
  */
 export const CancellationOriginSchema = z.object({
-	source: z.enum(['dashboard', 'api']),
+	source: z.enum(['dashboard', 'api', 'board-backlog']),
 	actor: z.string().optional(),
 	/** ISO 8601 timestamp of the request. */
 	requestedAt: z.string(),

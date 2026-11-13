@@ -39,10 +39,11 @@ export type RunPhaseFilter = z.infer<typeof runPhaseFilterSchema>;
  * here the same way `runStatusFilterSchema` mirrors the router's status enum.
  * A cancellation's recorded origin: at minimum distinguishes the supported
  * dashboard/API termination action from an unknown/external marker (which has
- * no record at all — see `RunRow.cancellation`).
+ * no record at all — see `RunRow.cancellation`). `board-backlog` (issue #1451)
+ * is the same Terminate made because the run's board card was moved to Backlog.
  */
 export const cancellationOriginSchema = z.object({
-	source: z.enum(['dashboard', 'api']),
+	source: z.enum(['dashboard', 'api', 'board-backlog']),
 	actor: z.string().optional(),
 	requestedAt: z.string(),
 	requestId: z.string().optional(),

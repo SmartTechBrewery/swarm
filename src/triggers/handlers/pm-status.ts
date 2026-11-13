@@ -32,13 +32,17 @@
  *
  * Loop prevention (a persona's own board moves must not re-fire the trigger)
  * already happened router-side (`PMRouterAdapter.isSelfAuthored`), so it isn't
- * repeated here. That covers the notice too: a comment is not a status change
+ * repeated here — which is also why SWARM's own move of a card to Backlog never
+ * terminates that card's running phase (issue #1451). That covers the notice too: a comment is not a status change
  * (`PMRouterAdapter.isStatusChange`), and it carries the SWARM footer and marker,
  * so it can never re-enter this handler.
  */
 
 import type { ProjectConfig } from '../../config/schema.js';
-import { retireSupersededBoardPhases } from '../../dispatch/board-phase-retirement.js';
+import {
+	retireSupersededBoardPhases,
+	terminateRunningBoardPhases,
+} from '../../dispatch/board-phase-retirement.js';
 import { promoteDependencyWaits } from '../../dispatch/dispatcher.js';
 import { releaseTicketSlot } from '../../dispatch/wip-limit.js';
 import { requireProjectPMAdapter } from '../../integrations/pm/registry.js';
@@ -265,7 +269,8 @@ async function observeStatus(ctx: PmTriggerContext, statusId: string): Promise<b
  * Make the card's current column the single source of truth for which
  * board-driven phase is queued for it (issue #909): retire whatever board-driven
  * phase an *earlier* move left waiting, so only the phase this column calls for
- * — if it calls for one — is left queued.
+ * — if it calls for one — is left queued. A move to Backlog additionally
+ * terminates a board-driven phase that is already running (issue #1451).
  *
  * Four conditions each carry one acceptance criterion, and a handler reaching
  * into the dispatch layer for this is precedented (`./review.ts` already imports
@@ -298,6 +303,19 @@ async function applyColumnToQueue(
 		keepPhase,
 		excludeDispatchId: ctx.dispatchId,
 	});
+
+	// Backlog is "stop working on this" (issue #1451): beyond the waiting phases
+	// retired above, a Planning/Implementation already *running* for the card is
+	// terminated exactly as the dashboard's Terminate would. Keyed on the canonical
+	// status key, so it holds for every PM provider; Review and the other
+	// SCM-driven phases are never touched. Fails open.
+	if (workItem.statusKey === 'backlog') {
+		await terminateRunningBoardPhases({
+			projectId: ctx.project.id,
+			repository: ctx.project.repo,
+			taskId,
+		});
+	}
 }
 
 /**

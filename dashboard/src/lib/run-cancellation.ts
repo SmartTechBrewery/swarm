@@ -28,6 +28,13 @@ export function normalizeRunError(error: string): string {
 	return error === LEGACY_USER_TERMINATION_MESSAGE ? RUN_CANCELLED_MESSAGE : error;
 }
 
+/** The sentence each recorded origin source reads as (issue #1451 added the board move). */
+const CANCELLATION_SOURCE_COPY: Record<CancellationOrigin['source'], string> = {
+	dashboard: 'Cancelled via dashboard',
+	api: 'Cancelled via API',
+	'board-backlog': 'Cancelled because its board card was moved to Backlog',
+};
+
 /**
  * Describe a run's recorded cancellation origin, or `null` when there is none
  * to show — a marker-only (external/unknown) cancellation and every legacy row
@@ -37,6 +44,6 @@ export function describeCancellationOrigin(
 	origin: CancellationOrigin | null | undefined,
 ): string | null {
 	if (!origin) return null;
-	const base = origin.source === 'dashboard' ? 'Cancelled via dashboard' : 'Cancelled via API';
+	const base = CANCELLATION_SOURCE_COPY[origin.source];
 	return origin.actor ? `${base} by ${origin.actor}` : base;
 }

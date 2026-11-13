@@ -294,6 +294,14 @@ describe('run cancellation', () => {
 			expect(hget).toHaveBeenCalledWith('swarm:run-cancellation-origins', 'run-1');
 		});
 
+		it('accepts the board move to Backlog origin (issue #1451)', async () => {
+			const boardOrigin = { source: 'board-backlog', requestedAt: '2026-11-13T00:00:00.000Z' };
+			hget.mockResolvedValue(JSON.stringify(boardOrigin));
+			const { getRunCancellationOrigin } = await import('@/queue/cancellation.js');
+
+			expect(await getRunCancellationOrigin('run-1')).toEqual(boardOrigin);
+		});
+
 		it('returns null for a marker-only cancellation (no origin ever recorded)', async () => {
 			hget.mockResolvedValue(null);
 			const { getRunCancellationOrigin } = await import('@/queue/cancellation.js');
