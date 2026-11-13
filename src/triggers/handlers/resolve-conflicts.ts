@@ -23,9 +23,13 @@
 
 import type { DispatchWaitReason } from '../../db/repositories/dispatchesRepository.js';
 import {
+	getSubmittedReviewSlot,
+	isLastPermittedVerdict,
 	isReviewAllowanceSpent,
 	listActiveReviewSlotsForPullRequest,
+	type PullRequestReviewSlot,
 	type ReviewCapBound,
+	type ReviewVerdictKey,
 	reviewCapBoundAfterSupersession,
 } from '../../db/repositories/reviewVerdictsRepository.js';
 import { listParkedApprovalsAtMergeHead } from '../../db/repositories/runsRepository.js';
@@ -202,7 +206,9 @@ async function checkCandidate(
 			ctx,
 			`Pull request #${candidate.number} has spent its review allowance (${bound}), and resolving ` +
 				'the conflict would not reopen review, so SWARM does not resolve it. Use Force re-review ' +
-				'on the pull request: that grants another review and lets Resolve-conflicts run again.',
+				"on the pull request's last Review run to grant another review, then Recheck mergeability " +
+				'(`pr_recheck_mergeability`) so Resolve-conflicts runs without waiting for the next merge ' +
+				`into \`${candidate.baseBranch}\`.`,
 		);
 		return null;
 	}
@@ -241,6 +247,12 @@ async function checkCandidate(
  *  - the allowance is not spent, or an operator's Force re-review grant is
  *    outstanding (`isReviewAllowanceSpent`);
  *  - a review is in flight (a `pending` slot whose dispatch is still live);
+ *  - the pull request's last verdict is an approval of its current head
+ *    ({@link isUnmovedApproval}): Force re-review cannot act on an approval
+ *    whose head has not moved (`head-unchanged`), so the push a resolution
+ *    makes is what gives the operator — and merge automation — a way forward.
+ *    Holding it would strand an approved pull request (with `autoMerge` off, or
+ *    after a Force re-review approved past the cap) with no SWARM remedy at all;
  *  - SWARM's own push would reopen review: stamping the approvals parked at the
  *    current head superseded, as `src/dispatch/base-push-supersession.ts` does on
  *    a successful Resolve-conflicts settle (issue #1445), leaves no bound reached
@@ -263,15 +275,14 @@ async function reviewCapHold(
 		);
 		if (!isReviewAllowanceSpent(slots)) return null;
 		if (slots.some((slot) => slot.state === 'pending' && slot.dispatchActive)) return null;
-		const parked = await listParkedApprovalsAtMergeHead(
-			{
-				projectId: ctx.project.id,
-				repository: ctx.project.repo,
-				prNumber,
-				headSha: candidate.headSha,
-			},
-			MERGE_REARM_OUTCOMES,
-		);
+		const key = {
+			projectId: ctx.project.id,
+			repository: ctx.project.repo,
+			prNumber,
+			headSha: candidate.headSha,
+		};
+		if (await isUnmovedApproval(slots, key)) return null;
+		const parked = await listParkedApprovalsAtMergeHead(key, MERGE_REARM_OUTCOMES);
 		return reviewCapBoundAfterSupersession(
 			slots,
 			new Set(parked.map((approval) => approval.reviewedHeadSha)),
@@ -284,6 +295,25 @@ async function reviewCapHold(
 		});
 		return null;
 	}
+}
+
+/**
+ * Whether the pull request's last submitted verdict is a still-counted approval
+ * of `key.headSha` — the head the pull request is at now (issue #1446). Force
+ * re-review refuses exactly this shape (`head-unchanged`,
+ * `src/dispatch/force-re-review.ts`), so a hold here would leave nothing to act
+ * on. The in-memory slots answer "last, counted, at this head" with no read; the
+ * verdict itself is read only for that one candidate slot.
+ */
+async function isUnmovedApproval(
+	slots: readonly PullRequestReviewSlot[],
+	key: ReviewVerdictKey,
+): Promise<boolean> {
+	const atHead = slots.find(
+		(slot) => slot.state === 'submitted' && !slot.superseded && slot.headSha === key.headSha,
+	);
+	if (!atHead || !isLastPermittedVerdict(slots, atHead.ordinal)) return false;
+	return (await getSubmittedReviewSlot(key))?.verdict === 'approve';
 }
 
 /**

@@ -1336,13 +1336,22 @@ overnight. The per-PR path (`checkCandidate`, after ownership and mergeability,
 before the head/base claim) now notes a skip and logs the bound instead of
 dispatching when the allowance is spent with no outstanding Force re-review
 grant (`isReviewAllowanceSpent`), no review is in flight (a `pending` slot whose
-dispatch is live), and a bound would *still* be reached after the push's own
-#1445 stamp — `reviewCapBoundAfterSupersession` over the approvals
+dispatch is live), the last verdict is not a still-counted approval of the
+current head, and a bound would *still* be reached after the push's own #1445
+stamp — `reviewCapBoundAfterSupersession` over the approvals
 `listParkedApprovalsAtMergeHead` finds at the current head, the same arithmetic
-the reservation uses. That last clause is what keeps the `#2254` shape
-dispatched: its push is exactly what reopens review. A read error fails open and
-dispatches as before. Force re-review re-arms it; the fan-out (it only
-schedules) and the catch-up path (asked for a live approval) are not gated.
+the reservation uses. The last clause keeps the `#2254` shape dispatched: its
+push is exactly what reopens review. The approval clause keeps an approved pull
+request whose approval nothing parked (`autoMerge` off, a `policy-blocked`
+merge, or a Force re-review that approved past the cap) dispatched: Force
+re-review refuses an approval whose head has not moved (`head-unchanged`), so
+the resolution's push is what makes it actionable, and holding it would strand
+the pull request. A read error fails open and dispatches as before. A held
+pull request is released by Force re-review on its last Review run — the grant
+makes the allowance unspent — but Force re-review schedules no conflict check,
+so the skip names Recheck mergeability (`pr_recheck_mergeability`) to run one
+rather than waiting for the next base merge. The fan-out (it only schedules)
+and the catch-up path (asked for a live approval) are not gated.
 
 A superseded slot stays `submitted` — the prior-review signal, the Force
 re-review slot read and the override grant all still need it — but frees both its

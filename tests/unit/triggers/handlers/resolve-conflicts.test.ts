@@ -14,6 +14,7 @@ const {
 	findTaskIdForStoredTaskBranch,
 	listActiveReviewSlotsForPullRequest,
 	listParkedApprovalsAtMergeHead,
+	getSubmittedReviewSlot,
 } = vi.hoisted(() => ({
 	listConflictCandidates: vi.fn(),
 	commentOnPullRequest: vi.fn(),
@@ -23,6 +24,7 @@ const {
 	findTaskIdForStoredTaskBranch: vi.fn(),
 	listActiveReviewSlotsForPullRequest: vi.fn(),
 	listParkedApprovalsAtMergeHead: vi.fn(),
+	getSubmittedReviewSlot: vi.fn(),
 }));
 
 // The work-item origin gate (issue #836) reads run history; mock just that read,
@@ -41,6 +43,7 @@ vi.mock('@/db/repositories/runsRepository.js', async (importActual) => ({
 vi.mock('@/db/repositories/reviewVerdictsRepository.js', async (importActual) => ({
 	...(await importActual<typeof import('@/db/repositories/reviewVerdictsRepository.js')>()),
 	listActiveReviewSlotsForPullRequest,
+	getSubmittedReviewSlot,
 }));
 
 vi.mock('@/dispatch/dispatcher.js', () => ({ scheduleCoalescedDispatch: scheduleCoalescedJob }));
@@ -511,7 +514,19 @@ describe('resolve-conflicts holds a pull request a review cap stops (issue #1446
 		findTaskIdForStoredTaskBranch.mockResolvedValue(undefined);
 		listActiveReviewSlotsForPullRequest.mockResolvedValue(cappedSlots());
 		listParkedApprovalsAtMergeHead.mockResolvedValue([]);
+		getSubmittedReviewSlot.mockResolvedValue(undefined);
 	});
+
+	/** The ledger's submitted slot at the candidate's head, carrying `verdict`. */
+	function submittedAtHead(verdict: 'approve' | 'request-changes', ordinal = 3) {
+		return {
+			ordinal,
+			verdict,
+			reviewId: 'review-1',
+			capOverrideGrantedAt: null,
+			capOverrideConsumedAt: null,
+		};
+	}
 
 	async function handleWithDecline(): Promise<{
 		result: unknown;
@@ -540,6 +555,76 @@ describe('resolve-conflicts holds a pull request a review cap stops (issue #1446
 		expect(decline.kind).toBe('skipped');
 		expect(decline.reason).toContain('verdict-cap');
 		expect(decline.reason).toContain('Force re-review');
+	});
+
+	// Force re-review grants a review but schedules no conflict check, so the copy
+	// must name the action that does reach this per-PR path.
+	it('names a remedy that reaches the per-PR conflict check for a request-changes cap', async () => {
+		const slots = cappedSlots();
+		slots[2] = { ...slots[2], headSha: 'head123' };
+		listActiveReviewSlotsForPullRequest.mockResolvedValue(slots);
+		getSubmittedReviewSlot.mockResolvedValue(submittedAtHead('request-changes'));
+
+		const { result, noteDecline } = await handleWithDecline();
+
+		expect(result).toBeNull();
+		const { reason } = noteDecline.mock.calls[0][0] as TriggerDecline;
+		expect(reason).toContain('Force re-review');
+		expect(reason).toContain('`pr_recheck_mergeability`');
+		expect(reason).not.toContain('lets Resolve-conflicts run again');
+	});
+
+	// Force re-review refuses an approval whose head has not moved (`head-unchanged`),
+	// so the resolution's push is the only thing that gives this pull request a way on.
+	it('dispatches a pull request whose cap-reaching verdict is an approval at the current head with nothing parked', async () => {
+		const slots = cappedSlots();
+		slots[2] = { ...slots[2], headSha: 'head123' };
+		listActiveReviewSlotsForPullRequest.mockResolvedValue(slots);
+		getSubmittedReviewSlot.mockResolvedValue(submittedAtHead('approve'));
+
+		const result = await createResolveConflictsTrigger().handle(perPrEvent);
+
+		expect(result).toMatchObject({ phase: 'resolve-conflicts', prNumber: '42' });
+		expect(getSubmittedReviewSlot).toHaveBeenCalledWith({
+			projectId: project.id,
+			repository: project.repo,
+			prNumber: '42',
+			headSha: 'head123',
+		});
+		expect(listParkedApprovalsAtMergeHead).not.toHaveBeenCalled();
+	});
+
+	// 4 counted slots less the one parked stamp still reach the verdict cap, but the
+	// last verdict is an approval of the current head, so the hand-off goes through.
+	it('dispatches the #1264 hand-off after a forced re-review approved past the cap', async () => {
+		listActiveReviewSlotsForPullRequest.mockResolvedValue([
+			...cappedSlots(),
+			slot({
+				ordinal: 4,
+				headSha: 'head123',
+				capOverrideGrantedAt: new Date(),
+				capOverrideConsumedAt: new Date(),
+			}),
+		]);
+		listParkedApprovalsAtMergeHead.mockResolvedValue([{ id: 'run-4', reviewedHeadSha: 'head123' }]);
+		getSubmittedReviewSlot.mockResolvedValue(submittedAtHead('approve', 4));
+
+		const result = await createResolveConflictsTrigger().handle(perPrEvent);
+
+		expect(result).toMatchObject({ phase: 'resolve-conflicts', prNumber: '42' });
+		expect(claimConflictResolution).toHaveBeenCalledOnce();
+	});
+
+	// An approval at the current head that a later verdict outranks is not the stop.
+	it('still holds when the approval at the current head is not the last verdict', async () => {
+		listActiveReviewSlotsForPullRequest.mockResolvedValue([
+			slot({ ordinal: 1, headSha: 'head123' }),
+			slot({ ordinal: 2, headSha: 'reviewed-1' }),
+			slot({ ordinal: 3, headSha: 'reviewed-2' }),
+		]);
+
+		expect(await createResolveConflictsTrigger().handle(perPrEvent)).toBeNull();
+		expect(getSubmittedReviewSlot).not.toHaveBeenCalled();
 	});
 
 	// The #2254 shape: the push stamps the parked approval superseded, which frees
