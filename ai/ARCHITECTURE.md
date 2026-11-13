@@ -1329,6 +1329,21 @@ time. The skip saves the slot only while the head stays red: nothing re-arms the
 merge off the parked approval, so if that head later goes green it reserves a new,
 counted slot and is reviewed — the same slot the hand-back used to spend.
 
+**Resolve-conflicts holds a pull request a review cap has stopped for good
+(issue #1446).** A capped pull request that conflicts is resolved, reviewed by
+nobody, and conflicts again at the next base merge — `#2245` had seven such runs
+overnight. The per-PR path (`checkCandidate`, after ownership and mergeability,
+before the head/base claim) now notes a skip and logs the bound instead of
+dispatching when the allowance is spent with no outstanding Force re-review
+grant (`isReviewAllowanceSpent`), no review is in flight (a `pending` slot whose
+dispatch is live), and a bound would *still* be reached after the push's own
+#1445 stamp — `reviewCapBoundAfterSupersession` over the approvals
+`listParkedApprovalsAtMergeHead` finds at the current head, the same arithmetic
+the reservation uses. That last clause is what keeps the `#2254` shape
+dispatched: its push is exactly what reopens review. A read error fails open and
+dispatches as before. Force re-review re-arms it; the fan-out (it only
+schedules) and the catch-up path (asked for a live approval) are not gated.
+
 A superseded slot stays `submitted` — the prior-review signal, the Force
 re-review slot read and the override grant all still need it — but frees both its
 ordinal and its `REVIEW_VERDICT_CAP` slot, exactly as an `abandoned` one does,

@@ -13,15 +13,30 @@
  * worker-side branch update for a provider that cannot update a branch itself
  * arrives as a synthetic job carrying `mergeCatchUp`, and is dispatched as a
  * catch-up pass of this phase — see {@link checkCatchUp}.
+ *
+ * The per-PR path also holds a pull request a review cap has stopped for good
+ * (issue #1446): if no review can follow the push, resolving the conflict buys
+ * nothing, and the next base merge would only dispatch it again — see
+ * {@link reviewCapHold}. The fan-out and catch-up paths are not gated: the
+ * fan-out only schedules per-PR checks, and a catch-up is asked for a live approval.
  */
 
 import type { DispatchWaitReason } from '../../db/repositories/dispatchesRepository.js';
+import {
+	isReviewAllowanceSpent,
+	listActiveReviewSlotsForPullRequest,
+	type ReviewCapBound,
+	reviewCapBoundAfterSupersession,
+} from '../../db/repositories/reviewVerdictsRepository.js';
+import { listParkedApprovalsAtMergeHead } from '../../db/repositories/runsRepository.js';
 import { scheduleCoalescedDispatch } from '../../dispatch/dispatcher.js';
+import { describeError } from '../../lib/errors.js';
 import { logger } from '../../lib/logger.js';
 import type { MergeCatchUpRequest, ScmWebhookJob } from '../../queue/jobs.js';
 import type { ScmEvent } from '../../scm/events.js';
 import { SWARM_GENERATED_FOOTER } from '../../scm/swarm-origin.js';
 import type { PullRequestDetails } from '../../scm/types.js';
+import { MERGE_REARM_OUTCOMES } from '../../worker/merge-rearm-outcomes.js';
 import { noteSkip } from '../decline.js';
 import { buildConflictResolutionKey, claimConflictResolution } from '../resolve-conflicts-dedup.js';
 import {
@@ -143,10 +158,12 @@ export function createResolveConflictsTrigger(): TriggerHandler {
 }
 
 /**
- * The per-PR path: decide ownership, then mergeability, then claim the head/base
- * state and dispatch. Ownership comes first, mirroring `review.ts` — a PR that is
- * not ours must not spend rechecks waiting for a mergeability answer that would
- * be discarded anyway.
+ * The per-PR path: decide ownership, then mergeability, then whether a review cap
+ * has stopped the pull request for good, then claim the head/base state and
+ * dispatch. Ownership comes first, mirroring `review.ts` — a PR that is not ours
+ * must not spend rechecks waiting for a mergeability answer that would be
+ * discarded anyway. The cap hold sits before the claim, so a held pull request
+ * takes none.
  */
 async function checkCandidate(
 	ctx: ScmTriggerContext,
@@ -175,6 +192,21 @@ async function checkCandidate(
 		return null;
 	}
 
+	const bound = await reviewCapHold(ctx, candidate);
+	if (bound) {
+		logger.info(
+			'resolve-conflicts: a review cap stops this pull request and a base merge cannot reopen it — not resolving',
+			{ prNumber: candidate.number, headSha: candidate.headSha, bound },
+		);
+		noteSkip(
+			ctx,
+			`Pull request #${candidate.number} has spent its review allowance (${bound}), and resolving ` +
+				'the conflict would not reopen review, so SWARM does not resolve it. Use Force re-review ' +
+				'on the pull request: that grants another review and lets Resolve-conflicts run again.',
+		);
+		return null;
+	}
+
 	const stateKey = buildConflictResolutionKey(
 		ctx.project.repo,
 		String(candidate.number),
@@ -197,6 +229,61 @@ async function checkCandidate(
 		baseBranch: candidate.baseBranch,
 		baseSha: candidate.baseSha,
 	};
+}
+
+/**
+ * Which review-cap bound would still stop this pull request after the push a
+ * Resolve-conflicts run makes, or `null` when the run is worth dispatching
+ * (issue #1446). A capped pull request is resolved, reviewed by nobody, and
+ * conflicts again at the next base merge — `#2245` had seven such runs overnight.
+ *
+ * `null` — dispatch as before — when any of these hold:
+ *  - the allowance is not spent, or an operator's Force re-review grant is
+ *    outstanding (`isReviewAllowanceSpent`);
+ *  - a review is in flight (a `pending` slot whose dispatch is still live);
+ *  - SWARM's own push would reopen review: stamping the approvals parked at the
+ *    current head superseded, as `src/dispatch/base-push-supersession.ts` does on
+ *    a successful Resolve-conflicts settle (issue #1445), leaves no bound reached
+ *    (`reviewCapBoundAfterSupersession`). That is the `#2254` shape, and holding
+ *    it would block the very push that unsticks it.
+ *
+ * Fails open: a read error is logged and answers `null`, so the worst case is the
+ * behaviour before this gate existed.
+ */
+async function reviewCapHold(
+	ctx: ScmTriggerContext,
+	candidate: PullRequestDetails,
+): Promise<ReviewCapBound | null> {
+	const prNumber = String(candidate.number);
+	try {
+		const slots = await listActiveReviewSlotsForPullRequest(
+			ctx.project.id,
+			ctx.project.repo,
+			prNumber,
+		);
+		if (!isReviewAllowanceSpent(slots)) return null;
+		if (slots.some((slot) => slot.state === 'pending' && slot.dispatchActive)) return null;
+		const parked = await listParkedApprovalsAtMergeHead(
+			{
+				projectId: ctx.project.id,
+				repository: ctx.project.repo,
+				prNumber,
+				headSha: candidate.headSha,
+			},
+			MERGE_REARM_OUTCOMES,
+		);
+		return reviewCapBoundAfterSupersession(
+			slots,
+			new Set(parked.map((approval) => approval.reviewedHeadSha)),
+		);
+	} catch (err) {
+		logger.warn('resolve-conflicts: could not read the review cap — resolving as usual', {
+			prNumber,
+			headSha: candidate.headSha,
+			error: describeError(err),
+		});
+		return null;
+	}
 }
 
 /**

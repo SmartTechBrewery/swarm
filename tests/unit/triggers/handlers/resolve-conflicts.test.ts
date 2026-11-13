@@ -12,6 +12,8 @@ const {
 	claimConflictResolution,
 	hasRunForTask,
 	findTaskIdForStoredTaskBranch,
+	listActiveReviewSlotsForPullRequest,
+	listParkedApprovalsAtMergeHead,
 } = vi.hoisted(() => ({
 	listConflictCandidates: vi.fn(),
 	commentOnPullRequest: vi.fn(),
@@ -19,6 +21,8 @@ const {
 	claimConflictResolution: vi.fn(),
 	hasRunForTask: vi.fn(),
 	findTaskIdForStoredTaskBranch: vi.fn(),
+	listActiveReviewSlotsForPullRequest: vi.fn(),
+	listParkedApprovalsAtMergeHead: vi.fn(),
 }));
 
 // The work-item origin gate (issue #836) reads run history; mock just that read,
@@ -29,6 +33,14 @@ vi.mock('@/db/repositories/runsRepository.js', async (importActual) => ({
 	...(await importActual<typeof import('@/db/repositories/runsRepository.js')>()),
 	hasRunForTask,
 	findTaskIdForStoredTaskBranch,
+	listParkedApprovalsAtMergeHead,
+}));
+
+// The review-cap hold (issue #1446) reads the ledger's slots; mock just that read,
+// keeping the real cap arithmetic so the gate genuinely has to reach the bound.
+vi.mock('@/db/repositories/reviewVerdictsRepository.js', async (importActual) => ({
+	...(await importActual<typeof import('@/db/repositories/reviewVerdictsRepository.js')>()),
+	listActiveReviewSlotsForPullRequest,
 }));
 
 vi.mock('@/dispatch/dispatcher.js', () => ({ scheduleCoalescedDispatch: scheduleCoalescedJob }));
@@ -38,6 +50,7 @@ vi.mock('@/triggers/resolve-conflicts-dedup.js', () => ({
 		`${repo}:${prNumber}:${headSha}:${baseSha}`,
 }));
 
+import type { PullRequestReviewSlot } from '@/db/repositories/reviewVerdictsRepository.js';
 import { MERGE_CATCH_UP_ACTION } from '@/queue/jobs.js';
 import {
 	buildConflictCheckJob,
@@ -95,6 +108,8 @@ describe('resolve-conflicts trigger', () => {
 		claimConflictResolution.mockResolvedValue(true);
 		scheduleCoalescedJob.mockResolvedValue(undefined);
 		hasRunForTask.mockResolvedValue(true);
+		listActiveReviewSlotsForPullRequest.mockResolvedValue([]);
+		listParkedApprovalsAtMergeHead.mockResolvedValue([]);
 		// No recorded task branch (issue #1247), so the gate decodes the branch as before.
 		findTaskIdForStoredTaskBranch.mockResolvedValue(undefined);
 	});
@@ -303,6 +318,8 @@ describe('resolve-conflicts trigger: the conflict check merge automation asks fo
 		claimConflictResolution.mockResolvedValue(true);
 		scheduleCoalescedJob.mockResolvedValue(undefined);
 		hasRunForTask.mockResolvedValue(true);
+		listActiveReviewSlotsForPullRequest.mockResolvedValue([]);
+		listParkedApprovalsAtMergeHead.mockResolvedValue([]);
 		findTaskIdForStoredTaskBranch.mockResolvedValue(undefined);
 	});
 
@@ -415,6 +432,8 @@ describe('resolve-conflicts names why it skipped (issue #1248)', () => {
 		claimConflictResolution.mockResolvedValue(true);
 		scheduleCoalescedJob.mockResolvedValue(undefined);
 		hasRunForTask.mockResolvedValue(true);
+		listActiveReviewSlotsForPullRequest.mockResolvedValue([]);
+		listParkedApprovalsAtMergeHead.mockResolvedValue([]);
 	});
 
 	async function skipReason(): Promise<string> {
@@ -457,5 +476,143 @@ describe('resolve-conflicts names why it skipped (issue #1248)', () => {
 		listConflictCandidates.mockResolvedValue([{ ...candidate, mergeable: null }]);
 
 		expect(await skipReason()).toContain('not yet reported whether pull request #42 is mergeable');
+	});
+});
+
+// Issue #1446: a pull request a review cap has stopped for good is not resolved —
+// nobody reviews the result, and the next base merge would only dispatch it again.
+describe('resolve-conflicts holds a pull request a review cap stops (issue #1446)', () => {
+	const perPrEvent = { ...mergedEvent, event: { ...mergedEvent.event, conflictPrNumber: '42' } };
+
+	function slot(overrides: Partial<PullRequestReviewSlot> = {}): PullRequestReviewSlot {
+		return {
+			ordinal: 1,
+			state: 'submitted',
+			headSha: 'reviewed-0',
+			capOverrideGrantedAt: null,
+			capOverrideConsumedAt: null,
+			dispatchActive: false,
+			superseded: false,
+			...overrides,
+		};
+	}
+
+	/** Three counted verdicts, each at its own reviewed head. */
+	function cappedSlots(): PullRequestReviewSlot[] {
+		return [0, 1, 2].map((i) => slot({ ordinal: i + 1, headSha: `reviewed-${i}` }));
+	}
+
+	beforeEach(() => {
+		vi.clearAllMocks();
+		listConflictCandidates.mockResolvedValue([candidate]);
+		claimConflictResolution.mockResolvedValue(true);
+		scheduleCoalescedJob.mockResolvedValue(undefined);
+		hasRunForTask.mockResolvedValue(true);
+		findTaskIdForStoredTaskBranch.mockResolvedValue(undefined);
+		listActiveReviewSlotsForPullRequest.mockResolvedValue(cappedSlots());
+		listParkedApprovalsAtMergeHead.mockResolvedValue([]);
+	});
+
+	async function handleWithDecline(): Promise<{
+		result: unknown;
+		noteDecline: ReturnType<typeof vi.fn>;
+	}> {
+		const noteDecline = vi.fn();
+		const result = await createResolveConflictsTrigger().handle({ ...perPrEvent, noteDecline });
+		return { result, noteDecline };
+	}
+
+	it('holds a verdict-capped pull request with nothing parked at its head, and says why', async () => {
+		const { result, noteDecline } = await handleWithDecline();
+
+		expect(result).toBeNull();
+		expect(claimConflictResolution).not.toHaveBeenCalled();
+		expect(listActiveReviewSlotsForPullRequest).toHaveBeenCalledWith(
+			project.id,
+			project.repo,
+			'42',
+		);
+		expect(listParkedApprovalsAtMergeHead).toHaveBeenCalledWith(
+			{ projectId: project.id, repository: project.repo, prNumber: '42', headSha: 'head123' },
+			['not-eligible', 'retry-exhausted'],
+		);
+		const decline = noteDecline.mock.calls[0][0] as TriggerDecline;
+		expect(decline.kind).toBe('skipped');
+		expect(decline.reason).toContain('verdict-cap');
+		expect(decline.reason).toContain('Force re-review');
+	});
+
+	// The #2254 shape: the push stamps the parked approval superseded, which frees
+	// the verdict cap, so the run is exactly what unsticks the pull request.
+	it('dispatches when the push would supersede the approval that caps it', async () => {
+		listParkedApprovalsAtMergeHead.mockResolvedValue([
+			{ id: 'run-1', reviewedHeadSha: 'reviewed-2' },
+		]);
+
+		const result = await createResolveConflictsTrigger().handle(perPrEvent);
+
+		expect(result).toMatchObject({ phase: 'resolve-conflicts', prNumber: '42' });
+		expect(claimConflictResolution).toHaveBeenCalledOnce();
+	});
+
+	it('holds a pull request at the superseded bound', async () => {
+		listActiveReviewSlotsForPullRequest.mockResolvedValue(
+			[0, 1, 2, 3, 4].map((i) => slot({ ordinal: 1, headSha: `old-${i}`, superseded: true })),
+		);
+
+		const { result, noteDecline } = await handleWithDecline();
+
+		expect(result).toBeNull();
+		expect(claimConflictResolution).not.toHaveBeenCalled();
+		expect((noteDecline.mock.calls[0][0] as TriggerDecline).reason).toContain('superseded-bound');
+	});
+
+	it('dispatches while an operator Force re-review grant is outstanding', async () => {
+		const slots = cappedSlots();
+		slots[2] = { ...slots[2], capOverrideGrantedAt: new Date() };
+		listActiveReviewSlotsForPullRequest.mockResolvedValue(slots);
+
+		const result = await createResolveConflictsTrigger().handle(perPrEvent);
+
+		expect(result).toMatchObject({ phase: 'resolve-conflicts' });
+		expect(listParkedApprovalsAtMergeHead).not.toHaveBeenCalled();
+	});
+
+	it('dispatches while a review is in flight', async () => {
+		listActiveReviewSlotsForPullRequest.mockResolvedValue([
+			...cappedSlots(),
+			slot({ ordinal: 4, state: 'pending', headSha: 'head123', dispatchActive: true }),
+		]);
+
+		const result = await createResolveConflictsTrigger().handle(perPrEvent);
+
+		expect(result).toMatchObject({ phase: 'resolve-conflicts' });
+	});
+
+	// A pending relic whose dispatch already settled is not a review in flight.
+	it('still holds behind a pending slot whose dispatch is no longer live', async () => {
+		listActiveReviewSlotsForPullRequest.mockResolvedValue([
+			...cappedSlots(),
+			slot({ ordinal: 4, state: 'pending', headSha: 'head123', dispatchActive: false }),
+		]);
+
+		expect(await createResolveConflictsTrigger().handle(perPrEvent)).toBeNull();
+	});
+
+	it('dispatches as usual when the review cap cannot be read', async () => {
+		listActiveReviewSlotsForPullRequest.mockRejectedValue(new Error('connection reset'));
+
+		const result = await createResolveConflictsTrigger().handle(perPrEvent);
+
+		expect(result).toMatchObject({ phase: 'resolve-conflicts' });
+	});
+
+	it('dispatches a pull request whose allowance is not spent without reading parked approvals', async () => {
+		listActiveReviewSlotsForPullRequest.mockResolvedValue(cappedSlots().slice(0, 2));
+
+		const result = await createResolveConflictsTrigger().handle(perPrEvent);
+
+		expect(result).toMatchObject({ phase: 'resolve-conflicts' });
+		expect(listParkedApprovalsAtMergeHead).not.toHaveBeenCalled();
 	});
 });

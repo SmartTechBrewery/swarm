@@ -883,6 +883,32 @@ export function reviewCapBoundReached(
 }
 
 /**
+ * Which bound would still be reached once every `submitted` slot keyed on one of
+ * `reviewedHeadsToStamp` were stamped superseded — {@link reviewCapBoundReached}
+ * over the ledger SWARM's own next base push would leave behind (issue #1446).
+ *
+ * The reader's copy of what `src/dispatch/base-push-supersession.ts` writes
+ * through {@link markReviewVerdictSuperseded} (issue #1445): the slots it marks
+ * are exactly the ones that write's `WHERE` clause matches — `submitted`, at one
+ * of those heads — and the count runs through the same {@link reachedBound} the
+ * writer's reservation uses, so the Resolve-conflicts gate asking "would this
+ * push reopen review?" cannot drift from the push that answers it. `null`
+ * means it would: the stamp frees enough of the allowance for a review.
+ */
+export function reviewCapBoundAfterSupersession(
+	slots: readonly PullRequestReviewSlot[],
+	reviewedHeadsToStamp: ReadonlySet<string>,
+): ReviewCapBound | null {
+	return reachedBound(
+		slots.map((slot) =>
+			slot.state === 'submitted' && reviewedHeadsToStamp.has(slot.headSha)
+				? { ...slot, superseded: true }
+				: slot,
+		),
+	);
+}
+
+/**
  * Whether an operator's cap-override grant is recorded on this pull request and
  * no reservation has spent it yet — {@link isReviewAllowanceSpent}'s second half,
  * named so a reader can tell "the operator has already acted" apart from "the
