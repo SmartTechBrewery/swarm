@@ -173,10 +173,26 @@ export function resolveProblemAnchorBusy(
 }
 
 /**
+ * Why a run an operator cancelled — dashboard/API Terminate, or its card moved to
+ * Backlog (issue #1453), i.e. a recorded `runs.cancellation` origin — is never
+ * attempted, or `undefined` when nobody cancelled it. Unlike
+ * {@link resolveProblemAnchorBusy} this never clears: the stop is the operator's
+ * call. A marker-only cancellation records no origin and is not one of these.
+ */
+export function resolveProblemAnchorCancelled(
+	run: Pick<RunRow, 'id' | 'cancellation'>,
+): string | undefined {
+	return run.cancellation
+		? `Run ${run.id} was cancelled by an operator (${run.cancellation.source}) — restarting it is their call`
+		: undefined;
+}
+
+/**
  * The phase's inputs for a claimed Resolve problem dispatch, or the reason it must
  * not run. A run attempt is read off the failed run: it is skipped when the project
  * has not turned the phase on, the run is gone or belongs elsewhere, it is no longer
- * `failed` (a retry already picked it up), or it is itself a Resolve problem
+ * `failed` (a retry already picked it up), an operator cancelled it
+ * ({@link resolveProblemAnchorCancelled}), or it is itself a Resolve problem
  * attempt. A ticket attempt (issue #1425) is re-checked against the WIP classifier:
  * see {@link resolveTicketAttempt}.
  */
@@ -210,6 +226,8 @@ export async function resolveProblemTrigger(
 			taskId,
 		};
 	}
+	const cancelled = resolveProblemAnchorCancelled(run);
+	if (cancelled) return { skip: cancelled, taskId };
 	return {
 		phase: 'resolve-problem',
 		taskId,
@@ -245,8 +263,8 @@ async function readTicketAnchor(
 	if (anchor.phase === 'resolve-problem') {
 		return { skip: `Run ${anchor.id} is itself a Resolve problem attempt` };
 	}
-	const busy = resolveProblemAnchorBusy(anchor, now);
-	return busy ? { skip: busy } : anchor;
+	const held = resolveProblemAnchorCancelled(anchor) ?? resolveProblemAnchorBusy(anchor, now);
+	return held ? { skip: held } : anchor;
 }
 
 /**

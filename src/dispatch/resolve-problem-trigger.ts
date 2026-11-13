@@ -7,9 +7,10 @@
  * **Failed runs** ({@link dispatchResolveProblemForFailedRuns}, issue #1396). A run
  * qualifies once it has been `failed` for {@link RESOLVE_PROBLEM_DELAY_MS}, within
  * {@link RESOLVE_PROBLEM_LOOKBACK_MS}, in a project that turned the phase on, and
- * while nothing else has picked it up: no retry or continuation of the run, no
- * Reset, no other dispatch or newer run on its task or pull request, and no attempt
- * for it yet. The database half of that — everything but the project opt-in — is
+ * while nothing else has picked it up and no operator cancelled it: no retry or
+ * continuation of the run, no Reset, no recorded cancellation origin (dashboard/API
+ * Terminate or a board move to Backlog, issue #1453), no other dispatch or newer run
+ * on its task or pull request, and no attempt for it yet. The database half of that — everything but the project opt-in — is
  * `listUnrecoveredFailedRuns` (`../db/repositories/runsRepository.ts`). Only
  * `status = 'failed'` is read there, so `deferred`, `checkpointed` and every other
  * self-retrying state never qualify.
@@ -23,7 +24,9 @@
  * termination, the review cap, a plan awaiting greenlight and an approval awaiting
  * merge are deliberate hand-offs to a person and are left alone. A `failed` holder
  * becomes the same run attempt the first leg would dispatch; a `stalled` holder a
- * ticket attempt, anchored to its latest run when it has one.
+ * ticket attempt, anchored to its latest run when it has one. A holder whose
+ * anchor run an operator cancelled is never attempted, even where the panel shows
+ * it as `failed` (a user termination in a non-board phase, issue #1453).
  *
  * One attempt per situation: the attempt is a `resolve-problem` run, which is never
  * ticket activity and so never qualifies itself or changes a holder's
@@ -32,7 +35,8 @@
  * key in both legs for the same run — so concurrent passes, and both legs, create
  * one dispatch. Nothing is dispatched while a dispatch is queued for the holder or
  * a newer run moved it (the classifier reads those as the pipeline's), nor while
- * its anchor run is being Reset or has a retry of its own scheduled.
+ * its anchor run is being Reset or has a retry of its own scheduled. The claim-time
+ * re-check (`./resolve-problem.ts`) skips a cancelled anchor run too.
  *
  * Best-effort and logged, like the rest of the reconciler: this never throws.
  */
@@ -52,6 +56,7 @@ import type { WipTicket, WipUsageEntry } from '../queue/wip-usage.js';
 import {
 	type ResolveProblemTicketCandidate,
 	resolveProblemAnchorBusy,
+	resolveProblemAnchorCancelled,
 	scheduleResolveProblem,
 	scheduleResolveProblemForTicket,
 } from './resolve-problem.js';
@@ -248,6 +253,15 @@ async function scheduleWaitingCandidate(
 	const anchorId = candidate.kind === 'run' ? candidate.runId : candidate.latestRunId;
 	const anchor = anchorId ? await deps.readRun(anchorId) : undefined;
 	if (anchorId && !anchor) return false;
+	const cancelled = anchor ? resolveProblemAnchorCancelled(anchor) : undefined;
+	if (cancelled) {
+		logger.debug('resolve-problem trigger: holder’s run was cancelled by an operator; skipping', {
+			projectId: candidate.projectId,
+			taskId: candidate.taskId,
+			reason: cancelled,
+		});
+		return false;
+	}
 	const busy = anchor ? resolveProblemAnchorBusy(anchor, now) : undefined;
 	if (busy) {
 		logger.debug('resolve-problem trigger: holder’s run is being acted on; skipping', {
