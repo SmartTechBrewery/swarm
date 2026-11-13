@@ -1,6 +1,7 @@
 import { and, asc, eq } from 'drizzle-orm';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { ProjectConfig } from '../../../src/config/schema.js';
 import { getDb } from '../../../src/db/client.js';
 import {
 	cancelWaitingDispatch,
@@ -19,17 +20,32 @@ import {
 	listActiveReviewSlotsForPullRequest,
 	markReviewVerdictSubmitted,
 	markReviewVerdictSuperseded,
+	REVIEW_SUPERSEDED_CAP,
 	REVIEW_VERDICT_CAP,
 	reserveReviewVerdict,
 } from '../../../src/db/repositories/reviewVerdictsRepository.js';
-import { createRun } from '../../../src/db/repositories/runsRepository.js';
+import {
+	completeRun,
+	createRun,
+	getRunByIdFromDb,
+	updateReviewMergeOutcome,
+} from '../../../src/db/repositories/runsRepository.js';
 import { dispatches } from '../../../src/db/schema/dispatches.js';
-import { recoverUnreviewedPullRequests } from '../../../src/dispatch/unreviewed-pr-recovery.js';
+import { supersedeApprovalsParkedAtHead } from '../../../src/dispatch/base-push-supersession.js';
+import {
+	classifyReviewLedgerForRecovery,
+	recoverUnreviewedPullRequests,
+} from '../../../src/dispatch/unreviewed-pr-recovery.js';
 import type { SCMProviderManifest } from '../../../src/integrations/scm/manifest.js';
 import { registerSCMProvider } from '../../../src/integrations/scm/registry.js';
 import type { SwarmJob } from '../../../src/queue/jobs.js';
 import type { AggregateCheckStatus, PullRequestDetails } from '../../../src/scm/types.js';
-import { createFakeScmProvider } from '../../helpers/factories.js';
+import {
+	createFakeScmProvider,
+	createMockProjectConfig,
+	createMockScmEvent,
+	createMockScmWebhookJob,
+} from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
 
@@ -407,6 +423,184 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 				const [row] = await recoveryDispatches();
 				const dispatch = await getDispatchById(row.id);
 				expect(dispatch).toMatchObject({ state: 'pending', phase: 'review', taskId: PR });
+			});
+		});
+
+		// Issue #1445: approvals merge automation refused (red checks, `not-eligible`)
+		// stayed parked at the refused head and kept spending `REVIEW_VERDICT_CAP`
+		// slots after SWARM's own base merge had replaced that head — `#2254` and
+		// `#2245` stopped capped, green, mergeable and unreviewed.
+		describe('approvals parked at a head SWARM’s own base merge replaced (issue #1445)', () => {
+			let project: ProjectConfig;
+			const slotKey = (headSha: string) => ({
+				projectId: PROJECT_ID,
+				repository: REPO,
+				prNumber: PR,
+				headSha,
+			});
+
+			beforeEach(async () => {
+				await seedImplementationRun();
+				project = createMockProjectConfig({ id: PROJECT_ID, repo: REPO, scm: 'github' });
+			});
+
+			/** A submitted verdict at `headSha` in the ledger. */
+			async function submitVerdict(
+				headSha: string,
+				verdict: 'approve' | 'request-changes',
+			): Promise<void> {
+				await reserveReviewVerdict(slotKey(headSha), await seedVerdictOwner());
+				await markReviewVerdictSubmitted(slotKey(headSha), { verdict });
+			}
+
+			/**
+			 * The Review run behind a verdict: it reviewed `reviewed`, and its merge
+			 * generation stopped at `parkedAt` with `outcome` — on another head when the
+			 * merge advanced onto an updated head (issue #874) and was refused there.
+			 */
+			async function reviewRun(opts: {
+				reviewed: string;
+				parkedAt: string;
+				verdict?: 'approve' | 'request-changes';
+				outcome?: string;
+			}): Promise<string> {
+				const id = await createRun({
+					projectId: PROJECT_ID,
+					repository: REPO,
+					taskId: PR,
+					phase: 'review',
+					prNumber: PR,
+					jobPayload: createMockScmWebhookJob({
+						event: createMockScmEvent({ repoFullName: REPO, headSha: opts.reviewed }),
+					}),
+				});
+				await completeRun(id, {
+					status: 'completed',
+					engine: 'claude',
+					reviewVerdict: opts.verdict ?? 'approve',
+				});
+				await updateReviewMergeOutcome(id, {
+					status: opts.outcome ?? 'not-eligible',
+					message: 'refused: the head fails its checks',
+					attempt: 0,
+					approvedHeadSha: opts.parkedAt,
+				});
+				return id;
+			}
+
+			/** A Resolve-conflicts push (or a branch update) moving the head off `fromHeadSha`. */
+			function basePushFrom(fromHeadSha: string): Promise<number> {
+				return supersedeApprovalsParkedAtHead({
+					project,
+					prNumber: PR,
+					fromHeadSha,
+					cause: 'resolve-conflicts',
+				});
+			}
+
+			async function ledgerAt(headSha: string) {
+				return classifyReviewLedgerForRecovery(
+					await listActiveReviewSlotsForPullRequest(PROJECT_ID, REPO, PR),
+					headSha,
+				);
+			}
+
+			// `#2254`: request-changes at A; an approval of X whose merge advanced onto
+			// B and was refused red there; the no-fix hand-back's approval of B, refused
+			// too. Resolve-conflicts then moved the pull request from B to C.
+			it('frees both approvals parked at B, so the sweep reviews C and it is no longer capped', async () => {
+				await submitVerdict('sha-a', 'request-changes');
+				await submitVerdict('sha-x', 'approve');
+				const advanced = await reviewRun({ reviewed: 'sha-x', parkedAt: 'sha-b' });
+				await submitVerdict('sha-b', 'approve');
+				const handBack = await reviewRun({ reviewed: 'sha-b', parkedAt: 'sha-b' });
+
+				expect(await ledgerAt(HEAD)).toBe('capped');
+				await recoverUnreviewedPullRequests();
+				expect(await recoveryDispatches()).toHaveLength(0);
+
+				expect(await basePushFrom('sha-b')).toBe(2);
+
+				expect(await listActiveReviewSlotsForPullRequest(PROJECT_ID, REPO, PR)).toMatchObject([
+					{ headSha: 'sha-a', superseded: false },
+					{ headSha: 'sha-x', superseded: true },
+					{ headSha: 'sha-b', superseded: true },
+				]);
+				expect((await getRunByIdFromDb(advanced))?.reviewSupersededAt).toBeInstanceOf(Date);
+				expect((await getRunByIdFromDb(handBack))?.reviewSupersededAt).toBeInstanceOf(Date);
+				expect(await ledgerAt(HEAD)).toBe('recover');
+
+				await recoverUnreviewedPullRequests();
+				const recoveries = await recoveryDispatches();
+				expect(recoveries).toHaveLength(1);
+				expect(recoveries[0].jobPayload).toMatchObject({ event: { headSha: HEAD } });
+
+				// The Review of C gets a slot — it is no longer capped, so its approval
+				// reaches merge automation as any other does.
+				expect(await reserveReviewVerdict(slotKey(HEAD), await seedVerdictOwner())).toMatchObject({
+					status: 'reserved',
+				});
+			});
+
+			// `#2245`: three approvals at three successive heads, each refused and each
+			// followed by a Resolve-conflicts push.
+			it('ends recoverable after approvals refused at three successive heads', async () => {
+				for (const head of ['sha-1', 'sha-2', 'sha-3']) {
+					await submitVerdict(head, 'approve');
+					await reviewRun({ reviewed: head, parkedAt: head });
+					expect(await basePushFrom(head)).toBe(1);
+				}
+
+				expect(await ledgerAt(HEAD)).toBe('recover');
+				await recoverUnreviewedPullRequests();
+				expect(await recoveryDispatches()).toHaveLength(1);
+			});
+
+			// The #511 loop guard: request-changes verdicts are never stamped, so a
+			// base push buys a request-changes loop nothing.
+			it('still stops three request-changes verdicts at the verdict cap', async () => {
+				for (const head of ['sha-1', 'sha-2', 'sha-3']) {
+					await submitVerdict(head, 'request-changes');
+					await reviewRun({ reviewed: head, parkedAt: head, verdict: 'request-changes' });
+				}
+
+				expect(await basePushFrom('sha-3')).toBe(0);
+
+				expect(await ledgerAt(HEAD)).toBe('capped');
+				expect(await reserveReviewVerdict(slotKey(HEAD), await seedVerdictOwner())).toMatchObject({
+					status: 'capped',
+					reason: 'verdict-cap',
+				});
+			});
+
+			// The #1079 bound: a head SWARM keeps moving still stops at
+			// `REVIEW_SUPERSEDED_CAP`.
+			it('still stops a head superseded again and again at the superseded bound', async () => {
+				for (let i = 1; i <= REVIEW_SUPERSEDED_CAP; i++) {
+					await submitVerdict(`sha-${i}`, 'approve');
+					await reviewRun({ reviewed: `sha-${i}`, parkedAt: `sha-${i}` });
+					expect(await basePushFrom(`sha-${i}`)).toBe(1);
+				}
+
+				expect(await ledgerAt(HEAD)).toBe('capped');
+				expect(await reserveReviewVerdict(slotKey(HEAD), await seedVerdictOwner())).toMatchObject({
+					status: 'capped',
+					reason: 'superseded-bound',
+				});
+			});
+
+			it('leaves an approval whose merge is still waiting, or merged, counting', async () => {
+				await submitVerdict('sha-1', 'approve');
+				await reviewRun({ reviewed: 'sha-1', parkedAt: 'sha-1', outcome: 'not-ready' });
+				await submitVerdict('sha-2', 'approve');
+				await reviewRun({ reviewed: 'sha-2', parkedAt: 'sha-2', outcome: 'merged' });
+
+				expect(await basePushFrom('sha-1')).toBe(0);
+				expect(await basePushFrom('sha-2')).toBe(0);
+				expect(await listActiveReviewSlotsForPullRequest(PROJECT_ID, REPO, PR)).toMatchObject([
+					{ headSha: 'sha-1', superseded: false },
+					{ headSha: 'sha-2', superseded: false },
+				]);
 			});
 		});
 	},

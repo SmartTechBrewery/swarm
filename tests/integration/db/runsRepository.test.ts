@@ -47,6 +47,7 @@ import {
 	hasRunForTask,
 	hasUpdatedHeadChecksRerun,
 	type ListRunsFilter,
+	listParkedApprovalsAtMergeHead,
 	listResolveProblemAttempts,
 	listResolveProblemAttemptsForHolders,
 	listRunPassedOverWorkerIds,
@@ -3556,6 +3557,104 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 				id: newer,
 				taskId: '70',
 			});
+		});
+	});
+
+	describe('listParkedApprovalsAtMergeHead (issue #1445)', () => {
+		const OUTCOMES = ['not-eligible', 'retry-exhausted'] as const;
+		const key = { projectId: PROJECT_ID, repository: REPO, prNumber: '74', headSha: 'sha-b' };
+
+		/**
+		 * A completed Review run on PR 74 that reviewed `reviewed` (or names no head
+		 * when `null`), whose merge generation stopped at `parkedAt` with `outcome`.
+		 */
+		async function parkedRun(
+			opts: {
+				reviewed?: string | null;
+				parkedAt?: string;
+				outcome?: string;
+				verdict?: 'approve' | 'request-changes';
+			} = {},
+		): Promise<string> {
+			const reviewed = opts.reviewed === undefined ? 'sha-b' : opts.reviewed;
+			const id = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '74',
+				phase: 'review',
+				prNumber: '74',
+				...(reviewed !== null
+					? {
+							jobPayload: createMockScmWebhookJob({
+								event: createMockScmEvent({ headSha: reviewed }),
+							}),
+						}
+					: {}),
+			});
+			await completeRun(id, {
+				status: 'completed',
+				engine: 'claude',
+				reviewVerdict: opts.verdict ?? 'approve',
+			});
+			await updateReviewMergeOutcome(id, {
+				status: opts.outcome ?? 'not-eligible',
+				message: 'refused',
+				attempt: 0,
+				approvedHeadSha: opts.parkedAt ?? 'sha-b',
+			});
+			return id;
+		}
+
+		// `#2254`: an approval whose merge advanced onto `sha-b` and was refused there,
+		// plus the no-fix hand-back's Review of `sha-b` itself.
+		it('returns every approval parked at the head, each with the head it reviewed', async () => {
+			const advanced = await parkedRun({ reviewed: 'sha-x' });
+			const own = await parkedRun({ outcome: 'retry-exhausted' });
+			await getDb()
+				.update(runs)
+				.set({ completedAt: new Date('2026-01-01T00:00:00Z') })
+				.where(eq(runs.id, advanced));
+			await getDb()
+				.update(runs)
+				.set({ completedAt: new Date('2026-01-02T00:00:00Z') })
+				.where(eq(runs.id, own));
+
+			expect(await listParkedApprovalsAtMergeHead(key, OUTCOMES)).toEqual([
+				{ id: advanced, reviewedHeadSha: 'sha-x' },
+				{ id: own, reviewedHeadSha: 'sha-b' },
+			]);
+		});
+
+		it('falls back to the parked head for a run whose payload names none', async () => {
+			const id = await parkedRun({ reviewed: null });
+
+			expect(await listParkedApprovalsAtMergeHead(key, OUTCOMES)).toEqual([
+				{ id, reviewedHeadSha: 'sha-b' },
+			]);
+		});
+
+		it.each([
+			['a request-changes verdict', { verdict: 'request-changes' as const }],
+			['a merged outcome', { outcome: 'merged' }],
+			['a merge still waiting (not-ready)', { outcome: 'not-ready' }],
+			['a merge generation advanced off the head (stale-base)', { outcome: 'stale-base' }],
+			['a merge generation parked at another head', { parkedAt: 'sha-c' }],
+		])('ignores %s', async (_label, opts) => {
+			await parkedRun(opts);
+
+			expect(await listParkedApprovalsAtMergeHead(key, OUTCOMES)).toEqual([]);
+		});
+
+		it('ignores an already superseded approval', async () => {
+			const id = await parkedRun();
+			await markReviewRunSuperseded(id);
+
+			expect(await listParkedApprovalsAtMergeHead(key, OUTCOMES)).toEqual([]);
+		});
+
+		it('returns nothing for no outcomes', async () => {
+			await parkedRun();
+
+			expect(await listParkedApprovalsAtMergeHead(key, [])).toEqual([]);
 		});
 	});
 

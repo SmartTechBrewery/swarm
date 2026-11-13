@@ -275,6 +275,7 @@ import {
 import {
 	createFailedRun,
 	failRunFromStatus,
+	findUpdatedHeadReviewRun,
 	getLatestRunForTask,
 } from '../../db/repositories/runsRepository.js';
 import {
@@ -313,7 +314,9 @@ import {
 	buildReviewDispatchKey,
 	claimReviewDispatch,
 	markReviewDispatchClaimedWithoutChecks,
+	REFRESHED_CLAIM_OWNER,
 	refreshReviewDispatchClaim,
+	releaseReviewDispatchHeldBy,
 	reviewClaimedWithoutChecksTtlSec,
 	reviewDispatchClaimOwner,
 	reviewDispatchClaimTtlSec,
@@ -1146,12 +1149,143 @@ async function scheduleRerunSettleRecheck(
 }
 
 /**
+ * Whether the `no-fix` hand-back (issue #841) met a head merge automation brought
+ * up to date for a still-counting approval (issues #874, #1117) — and, when it
+ * did, settle it here without a Review (issue #1445).
+ *
+ * SWARM already approved that head's code: the approval's diff plus the base,
+ * merged at SWARM's own request. Reviewing it again bought nothing but a fresh,
+ * counted `REVIEW_VERDICT_CAP` slot — no slot exists at an updated head, so the
+ * reservation created one — and two such heads stranded a pull request at the
+ * cap (`#2254`). The approval stands instead, and a later SWARM base merge
+ * supersedes the approval parked here (`../../dispatch/base-push-supersession.ts`)
+ * so the next head is reviewed without spending its slot. A head that was itself
+ * reviewed needs nothing here — its reservation already answers `submitted`.
+ *
+ * The skip saves the slot only while the head stays red. Nothing re-arms the
+ * merge off this approval: if the head's checks later pass, that green is decided
+ * like any updated head's that nothing waits on, so it reserves a new, counted
+ * slot and is reviewed — no worse than before, when that slot was spent here.
+ * A later red on the head is settled by {@link settleSkippedNoFixUpdatedHead}
+ * rather than Respond-to-CI, keyed on the same two facts as this skip, because no
+ * approved slot exists here for the #1128 check to find.
+ *
+ * The PR+SHA claim the hand-back inherited is released, owner-fenced, so the head's
+ * next green `checks` event is not dropped as a duplicate until the lease lapses.
+ * Fails **open**: a read that throws dispatches the Review as before, since a
+ * missed skip costs one slot and a wrong one could strand the pull request.
+ */
+async function skipNoFixReviewOfUpdatedHead(
+	ctx: ScmTriggerContext,
+	prNumber: string,
+	headSha: string,
+): Promise<boolean> {
+	const { project } = ctx;
+	let approval: Awaited<ReturnType<typeof findUpdatedHeadReviewRun>>;
+	try {
+		approval = await findUpdatedHeadReviewRun({
+			projectId: project.id,
+			repository: project.repo,
+			prNumber,
+			headSha,
+		});
+	} catch (err) {
+		logger.warn('review: could not read whether SWARM already approved this updated head', {
+			prNumber,
+			headSha,
+			error: describeError(err),
+		});
+		return false;
+	}
+	if (!approval) return false;
+	logger.info(
+		'review: no-fix hand-back on a head SWARM already approved — not reviewing it again',
+		{
+			prNumber,
+			headSha,
+			approvingRunId: approval.id,
+		},
+	);
+	await releaseReviewDispatchHeldBy(
+		buildReviewDispatchKey(project.repo, prNumber, headSha),
+		REFRESHED_CLAIM_OWNER,
+	);
+	noteSkip(
+		ctx,
+		`Pull request #${prNumber} at head '${headSha}' is a head merge automation brought up to date ` +
+			"for an approval that still stands, and SWARM's CI agent judged its failing checks not to be " +
+			"the pull request's fault, so it was not reviewed again and no further CI fix is made on it. " +
+			'If the checks later pass, that head is reviewed as a new, counted verdict; ' +
+			"SWARM's next base merge supersedes the approval so the head it produces is reviewed.",
+	);
+	return true;
+}
+
+/**
+ * Settle an ordinary (unmarked) red on a head whose `no-fix` hand-back
+ * {@link skipNoFixReviewOfUpdatedHead} skipped (issue #1445): SWARM's CI agent
+ * already declined this head's red (`hasCiNoFixRecovery`) and it is a head merge
+ * automation brought up to date for a still-counting approval
+ * (`findUpdatedHeadReviewRun`) — the two facts that skip keyed on. Respond-to-CI
+ * would only decline again, at the cost of a `MAX_FIX_ATTEMPTS` slot.
+ *
+ * The #1128 adjudicated-approved-head check cannot see this head: it keys on an
+ * approved ledger slot *at* the head, and the skip deliberately wrote none. So
+ * this is its run-keyed twin, durable past any claim TTL, and taken before the
+ * PR+SHA claim — nothing is dispatched, so nothing is consumed. Only with merge
+ * automation on, like every other approved-head policy; a read that throws falls
+ * **open** to the routing below, which the per-PR fix-attempt cap bounds.
+ */
+async function settleSkippedNoFixUpdatedHead(
+	ctx: ScmTriggerContext,
+	prNumber: string,
+	headSha: string,
+	failedChecks: string[],
+): Promise<boolean> {
+	const { project } = ctx;
+	if (project.autoMerge !== true) return false;
+	let approval: Awaited<ReturnType<typeof findUpdatedHeadReviewRun>>;
+	try {
+		if (!(await hasCiNoFixRecovery(project, prNumber, headSha))) return false;
+		approval = await findUpdatedHeadReviewRun({
+			projectId: project.id,
+			repository: project.repo,
+			prNumber,
+			headSha,
+		});
+	} catch (err) {
+		logger.warn('review: could not read whether this updated head was already adjudicated', {
+			prNumber,
+			headSha,
+			error: describeError(err),
+		});
+		return false;
+	}
+	if (!approval) return false;
+	logger.info('review: adjudicated red on an updated head SWARM approved — no CI fix dispatched', {
+		prNumber,
+		headSha,
+		failedChecks,
+		approvingRunId: approval.id,
+	});
+	noteSkip(
+		ctx,
+		`Pull request #${prNumber} at head '${headSha}' is a head merge automation brought up to date ` +
+			"for an approval that still stands, and SWARM's CI agent already judged its failing checks " +
+			"not to be the pull request's fault, so no further CI fix was dispatched. If the checks " +
+			'later pass, that head is reviewed.',
+	);
+	return true;
+}
+
+/**
  * Route a red aggregate (a check failed) — {@link resolveAggregateCheckReview}'s
  * `respond-to-ci` decision, before it becomes one. Each judgement below is taken
  * before the PR+SHA claim, so one that settles the red here consumes nothing: the
  * `no-fix` hand-back's Review (issue #841), the adjudicated approved head's re-run
- * policy (issue #1128), the updated head's one re-run (issue #1433), and the
- * base-branch attribution (issue #873). Only what survives all four goes to
+ * policy (issue #1128), the updated head's one re-run (issue #1433), the
+ * updated head whose `no-fix` hand-back was skipped (issue #1445), and the
+ * base-branch attribution (issue #873). Only what survives all five goes to
  * Respond-to-CI.
  */
 async function resolveRedAggregate(
@@ -1164,6 +1298,8 @@ async function resolveRedAggregate(
 	// The `no-fix` hand-back (issue #841) — see the module header. The red is
 	// SWARM's own CI agent's verdict, not a fresh failure, so route to Review.
 	if (ctx.ciNoFixRecovery === true) {
+		// …unless SWARM already approved this head's code (issue #1445).
+		if (await skipNoFixReviewOfUpdatedHead(ctx, prNumber, headSha)) return { kind: 'none' };
 		logger.info('review: CI agent adjudicated this red — reviewing instead of re-fixing', {
 			prNumber,
 			headSha,
@@ -1187,6 +1323,14 @@ async function resolveRedAggregate(
 	// CI fix. Like the bypass above it settles here, before the PR+SHA claim, so a
 	// requested re-run consumes nothing; a spent or refused one falls through.
 	if (await handleUpdatedHeadRed(ctx, prNumber, headSha, failedChecks)) {
+		return { kind: 'none' };
+	}
+	// The `no-fix` hand-back skipped above, met again by an ordinary red event on
+	// the same head (issue #1445) — a delayed sibling suite, or a re-run that
+	// failed again. The skip wrote no approved slot here, so the #1128 check above
+	// cannot see the adjudication; without this the red would take the claim the
+	// skip released and spend a second CI fix on a head the CI agent declined.
+	if (await settleSkippedNoFixUpdatedHead(ctx, prNumber, headSha, failedChecks)) {
 		return { kind: 'none' };
 	}
 	// Beside the bypass above, and the same shape: a second judgement about

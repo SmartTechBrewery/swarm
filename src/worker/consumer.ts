@@ -83,6 +83,7 @@ import {
 	updateRunJobPayload,
 } from '../db/repositories/runsRepository.js';
 import { countWipSlots, type WipSlotHolder } from '../db/repositories/wipSlotsRepository.js';
+import { supersedeApprovalsParkedAtHead } from '../dispatch/base-push-supersession.js';
 import { scheduleCiNoFixRecovery } from '../dispatch/ci-no-fix-recovery.js';
 import {
 	claimDispatchForJob,
@@ -4566,6 +4567,32 @@ async function handBackWorkerBranchUpdate(
 }
 
 /**
+ * Supersede the approvals merge automation refused at the head a successful
+ * Resolve-conflicts run just moved the pull request off (issue #1445,
+ * `../dispatch/base-push-supersession.ts`), so a red-refused approval stops
+ * spending a review-cap slot once SWARM's own base merge has replaced its head.
+ *
+ * `trigger.headSha` is the head the phase checked out, and a successful
+ * resolution always pushes a merge commit on top of it. A catch-up pass is left
+ * out: it is merge automation's own branch update, settled through
+ * {@link handBackWorkerBranchUpdate}, which supersedes on that path itself.
+ * Here, at the composition root, for the reason {@link scheduleCiRecoveryIfNoFix}
+ * states. Never throws.
+ */
+async function supersedeApprovalsAfterConflictPush(
+	trigger: TriggerResult,
+	project: ProjectConfig,
+): Promise<void> {
+	if (trigger.phase !== 'resolve-conflicts' || trigger.mergeCatchUp) return;
+	await supersedeApprovalsParkedAtHead({
+		project,
+		prNumber: trigger.prNumber,
+		fromHeadSha: trigger.headSha,
+		cause: 'resolve-conflicts',
+	});
+}
+
+/**
  * The eligibility rule itself, split out of {@link requestMergeAutomationIfEligible}
  * so it can be honoured for an approval read back off the review-verdict ledger
  * rather than off a phase result (issue #815) — without inventing a `TriggerResult`
@@ -6963,6 +6990,7 @@ async function processClaimedDispatch(
 		// After `tryCompleteDispatch` too: the merge dispatch this wakes is the one
 		// that asked for the catch-up, and it must not find this run still active.
 		await handBackWorkerBranchUpdate(trigger, project, result);
+		await supersedeApprovalsAfterConflictPush(trigger, project);
 		return {
 			status: 'phase-succeeded',
 			phase: trigger.phase,

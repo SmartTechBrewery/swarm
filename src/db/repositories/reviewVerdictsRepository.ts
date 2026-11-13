@@ -61,7 +61,10 @@
  * refused *only* because the pull request's head had moved since the review —
  * most often because Resolve-conflicts pushed a merge of a fast-moving base —
  * is stamped {@link markReviewVerdictSuperseded} by the merge dispatch
- * (`src/worker/merge-automation.ts`). It stays `submitted`, because the review
+ * (`src/worker/merge-automation.ts`) — and, since issue #1445, so is an
+ * approval merge automation refused (red checks included) once SWARM's own base
+ * merge moves the pull request off the head it was parked at
+ * (`src/dispatch/base-push-supersession.ts`). It stays `submitted`, because the review
  * genuinely happened and the prior-review signal, the force-re-review slot read
  * and the override grant all still need it; but it stops counting toward
  * {@link REVIEW_VERDICT_CAP} and stops consuming an ordinal, exactly as an
@@ -478,7 +481,8 @@ export async function abandonReviewVerdictOwnedBy(
  * Record that this PR/head's submitted approval was invalidated by the pull
  * request's head moving after the review (issue #1079) — written by the merge
  * dispatch (`src/worker/merge-automation.ts`) when its refusal was *only* that
- * the head changed.
+ * the head changed, and by `src/dispatch/base-push-supersession.ts` for an
+ * approval parked at a head SWARM's own base merge moved off (issue #1445).
  *
  * Conditional and therefore idempotent: it only fires on a `submitted` row that
  * is not already stamped, so a merge retry, a reconciler re-import and a

@@ -35,7 +35,10 @@
  *    (issue #284), no matter how often the enqueue is retried;
  *  - one Review per head — the PR+SHA dispatch claim this recovery *keeps* (see
  *    {@link scheduleCiNoFixRecovery}) plus the durable review-verdict ledger
- *    reservation the handler still takes;
+ *    reservation the handler still takes — and none at all for a head merge
+ *    automation brought up to date for a still-counting approval (issue #1445):
+ *    SWARM already approved that code, so the handler releases the claim and
+ *    dispatches nothing rather than spend a fresh review-cap slot on it;
  *  - if that Review requests changes, Respond-to-review pushes a new head → a
  *    fresh `checks` event → still red → Respond-to-CI, which spends one of the
  *    per-PR `MAX_FIX_ATTEMPTS` (`src/triggers/respond-to-ci-attempts.ts`). At the
@@ -154,6 +157,14 @@ export async function hasCiNoFixRecovery(
  * extended lease lapsed — a Redis restart. There the per-PR fix-attempt cap
  * (`src/triggers/respond-to-ci-attempts.ts`) is what bounds a duplicate fix, and
  * the recovery's own deterministic delivery id still keeps the Review single.
+ *
+ * One recovery gives the claim up early: on a head merge automation brought up
+ * to date for a still-counting approval, `pr-review` dispatches no Review and
+ * releases the claim (issue #1445), so the head's next green is not dropped.
+ * The delayed-sibling guarantee then rests on routing rather than the claim: an
+ * unmarked red on that head finds this module's own trace
+ * ({@link hasCiNoFixRecovery}) beside the approving run and settles with no
+ * dispatch (`settleSkippedNoFixUpdatedHead`) — durably, past any lease.
  */
 export async function scheduleCiNoFixRecovery({
 	project,

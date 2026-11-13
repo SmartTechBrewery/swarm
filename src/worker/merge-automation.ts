@@ -82,8 +82,12 @@
  * permanently unreviewed. Decided by one provider-neutral `getPullRequest` read
  * rather than a structured refusal reason, and written on the two head-moved
  * paths — and, with no read, on a conflicting update (issue #1264), whose
- * approval the base invalidated rather than the diff — but never on a red-head
- * refusal, which is a real failure.
+ * approval the base invalidated rather than the diff — but never by a red-head
+ * refusal itself, which is a real failure. That refusal keeps its slot only
+ * until SWARM's own base merge moves the head (issue #1445): a Resolve-conflicts
+ * push or a branch update ({@link advanceOntoUpdatedHead}) supersedes every
+ * approval still parked at the head it moved off
+ * (`../dispatch/base-push-supersession.ts`).
  *
  * **One merge per repository at a time (issue #1114).** Freshness checked per
  * pull request is not enough on its own: two approved pull requests can each read
@@ -170,6 +174,7 @@ import {
 	type AdjudicatedApprovedHeadOutcome,
 	recoverAdjudicatedApprovedHead,
 } from '../dispatch/approved-head-checks-rerun.js';
+import { supersedeApprovalsParkedAtHead } from '../dispatch/base-push-supersession.js';
 import { hasCiNoFixRecovery } from '../dispatch/ci-no-fix-recovery.js';
 import { classifyDispatchClaim } from '../dispatch/claim-liveness.js';
 import {
@@ -216,12 +221,11 @@ import {
 	refreshMergeAutomationClaim,
 	releaseReviewDispatchHeldBy,
 } from '../triggers/review-dispatch-dedup.js';
+import { MERGE_REARM_OUTCOMES, MERGE_RETRY_EXHAUSTED } from './merge-rearm-outcomes.js';
 
-/**
- * Terminal outcome recorded once the bounded retry budget is spent while the
- * pull request itself never became ready.
- */
-export const MERGE_RETRY_EXHAUSTED = 'retry-exhausted' as const;
+// Split into a leaf for `src/dispatch/base-push-supersession.ts` (issue #1445);
+// re-exported so every other importer keeps reading them from here.
+export { MERGE_REARM_OUTCOMES, MERGE_RETRY_EXHAUSTED };
 
 /**
  * Terminal outcome recorded once that *same* bounded budget is spent against a
@@ -377,17 +381,6 @@ export function mergeDispatchDedupKey(reviewRunId: string): string {
 export function mergeRearmDedupKey(reviewRunId: string, headSha: string): string {
 	return `merge-rearm:${reviewRunId}:${headSha}`;
 }
-
-/**
- * The merge outcomes a now-green approved head can clear (issue #1128): the
- * red-head refusal (`not-eligible`, issue #1124) and a budget spent waiting for
- * the approved head's pending checks ({@link MERGE_RETRY_EXHAUSTED}). A
- * `not-eligible` with another cause is re-armed too and refused again, harmlessly,
- * because the merge re-verifies the approval and the head. `policy-blocked`,
- * `unsupported` and {@link MERGE_PROVIDER_ERROR_EXHAUSTED} are left out: a green
- * head changes none of them.
- */
-export const MERGE_REARM_OUTCOMES = ['not-eligible', MERGE_RETRY_EXHAUSTED] as const;
 
 /** The outcome `processJob` returns for a settled merge-automation dispatch. */
 export interface MergeAutomationSettledOutcome {
@@ -1316,6 +1309,16 @@ async function advanceOntoUpdatedHead(
 	const where = source === 'worker' ? ' on a SWARM worker' : '';
 	const advancedMessage = `Brought the head up to date with the base${where} (${job.approvedHeadSha} → ${headSha}); the approval carries forward and the merge waits for this head's own checks.`;
 	await persistMergeOutcome(advanced, 'stale-base', advancedMessage, attempt, job.approvedHeadSha);
+	// Any *other* approval still parked at the head this update moved off — refused
+	// there, red or otherwise — no longer covers the pull request's head, so it stops
+	// spending a review-cap slot (issue #1445). This run's own generation already
+	// points at the new head, so it is never among them.
+	await supersedeApprovalsParkedAtHead({
+		project,
+		prNumber: job.prNumber,
+		fromHeadSha: job.approvedHeadSha,
+		cause: 'update-branch',
+	});
 	await claimUpdatedHeadReviewSlot(project, job, headSha);
 	// `attempt: 0` resets the not-ready budget: the fresh CI is a new wait, not
 	// a continuation of whatever the old head was waiting for.
@@ -2231,7 +2234,9 @@ async function refuseRedHead(
 	// the terminal branch that would: this refusal is a genuinely red head — a
 	// merged tree, or the approved commit itself — not a supersession. The
 	// approval must keep its slot — freeing it would buy re-reviews of a head
-	// that is actually broken.
+	// that is actually broken. It keeps it only until SWARM's own base merge
+	// moves the pull request off this head (issue #1445,
+	// `../dispatch/base-push-supersession.ts`).
 	await settleMergeDispatch(dispatch, job, project, 'merge-not-eligible');
 	return settledOutcome(job, 'not-eligible');
 }
