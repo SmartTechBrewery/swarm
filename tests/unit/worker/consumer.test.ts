@@ -751,6 +751,14 @@ vi.mock('@/dispatch/ci-no-fix-recovery.js', () => ({
 	scheduleCiNoFixRecovery: (input: unknown) => scheduleCiNoFixRecovery(input),
 }));
 
+// The base-push supersession (issue #1445), mocked at its own boundary: these
+// tests assert that a successful conflict resolution asks for it with the head it
+// moved off, not which approvals it stamps (`base-push-supersession.test.ts`).
+const supersedeApprovalsParkedAtHead = vi.fn(async (_input: unknown) => 0);
+vi.mock('@/dispatch/base-push-supersession.js', () => ({
+	supersedeApprovalsParkedAtHead: (input: unknown) => supersedeApprovalsParkedAtHead(input),
+}));
+
 // The federated dispatch gate (issue #339) reads the project's enrolled workers
 // and resolves an item's assignee to a SWARM user. Both are mocked at their
 // module boundary so these tests drive routing without Postgres; the default —
@@ -1230,6 +1238,8 @@ describe('processJob', () => {
 		scheduleCiNoFixRecovery.mockResolvedValue(undefined);
 		adoptWorkerBranchUpdate.mockClear();
 		adoptWorkerBranchUpdate.mockResolvedValue(true);
+		supersedeApprovalsParkedAtHead.mockClear();
+		supersedeApprovalsParkedAtHead.mockResolvedValue(0);
 		getSubmittedReviewSlot.mockClear();
 		getSubmittedReviewSlot.mockResolvedValue(undefined);
 	});
@@ -9301,6 +9311,61 @@ describe('processJob', () => {
 				);
 
 				expect(outcome.status).toBe('phase-succeeded');
+			});
+		});
+
+		describe('superseding approvals parked at the head a resolution moved off (issue #1445)', () => {
+			it('asks for it with the head the resolution checked out', async () => {
+				phaseImpl = async () => ({ agent: agentResult() });
+
+				const outcome = await processJob(
+					createMockScmWebhookJob(),
+					registryReturning(RESOLVE_CONFLICTS_TRIGGER),
+				);
+
+				expect(outcome.status).toBe('phase-succeeded');
+				expect(supersedeApprovalsParkedAtHead).toHaveBeenCalledExactlyOnceWith({
+					project: PROJECT,
+					prNumber: '17',
+					fromHeadSha: 'deadbeef',
+					cause: 'resolve-conflicts',
+				});
+			});
+
+			// Merge automation's own branch update, which supersedes on its own path.
+			it('leaves a catch-up pass to merge automation', async () => {
+				phaseImpl = async () => ({
+					agent: agentResult(),
+					mergeCatchUp: { status: 'updated', headSha: 'worker-merge' },
+				});
+
+				await processJob(
+					createMockScmWebhookJob(),
+					registryReturning({
+						...RESOLVE_CONFLICTS_TRIGGER,
+						mergeCatchUp: { reviewRunId: 'review-run-1', headSha: 'deadbeef' },
+					} as TriggerResult),
+				);
+
+				expect(supersedeApprovalsParkedAtHead).not.toHaveBeenCalled();
+			});
+
+			it('supersedes nothing when the resolution failed', async () => {
+				phaseImpl = async () => {
+					throw new Error('resolve-conflicts agent exited with code 1');
+				};
+
+				await processJob(createMockScmWebhookJob(), registryReturning(RESOLVE_CONFLICTS_TRIGGER));
+
+				expect(supersedeApprovalsParkedAtHead).not.toHaveBeenCalled();
+			});
+
+			it('supersedes nothing for another phase', async () => {
+				phaseImpl = async () => ({ agent: agentResult(), ciOutcome: 'no-fix' });
+
+				await processJob(createMockScmWebhookJob(), registryReturning(RESPOND_TO_CI_TRIGGER));
+
+				expect(supersedeApprovalsParkedAtHead).not.toHaveBeenCalled();
 			});
 		});
 

@@ -87,6 +87,14 @@ vi.mock('@/dispatch/absorbed-child-settle.js', () => ({
 	settleAbsorbedChildren: (input: unknown) => settleAbsorbedChildren(input),
 }));
 
+// The base-push supersession of approvals parked at the head an update moved off
+// (issue #1445). Mocked: this suite asserts that the update asks for it and with
+// which head; which approvals it stamps is its own suite's and the integration's.
+const supersedeApprovalsParkedAtHead = vi.fn(async (_input: unknown) => 0);
+vi.mock('@/dispatch/base-push-supersession.js', () => ({
+	supersedeApprovalsParkedAtHead: (input: unknown) => supersedeApprovalsParkedAtHead(input),
+}));
+
 const createAndPublishDispatch = vi.fn(async (_input: unknown) => ({
 	dispatch: mockDispatchRow(),
 	created: true,
@@ -325,6 +333,7 @@ beforeEach(() => {
 	hasUpdatedHeadChecksRerun.mockReset();
 	hasUpdatedHeadChecksRerun.mockResolvedValue(false);
 	releaseReviewDispatchHeldBy.mockClear();
+	supersedeApprovalsParkedAtHead.mockClear();
 });
 
 /** The stale-base answer the merge capability gives for a head behind its base. */
@@ -1256,6 +1265,39 @@ describe('processMergeAutomationDispatch: a stale approved head', () => {
 		expect(claimReviewDispatch.mock.invocationCallOrder[0]).toBeLessThan(
 			scheduleDispatchRetry.mock.invocationCallOrder[0],
 		);
+	});
+
+	// Issue #1445: an approval refused at the head this update moves off (red, say)
+	// no longer covers the pull request's head, so it stops spending a cap slot.
+	it('supersedes the approvals parked at the previous head, after advancing its own generation', async () => {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning(STALE_BASE),
+			updatePullRequestBranch: updateReturning({
+				status: 'updated',
+				headSha: 'merged-with-base',
+			}),
+		});
+
+		expect(supersedeApprovalsParkedAtHead).toHaveBeenCalledExactlyOnceWith({
+			project,
+			prNumber: '17',
+			fromHeadSha: 'deadbeef',
+			cause: 'update-branch',
+		});
+		// After the generation write, so the advancing run's own row already points
+		// at the new head and can never be among those it stamps.
+		expect(updateReviewMergeOutcome.mock.invocationCallOrder[0]).toBeLessThan(
+			supersedeApprovalsParkedAtHead.mock.invocationCallOrder[0],
+		);
+	});
+
+	it('supersedes nothing when the update could not be made', async () => {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning(STALE_BASE),
+			updatePullRequestBranch: updateReturning({ status: 'conflict', message: 'conflict' }),
+		});
+
+		expect(supersedeApprovalsParkedAtHead).not.toHaveBeenCalled();
 	});
 
 	it('merges the updated head once its own checks are green', async () => {

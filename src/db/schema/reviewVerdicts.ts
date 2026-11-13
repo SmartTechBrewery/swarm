@@ -71,7 +71,10 @@ export const reviewVerdicts = pgTable(
 		/**
 		 * When merge automation found this *submitted* approval's merge refused only
 		 * because the pull request's head had moved since the review (issue #1079) —
-		 * in practice a Resolve-conflicts merge of a fast-moving base. A superseded
+		 * in practice a Resolve-conflicts merge of a fast-moving base — or, since issue
+		 * #1445, when SWARM's own base merge moved the pull request off the head a
+		 * refused approval was parked at (`src/dispatch/base-push-supersession.ts`;
+		 * the refusal itself, red checks included, never stamps). A superseded
 		 * slot frees its ordinal and its `REVIEW_VERDICT_CAP` slot, exactly as an
 		 * `abandoned` one does, and is counted against `REVIEW_SUPERSEDED_CAP`
 		 * instead: the pull request's code was approved, so the churn must not spend

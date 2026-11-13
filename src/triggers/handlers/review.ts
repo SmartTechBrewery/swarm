@@ -275,6 +275,7 @@ import {
 import {
 	createFailedRun,
 	failRunFromStatus,
+	findUpdatedHeadReviewRun,
 	getLatestRunForTask,
 } from '../../db/repositories/runsRepository.js';
 import {
@@ -313,7 +314,9 @@ import {
 	buildReviewDispatchKey,
 	claimReviewDispatch,
 	markReviewDispatchClaimedWithoutChecks,
+	REFRESHED_CLAIM_OWNER,
 	refreshReviewDispatchClaim,
+	releaseReviewDispatchHeldBy,
 	reviewClaimedWithoutChecksTtlSec,
 	reviewDispatchClaimOwner,
 	reviewDispatchClaimTtlSec,
@@ -1146,6 +1149,72 @@ async function scheduleRerunSettleRecheck(
 }
 
 /**
+ * Whether the `no-fix` hand-back (issue #841) met a head merge automation brought
+ * up to date for a still-counting approval (issues #874, #1117) — and, when it
+ * did, settle it here without a Review (issue #1445).
+ *
+ * SWARM already approved that head's code: the approval's diff plus the base,
+ * merged at SWARM's own request. Reviewing it again bought nothing but a fresh,
+ * counted `REVIEW_VERDICT_CAP` slot — no slot exists at an updated head, so the
+ * reservation created one — and two such heads stranded a pull request at the
+ * cap (`#2254`). The approval stands instead: if the head's checks later pass,
+ * that green is decided like any updated head's, and a later SWARM base merge
+ * supersedes the approval parked here (`../../dispatch/base-push-supersession.ts`)
+ * so the next head is reviewed without spending its slot. A head that was itself
+ * reviewed needs nothing here — its reservation already answers `submitted`.
+ *
+ * The PR+SHA claim the hand-back inherited is released, owner-fenced, so the head's
+ * next green `checks` event is not dropped as a duplicate until the lease lapses.
+ * Fails **open**: a read that throws dispatches the Review as before, since a
+ * missed skip costs one slot and a wrong one could strand the pull request.
+ */
+async function skipNoFixReviewOfUpdatedHead(
+	ctx: ScmTriggerContext,
+	prNumber: string,
+	headSha: string,
+): Promise<boolean> {
+	const { project } = ctx;
+	let approval: Awaited<ReturnType<typeof findUpdatedHeadReviewRun>>;
+	try {
+		approval = await findUpdatedHeadReviewRun({
+			projectId: project.id,
+			repository: project.repo,
+			prNumber,
+			headSha,
+		});
+	} catch (err) {
+		logger.warn('review: could not read whether SWARM already approved this updated head', {
+			prNumber,
+			headSha,
+			error: describeError(err),
+		});
+		return false;
+	}
+	if (!approval) return false;
+	logger.info(
+		'review: no-fix hand-back on a head SWARM already approved — not reviewing it again',
+		{
+			prNumber,
+			headSha,
+			approvingRunId: approval.id,
+		},
+	);
+	await releaseReviewDispatchHeldBy(
+		buildReviewDispatchKey(project.repo, prNumber, headSha),
+		REFRESHED_CLAIM_OWNER,
+	);
+	noteSkip(
+		ctx,
+		`Pull request #${prNumber} at head '${headSha}' is a head merge automation brought up to date ` +
+			"for an approval that still stands, and SWARM's CI agent judged its failing checks not to be " +
+			"the pull request's fault, so it was not reviewed again. If the checks later pass, that head " +
+			"is picked up again; SWARM's next base merge supersedes the approval so the head it produces " +
+			'is reviewed.',
+	);
+	return true;
+}
+
+/**
  * Route a red aggregate (a check failed) — {@link resolveAggregateCheckReview}'s
  * `respond-to-ci` decision, before it becomes one. Each judgement below is taken
  * before the PR+SHA claim, so one that settles the red here consumes nothing: the
@@ -1164,6 +1233,8 @@ async function resolveRedAggregate(
 	// The `no-fix` hand-back (issue #841) — see the module header. The red is
 	// SWARM's own CI agent's verdict, not a fresh failure, so route to Review.
 	if (ctx.ciNoFixRecovery === true) {
+		// …unless SWARM already approved this head's code (issue #1445).
+		if (await skipNoFixReviewOfUpdatedHead(ctx, prNumber, headSha)) return { kind: 'none' };
 		logger.info('review: CI agent adjudicated this red — reviewing instead of re-fixing', {
 			prNumber,
 			headSha,

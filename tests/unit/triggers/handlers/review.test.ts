@@ -23,6 +23,7 @@ const {
 	reviewClaimedWithoutChecksTtlSec,
 	takeOverMergeAutomationClaim,
 	releaseReviewDispatch,
+	releaseReviewDispatchHeldBy,
 } = vi.hoisted(() => ({
 	claimReviewDispatch: vi.fn(),
 	refreshReviewDispatchClaim: vi.fn(),
@@ -38,6 +39,8 @@ const {
 	takeOverMergeAutomationClaim: vi.fn(),
 	// What a requested updated-head re-run hands back (issue #1433).
 	releaseReviewDispatch: vi.fn(),
+	// What a skipped no-fix hand-back on an updated head hands back (issue #1445).
+	releaseReviewDispatchHeldBy: vi.fn(),
 }));
 vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	claimReviewDispatch,
@@ -47,6 +50,8 @@ vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 	reviewClaimedWithoutChecksTtlSec,
 	takeOverMergeAutomationClaim,
 	releaseReviewDispatch,
+	releaseReviewDispatchHeldBy,
+	REFRESHED_CLAIM_OWNER: 'pr-review-pending',
 	reviewDispatchClaimOwner: (dispatchId: string) => `pr-review:${dispatchId}`,
 	buildReviewDispatchKey: (repo: string, prNumber: string, headSha: string) =>
 		`${repo}:${prNumber}:${headSha}`,
@@ -287,6 +292,8 @@ beforeEach(() => {
 	claimUpdatedHeadChecksRerun.mockResolvedValue(true);
 	releaseReviewDispatch.mockReset();
 	releaseReviewDispatch.mockResolvedValue(undefined);
+	releaseReviewDispatchHeldBy.mockReset();
+	releaseReviewDispatchHeldBy.mockResolvedValue(undefined);
 	runAsPullRequestOperator.mockReset();
 	runAsPullRequestOperator.mockImplementation(
 		async (_project: unknown, _prNumber: string, fn: (operator: unknown) => Promise<unknown>) =>
@@ -3044,6 +3051,51 @@ describe('review trigger — the no-fix hand-back to Review (issue #841)', () =>
 			}),
 		);
 		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+	});
+
+	// Issue #1445 (`#2254`'s verdict 3): the head is one merge automation brought up
+	// to date for an approval that still counts, so SWARM already approved its code.
+	// Reviewing it again would reserve a fresh, counted slot at a head that has none.
+	describe('on a head merge automation produced for a still-counting approval (issue #1445)', () => {
+		const APPROVAL = { id: 'run-approve', checksRerunHeadSha: null, checksRerunAt: null };
+
+		it('dispatches nothing, reserves no slot, and releases the inherited claim', async () => {
+			findUpdatedHeadReviewRun.mockResolvedValue(APPROVAL);
+			const noteDecline = vi.fn();
+
+			expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true, noteDecline }))).toBeNull();
+
+			expect(findUpdatedHeadReviewRun).toHaveBeenCalledWith({
+				projectId: PROJECT.id,
+				repository: PROJECT.repo,
+				prNumber: '9',
+				headSha: 'cafe',
+			});
+			expect(reserveReviewVerdict).not.toHaveBeenCalled();
+			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+			expect(recoverAdjudicatedApprovedHead).not.toHaveBeenCalled();
+			// Owner-fenced on the hand-over's own token, so a claim another dispatch
+			// took after the lease lapsed is left alone.
+			expect(releaseReviewDispatchHeldBy).toHaveBeenCalledExactlyOnceWith(
+				`${PROJECT.repo}:9:cafe`,
+				'pr-review-pending',
+			);
+			expect(releaseReviewDispatch).not.toHaveBeenCalled();
+			expect(noteDecline).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ kind: 'skipped' }),
+			);
+		});
+
+		it('fails open to the Review when the lookup cannot be read', async () => {
+			findUpdatedHeadReviewRun.mockRejectedValue(new Error('db down'));
+
+			expect(await handler.handle(ctx(checks, { ciNoFixRecovery: true }))).toMatchObject({
+				phase: 'review',
+				headSha: 'cafe',
+				verdictSlotReserved: true,
+			});
+			expect(releaseReviewDispatchHeldBy).not.toHaveBeenCalled();
+		});
 	});
 
 	it('still reserves the durable review-verdict slot, and a capped reservation still skips', async () => {

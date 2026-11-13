@@ -95,6 +95,14 @@ export function buildReviewDispatchKey(repo: string, prNumber: string, headSha: 
 export const MERGE_AUTOMATION_CLAIM_OWNER = 'merge-automation';
 
 /**
+ * The value {@link refreshReviewDispatchClaim} stores — the token of a claim held
+ * across a hand-over (a pending continuation, or a `no-fix` recovery), so the job
+ * that inherits it can release exactly that claim through
+ * {@link releaseReviewDispatchHeldBy} (issue #1445).
+ */
+export const REFRESHED_CLAIM_OWNER = 'pr-review-pending';
+
+/**
  * The value a Review's claim is stored under — its owning dispatch (issue #1105),
  * so a hand-back can prove the claim it is about to release is still its own
  * ({@link releaseReviewDispatchHeldBy}).
@@ -218,7 +226,7 @@ export async function reviewDispatchClaimTtlSec(key: string): Promise<number | u
 export async function refreshReviewDispatchClaim(key: string, ttlSec: number): Promise<void> {
 	const namespacedKey = `${KEY_NS}${key}`;
 	try {
-		await getRedis().set(namespacedKey, 'pr-review-pending', 'EX', ttlSec);
+		await getRedis().set(namespacedKey, REFRESHED_CLAIM_OWNER, 'EX', ttlSec);
 	} catch (err) {
 		logger.warn('review-dispatch dedup: claim refresh failed (TTL will reap)', {
 			reviewDispatchKey: key,

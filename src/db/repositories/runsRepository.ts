@@ -1960,6 +1960,53 @@ export async function findApprovedReviewRunForRearm(
 	return { id: run.id, taskId: run.taskId };
 }
 
+/** A still-counting approval parked at a head, as {@link listParkedApprovalsAtMergeHead} returns it. */
+export interface ParkedApprovalAtMergeHead {
+	id: string;
+	/** The head the run reviewed — the key of its review-verdict ledger slot. */
+	reviewedHeadSha: string;
+}
+
+/**
+ * Every completed, still-counting Review run that approved this pull request and
+ * whose merge generation is parked at `key.headSha` with one of `outcomes` — the
+ * approvals SWARM's own base merge supersedes when it moves the pull request off
+ * that head (issue #1445, `src/dispatch/base-push-supersession.ts`).
+ *
+ * The same filter as {@link findApprovedReviewRunForRearm}, but every match, not
+ * the latest: two approvals can be parked at one head (an approval whose merge
+ * advanced onto an updated head, and the no-fix hand-back's Review of that head).
+ * `reviewedHeadSha` is read off the run's own dispatching event, as
+ * {@link findUpdatedHeadReviewRun} reads it, and falls back to the generation's
+ * head for a run whose payload names none — the ledger slot is keyed on the
+ * reviewed head, never on an advanced one.
+ */
+export async function listParkedApprovalsAtMergeHead(
+	key: ApprovedReviewRunForRearmKey,
+	outcomes: readonly string[],
+): Promise<ParkedApprovalAtMergeHead[]> {
+	if (outcomes.length === 0) return [];
+	const reviewedHeadSha = sql<string>`coalesce(${runs.jobPayload} -> 'event' ->> 'headSha', ${runs.reviewMergeApprovedHeadSha})`;
+	return getDb()
+		.select({ id: runs.id, reviewedHeadSha })
+		.from(runs)
+		.where(
+			and(
+				eq(runs.kind, PIPELINE_RUN_KIND),
+				eq(runs.phase, 'review'),
+				eq(runs.status, 'completed'),
+				eq(runs.reviewVerdict, 'approve'),
+				eq(runs.projectId, key.projectId),
+				eq(runs.repository, key.repository),
+				eq(runs.prNumber, key.prNumber),
+				eq(runs.reviewMergeApprovedHeadSha, key.headSha),
+				isNull(runs.reviewSupersededAt),
+				inArray(runs.reviewMergeOutcome, [...outcomes]),
+			),
+		)
+		.orderBy(asc(runs.completedAt));
+}
+
 /** Which pull-request head {@link findUpdatedHeadReviewRun} asks about. */
 export type UpdatedHeadReviewRunKey = ApprovedReviewRunForRearmKey;
 

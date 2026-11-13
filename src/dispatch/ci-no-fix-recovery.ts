@@ -35,7 +35,10 @@
  *    (issue #284), no matter how often the enqueue is retried;
  *  - one Review per head — the PR+SHA dispatch claim this recovery *keeps* (see
  *    {@link scheduleCiNoFixRecovery}) plus the durable review-verdict ledger
- *    reservation the handler still takes;
+ *    reservation the handler still takes — and none at all for a head merge
+ *    automation brought up to date for a still-counting approval (issue #1445):
+ *    SWARM already approved that code, so the handler releases the claim and
+ *    dispatches nothing rather than spend a fresh review-cap slot on it;
  *  - if that Review requests changes, Respond-to-review pushes a new head → a
  *    fresh `checks` event → still red → Respond-to-CI, which spends one of the
  *    per-PR `MAX_FIX_ATTEMPTS` (`src/triggers/respond-to-ci-attempts.ts`). At the
