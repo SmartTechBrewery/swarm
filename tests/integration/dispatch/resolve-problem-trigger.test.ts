@@ -25,6 +25,7 @@ import {
 	sweepResolveProblem,
 } from '../../../src/dispatch/resolve-problem-trigger.js';
 import { loadWipUsageEntries } from '../../../src/dispatch/wip-usage-loader.js';
+import type { CancellationOrigin } from '../../../src/queue/cancellation.js';
 import type { ResolveProblemJob, SwarmJob } from '../../../src/queue/jobs.js';
 import { closeQueue } from '../../../src/queue/producer.js';
 import { createMockScmWebhookJob } from '../../helpers/factories.js';
@@ -53,6 +54,7 @@ async function settledRun(
 		repository?: string;
 		resolvesRunId?: string;
 		nextRetryAt?: Date;
+		cancellation?: CancellationOrigin;
 	} = {},
 ): Promise<string> {
 	const projectId = options.projectId ?? PROJECT_ID;
@@ -69,6 +71,7 @@ async function settledRun(
 		status: options.status ?? 'failed',
 		error: 'boom',
 		...(options.nextRetryAt ? { nextRetryAt: options.nextRetryAt } : {}),
+		...(options.cancellation ? { cancellation: options.cancellation } : {}),
 	});
 	const completedAt = new Date(Date.now() - (options.minutesAgo ?? 15) * MINUTE);
 	await getDb()
@@ -243,6 +246,32 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			expect(await candidateIds()).toEqual([]);
 		});
 
+		it('leaves out a run an operator cancelled — dashboard, API or board-backlog, however old it is', async () => {
+			const requestedAt = new Date().toISOString();
+			let task = 0;
+			for (const source of ['dashboard', 'api', 'board-backlog'] as const) {
+				for (const minutesAgo of [15, 23 * 60]) {
+					task += 1;
+					await settledRun({
+						minutesAgo,
+						taskId: String(task),
+						cancellation: { source, requestedAt },
+					});
+				}
+			}
+			expect(await candidateIds()).toEqual([]);
+		});
+
+		it('still returns a genuinely failed run beside a cancelled one', async () => {
+			await settledRun({
+				minutesAgo: 30,
+				taskId: '1',
+				cancellation: { source: 'dashboard', requestedAt: new Date().toISOString() },
+			});
+			const failed = await settledRun({ minutesAgo: 30, taskId: '2' });
+			expect(await candidateIds()).toEqual([failed]);
+		});
+
 		it('reads only the projects it is scoped to', async () => {
 			await seedProject({ id: OTHER_PROJECT_ID, repo: OTHER_REPO });
 			await settledRun({ projectId: OTHER_PROJECT_ID, repository: OTHER_REPO });
@@ -285,6 +314,15 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 				state: 'pending',
 			});
 			expect(rows[0].jobPayload).toMatchObject({ type: 'resolve-problem', failedRunId: id });
+		});
+
+		it('dispatches nothing for a failed run an operator cancelled (issue #1453)', async () => {
+			await settledRun({
+				cancellation: { source: 'board-backlog', requestedAt: new Date().toISOString() },
+			});
+
+			expect(await dispatchResolveProblemForFailedRuns()).toEqual([]);
+			expect(await resolveProblemDispatches()).toHaveLength(0);
 		});
 
 		it('creates one dispatch from two concurrent passes, and none from a later one', async () => {

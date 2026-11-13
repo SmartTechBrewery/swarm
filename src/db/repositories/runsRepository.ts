@@ -3053,7 +3053,10 @@ export async function listResolveProblemAttemptsForHolders(input: {
  *  - no Resolve problem attempt exists for it — a run linked by `resolves_run_id`,
  *    or a dispatch already holding its `resolve-problem:<runId>` dedup key (one
  *    whose claim declined to run left no run behind, and re-offering it every pass
- *    would only meet the dedup conflict again).
+ *    would only meet the dedup conflict again);
+ *  - nobody cancelled it: no recorded cancellation origin (`runs.cancellation`,
+ *    issue #1453). Dashboard/API Terminate and the board move to Backlog are an
+ *    operator's own stop, and restarting the run is their call — at any age.
  *
  * `projectIds` is the scope; an empty one is answered without a query.
  */
@@ -3127,6 +3130,7 @@ export async function listUnrecoveredFailedRuns(options: {
 				lte(runs.completedAt, settledBefore),
 				or(isNull(runs.nextRetryAt), lte(runs.nextRetryAt, sql`now()`)),
 				isNull(runs.resetStartedAt),
+				isNull(runs.cancellation),
 				notExists(activeDispatchForRun),
 				notExists(activeDispatchForTask),
 				notExists(newerRunForTask),

@@ -265,6 +265,7 @@ describe('dispatchResolveProblemForWaitingTickets (issue #1425)', () => {
 			repository: ON.repo,
 			resetStartedAt: null,
 			nextRetryAt: null,
+			cancellation: null,
 			...overrides,
 		} as RunRow;
 	}
@@ -329,6 +330,31 @@ describe('dispatchResolveProblemForWaitingTickets (issue #1425)', () => {
 		// Only the never-ran ticket has no anchor to be busy; its slot was already attempted.
 		expect(scheduleTicket).toHaveBeenCalledTimes(1);
 		expect(created).toEqual([]);
+	});
+
+	it('skips a holder whose run an operator cancelled (issue #1453)', async () => {
+		const scheduleRun = vi.fn(async () => ({ created: true }));
+		const scheduleTicket = vi.fn(async (_t: ResolveProblemTicketCandidate) => ({ created: true }));
+		const requestedAt = '2026-11-10T11:00:00.000Z';
+
+		const created = await dispatchResolveProblemForWaitingTickets({
+			listProjects: async () => [RECORD_ON],
+			loadWaiting: async () => ENTRIES,
+			readRun: async (id) =>
+				run(id, {
+					cancellation:
+						id === 'run-failed'
+							? { source: 'dashboard', requestedAt }
+							: { source: 'board-backlog', requestedAt },
+				}),
+			scheduleRun,
+			scheduleTicket,
+			now: () => NOW,
+		});
+
+		expect(scheduleRun).not.toHaveBeenCalled();
+		expect(scheduleTicket.mock.calls.map(([t]) => t.taskId)).toEqual(['3']);
+		expect(created).toEqual([`on/${ON.repo}#3`]);
 	});
 
 	it('logs a failed dispatch and carries on, and never throws when a read fails', async () => {

@@ -1802,6 +1802,10 @@ attempt for a run when all of these hold:
 - nothing else picked up its task or pull request: no other dispatch is waiting
   or running for them, and no newer run was started on them. Resolve problem's
   own dispatches and runs do not count;
+- nobody cancelled the run. A run terminated from the dashboard or the API, or
+  stopped because its card was moved to Backlog, records that origin
+  (`runs.cancellation`) and is never attempted, at any age, by either leg
+  (issue #1453). Restarting it is that person's call;
 - the run is not itself a Resolve problem run, and it has no attempt yet.
 
 So every failed run gets at most one attempt, and a failed attempt never starts
@@ -1821,7 +1825,10 @@ Each reason is in scope or excluded (`src/dispatch/resolve-problem-scope.ts`):
   it gets the same attempt as a failed run above. A failed run older than the
   24-hour window is picked up here.
 - **Terminated** — excluded. A user terminated the run. Restarting it (moving the
-  card out of its column and back) is that person's call.
+  card out of its column and back) is that person's call. A run an operator
+  cancelled in a phase the panel reports as **Failed** (Review, Respond to review,
+  Respond to CI, Resolve conflicts) is skipped too, because its cancellation is
+  recorded (issue #1453).
 - **Review cap reached** — excluded. The review cap is a safety stop SWARM placed
   on purpose. Granting another review, or merging, is a person's decision.
 - **Plan awaiting greenlight** — excluded. The plan waits for the operator's
@@ -1834,11 +1841,13 @@ last moved. It gets **one attempt per stuck situation**: the situation is its
 latest run, or — for a ticket that never ran — the slot it holds. Only a newer run,
 or the slot being taken again, makes a new situation. Nothing is attempted while a
 dispatch is queued for the ticket, a newer run moved it, or its run is being reset
-or will retry by itself. A Resolve problem run never counts as the ticket moving,
+or will retry by itself — and never while its run is one an operator cancelled. A Resolve problem run never counts as the ticket moving,
 so an attempt neither qualifies itself nor hides the ticket from the panel. When
 the attempt is claimed, the ticket is checked again: it must still hold the same
-slot, still be Waiting on you for a reason in scope, and have the same latest run.
-Otherwise the attempt is skipped. If no SWARM tool can move the ticket, the agent
+slot, still be Waiting on you for a reason in scope, and have the same latest run,
+and that run must not have been cancelled by an operator. Otherwise the attempt is
+skipped. A run attempt is re-checked the same way: it is skipped once the run is no
+longer `failed` or an operator cancelled it. If no SWARM tool can move the ticket, the agent
 reports it `unresolved` and says what the person should do.
 
 **Seeing the attempts (issue #1428).** A Waiting on you ticket in the **Tickets in
