@@ -2450,6 +2450,7 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 					<RunStatusBadge
 						status={run.status as RunStatus}
 						timedOut={run.timedOut}
+						cancelled={Boolean(run.cancellation)}
 						phase={run.phase}
 						reviewVerdict={run.reviewVerdict}
 						reviewAutomationOutcome={run.reviewAutomationOutcome}
@@ -2727,6 +2728,7 @@ function RunOverview({ run, project }: RunOverviewProps) {
 							<RunStatusBadge
 								status={run.status as RunStatus}
 								timedOut={run.timedOut}
+								cancelled={Boolean(run.cancellation)}
 								phase={run.phase}
 								reviewVerdict={run.reviewVerdict}
 								reviewAutomationOutcome={run.reviewAutomationOutcome}

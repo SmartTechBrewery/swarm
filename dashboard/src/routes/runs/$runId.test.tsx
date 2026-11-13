@@ -1454,6 +1454,41 @@ describe('ReviewMergeCallout (issue #278)', () => {
 	});
 });
 
+// Issue #1453 — a run an operator stopped on purpose reads "Canceled", not "Failed",
+// while the recorded origin line beneath it is unchanged.
+describe('RunDetailHeader for a cancelled run (issue #1453)', () => {
+	function renderHeader(run: RunRow) {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		return render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={run} />
+			</QueryClientProvider>,
+		);
+	}
+
+	it('shows "Canceled" and keeps the board-backlog origin line', () => {
+		renderHeader(
+			makeReviewRun({
+				status: 'failed',
+				phase: 'implementation',
+				error: 'Terminated',
+				cancellation: { source: 'board-backlog', requestedAt: '2026-07-17T10:04:00.000Z' },
+			}),
+		);
+
+		expect(screen.getByText('Canceled')).toBeDefined();
+		expect(screen.queryByText('Failed')).toBeNull();
+		expect(screen.getByText(/Cancelled because its board card was moved to Backlog/)).toBeDefined();
+	});
+
+	it('keeps "Failed" for a failed run with no recorded origin', () => {
+		renderHeader(makeReviewRun({ status: 'failed', phase: 'implementation', error: 'boom' }));
+
+		expect(screen.getByText('Failed')).toBeDefined();
+		expect(screen.queryByText('Canceled')).toBeNull();
+	});
+});
+
 describe('RunAttributionFields (issue #446)', () => {
 	it('names the worker and its owning SWARM user', () => {
 		render(

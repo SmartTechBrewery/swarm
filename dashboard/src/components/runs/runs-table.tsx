@@ -92,6 +92,7 @@ export function RunsTable({
 										run.status as 'running' | 'completed' | 'failed' | 'deferred' | 'checkpointed'
 									}
 									timedOut={run.timedOut}
+									cancelled={Boolean(run.cancellation)}
 									phase={run.phase}
 									reviewVerdict={run.reviewVerdict}
 									reviewAutomationOutcome={run.reviewAutomationOutcome}
@@ -234,6 +235,7 @@ export function RunsTable({
 											run.status as 'running' | 'completed' | 'failed' | 'deferred' | 'checkpointed'
 										}
 										timedOut={run.timedOut}
+										cancelled={Boolean(run.cancellation)}
 										phase={run.phase}
 										reviewVerdict={run.reviewVerdict}
 										reviewAutomationOutcome={run.reviewAutomationOutcome}

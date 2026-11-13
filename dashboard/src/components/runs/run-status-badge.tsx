@@ -19,6 +19,13 @@ interface RunStatusBadgeProps extends ComponentProps<'span'> {
 	 */
 	timedOut?: boolean;
 	/**
+	 * The run has a recorded cancellation origin (`run.cancellation`): an operator
+	 * stopped it on purpose — dashboard/API Terminate, or its board card moved to
+	 * Backlog (issue #1453) — so it reads **Canceled**, not **Failed**. Only takes
+	 * effect with `status === 'failed'`, the status a cancellation settles as.
+	 */
+	cancelled?: boolean;
+	/**
 	 * The run's pipeline phase. A completed `review` run with a {@link reviewVerdict}
 	 * shows that verdict instead of the generic "Completed" badge (issue #218);
 	 * any other phase, or a non-completed status, falls through to the lifecycle
@@ -121,6 +128,20 @@ const TIMED_OUT_CONFIG: BadgeConfig = {
 	text: 'Timed out',
 	classes: 'bg-orange-500/10 text-orange-400 border-orange-500/20',
 	dotClass: 'bg-orange-400',
+};
+
+/**
+ * A `failed` run an operator stopped on purpose (issue #1453) — it carries a
+ * recorded cancellation origin. Orange is shared with the terminal
+ * {@link TIMED_OUT_CONFIG} on purpose: both are terminal stops that are not a
+ * genuine failure, which keeps red "Failed" for runs that actually broke. As
+ * with `checkpointed` vs. "Running", the label rather than the hue says which.
+ */
+const CANCELED_CONFIG: BadgeConfig = {
+	text: 'Canceled',
+	classes: 'bg-orange-500/10 text-orange-400 border-orange-500/20',
+	dotClass: 'bg-orange-400',
+	title: 'Stopped on purpose by an operator — not a failure.',
 };
 
 /**
@@ -268,7 +289,7 @@ type BadgeInput = Pick<
 	| 'reviewMergeOutcome'
 	| 'reviewCapSpent'
 	| 'reviewCapStop'
-> & { timedOut: boolean };
+> & { timedOut: boolean; cancelled: boolean };
 
 /**
  * A completed Review run's verdict badge. Both review-cap stops read "Manual
@@ -292,7 +313,9 @@ function reviewVerdictConfig(
 }
 
 function resolveBadgeConfig(input: BadgeInput): BadgeConfig {
-	const { status, timedOut, phase, reviewVerdict } = input;
+	const { status, timedOut, cancelled, phase, reviewVerdict } = input;
+	// The operator's stop is why the run ended, so it outranks a timeout flag.
+	if (status === 'failed' && cancelled) return CANCELED_CONFIG;
 	if (status === 'failed' && timedOut) return TIMED_OUT_CONFIG;
 	// A resumable wall-clock kill settles deferred/checkpointed, so the timeout
 	// has to be legible on those rows too — as their own hue, re-labelled.
@@ -317,6 +340,7 @@ function resolveBadgeConfig(input: BadgeInput): BadgeConfig {
 export function RunStatusBadge({
 	status,
 	timedOut = false,
+	cancelled = false,
 	phase,
 	reviewVerdict,
 	reviewAutomationOutcome,
@@ -330,6 +354,7 @@ export function RunStatusBadge({
 	const config = resolveBadgeConfig({
 		status,
 		timedOut,
+		cancelled,
 		phase,
 		reviewVerdict,
 		reviewAutomationOutcome,

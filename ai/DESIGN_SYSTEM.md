@@ -26,7 +26,8 @@ Stack it assumes: React + TypeScript + Vite + **Tailwind CSS v4** (CSS-first con
 | Accent (primary action) | `violet-600` / `violet-500` | | Primary buttons, active tab underline, focus rings — **theme-invariant**, see below |
 | Success | `emerald-500`/`emerald-400` | | Connected/verified status |
 | Warning | `amber-500`/`amber-200`/`amber-900` | | Loop-prevention and similar caution banners |
-| Danger | `red-400`/`red-500`/`red-900` | | Validation errors, destructive-action affordances |
+| Danger | `red-400`/`red-500`/`red-900` | | Validation errors, destructive-action affordances; the run status badge's **Failed**, reserved for a genuine failure |
+| Stopped, not failed | `orange-500`/`orange-400` | | A run that stopped terminally without a genuine failure — **Timed out** (wall-clock kill) or **Canceled** (an operator stopped it: Terminate, or its card moved to Backlog, issue #1453). The badge label, not the hue, says which (`dashboard/src/components/runs/run-status-badge.tsx`) |
 
 **Fix required, don't copy verbatim**: `zinc-850` and `violet-650` are not real Tailwind shades (the prototype uses `zinc-850` ~10 times and the primary-button glow recipe below uses `violet-650`, but it ships zero-config Tailwind v4, so those classes are silently dead). Define both for real in `dashboard/src/index.css` via Tailwind v4's `@theme`, alongside the semantic `canvas`/`panel` tokens (promoted from the literal `bg-[#0A0A0B]`/`bg-[#0F0F11]` the prototype hardcoded, so they can be overridden per-theme instead of staying frozen dark forever):
 
