@@ -9,7 +9,10 @@ import {
 	isLastPermittedVerdict,
 	isReviewAllowanceSpent,
 	type PullRequestReviewSlot,
+	REVIEW_SUPERSEDED_CAP,
 	REVIEW_VERDICT_CAP,
+	reviewCapBoundAfterSupersession,
+	reviewCapBoundReached,
 } from '@/db/repositories/reviewVerdictsRepository.js';
 
 /**
@@ -207,5 +210,52 @@ describe('hasReviewInFlightAbove', () => {
 
 	it('answers false for a run that was never ledgered', () => {
 		expect(hasReviewInFlightAbove(grantedFollowUpSlots(), null)).toBe(false);
+	});
+});
+
+/**
+ * Issue #1446: the Resolve-conflicts gate asks whether SWARM's own base push would
+ * reopen review — i.e. which bound is still reached once the approvals parked at
+ * the current head are stamped superseded, as `base-push-supersession.ts` does.
+ */
+describe('reviewCapBoundAfterSupersession', () => {
+	it('answers the bound unchanged when nothing is stamped', () => {
+		expect(reviewCapBoundAfterSupersession(spentSlots(), new Set())).toBe('verdict-cap');
+		expect(reviewCapBoundAfterSupersession(spentSlots().slice(1), new Set())).toBeNull();
+	});
+
+	it('frees the verdict cap when a counted approval is stamped', () => {
+		expect(reviewCapBoundAfterSupersession(spentSlots(), new Set(['head-2']))).toBeNull();
+	});
+
+	it('still reports the verdict cap when the stamped head matches no slot', () => {
+		expect(reviewCapBoundAfterSupersession(spentSlots(), new Set(['elsewhere']))).toBe(
+			'verdict-cap',
+		);
+	});
+
+	// Only a submitted slot is something the writer's stamp reaches.
+	it('never stamps a pending slot', () => {
+		const slots = [
+			...spentSlots().slice(0, REVIEW_VERDICT_CAP - 1),
+			slot({ ordinal: REVIEW_VERDICT_CAP, state: 'pending', headSha: 'head-2' }),
+		];
+		const after = reviewCapBoundAfterSupersession(slots, new Set(['head-2']));
+		expect(after).toBe(reviewCapBoundReached(slots));
+	});
+
+	it('reports the superseded bound the stamp itself would reach', () => {
+		const superseded = Array.from({ length: REVIEW_SUPERSEDED_CAP - 1 }, (_, i) =>
+			slot({ ordinal: i + 1, headSha: `old-${i}`, superseded: true }),
+		);
+		const slots = [...superseded, slot({ ordinal: 1, headSha: 'parked' })];
+		expect(reviewCapBoundReached(slots)).toBeNull();
+		expect(reviewCapBoundAfterSupersession(slots, new Set(['parked']))).toBe('superseded-bound');
+	});
+
+	it('does not mutate the slots it is given', () => {
+		const slots = spentSlots();
+		reviewCapBoundAfterSupersession(slots, new Set(['head-0']));
+		expect(slots.every((s) => !s.superseded)).toBe(true);
 	});
 });

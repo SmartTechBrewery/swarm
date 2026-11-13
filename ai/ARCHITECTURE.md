@@ -1329,6 +1329,30 @@ time. The skip saves the slot only while the head stays red: nothing re-arms the
 merge off the parked approval, so if that head later goes green it reserves a new,
 counted slot and is reviewed — the same slot the hand-back used to spend.
 
+**Resolve-conflicts holds a pull request a review cap has stopped for good
+(issue #1446).** A capped pull request that conflicts is resolved, reviewed by
+nobody, and conflicts again at the next base merge — `#2245` had seven such runs
+overnight. The per-PR path (`checkCandidate`, after ownership and mergeability,
+before the head/base claim) now notes a skip and logs the bound instead of
+dispatching when the allowance is spent with no outstanding Force re-review
+grant (`isReviewAllowanceSpent`), no review is in flight (a `pending` slot whose
+dispatch is live), the last verdict is not a still-counted approval of the
+current head, and a bound would *still* be reached after the push's own #1445
+stamp — `reviewCapBoundAfterSupersession` over the approvals
+`listParkedApprovalsAtMergeHead` finds at the current head, the same arithmetic
+the reservation uses. The last clause keeps the `#2254` shape dispatched: its
+push is exactly what reopens review. The approval clause keeps an approved pull
+request whose approval nothing parked (`autoMerge` off, a `policy-blocked`
+merge, or a Force re-review that approved past the cap) dispatched: Force
+re-review refuses an approval whose head has not moved (`head-unchanged`), so
+the resolution's push is what makes it actionable, and holding it would strand
+the pull request. A read error fails open and dispatches as before. A held
+pull request is released by Force re-review on its last Review run — the grant
+makes the allowance unspent — but Force re-review schedules no conflict check,
+so the skip names Recheck mergeability (`pr_recheck_mergeability`) to run one
+rather than waiting for the next base merge. The fan-out (it only schedules)
+and the catch-up path (asked for a live approval) are not gated.
+
 A superseded slot stays `submitted` — the prior-review signal, the Force
 re-review slot read and the override grant all still need it — but frees both its
 ordinal and its `REVIEW_VERDICT_CAP` slot, exactly as an `abandoned` one does,
