@@ -53,7 +53,10 @@ export function registerPullRequestTools(server: McpServer, context: ToolContext
 				'review verdicts it has spent against the cap (`verdictCount` of `verdictCap`, ' +
 				'`supersededCount` of `supersededCap`), whether a cap is reached (`capReached`, ' +
 				'`capBound`), and whether an operator Force re-review grant is still unspent ' +
-				'(`overrideOutstanding`). Does not query the source-control provider — `pr_live_state` does.',
+				'(`overrideOutstanding`). When a review cap has stopped the pull request and nothing ' +
+				'but an operator can move it (`waitingOnOperator`), `mergeOutcomeMessage` names that ' +
+				'stop and its bound instead of the last merge refusal, which stays readable verbatim ' +
+				'as `lastMergeRefusalMessage`. Does not query the source-control provider — `pr_live_state` does.',
 			inputSchema: prStatusInput,
 			annotations: { readOnlyHint: true, openWorldHint: false },
 		},

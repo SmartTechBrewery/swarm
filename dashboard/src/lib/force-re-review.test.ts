@@ -11,6 +11,7 @@ import {
 	isCapSpentApproval,
 	isForcedReviewPending,
 	isManualActionRequired,
+	reviewCapStopLine,
 	showsCapSpentApprovalCallout,
 } from './force-re-review.js';
 
@@ -380,5 +381,38 @@ describe('describeForceReReviewResult', () => {
 	it('omits the head clause when the server reported none', () => {
 		const lines = describeForceReReviewResult(reviewReport({ reviewHeadSha: undefined }));
 		expect(lines[1]).toBe('Review: scheduled for PR #508 as dispatch dispatch-9.');
+	});
+});
+
+describe('reviewCapStopLine (issue #1447)', () => {
+	it('names the verdict-cap stop as waiting on the operator', () => {
+		expect(reviewCapStopLine({ ...CAP_SPENT_APPROVAL, reviewCapStop: 'verdict-cap' })).toBe(
+			'Stopped by the review cap (verdict-cap: every counted review verdict is spent) — waiting on the operator (Force re-review).',
+		);
+	});
+
+	it('words the superseded-bound stop as its own', () => {
+		expect(reviewCapStopLine({ ...CAP_SPENT_APPROVAL, reviewCapStop: 'superseded-bound' })).toBe(
+			'Stopped by the review cap (superseded-bound: the head moved out from under too many approvals) — waiting on the operator (Force re-review).',
+		);
+	});
+
+	it('does not ask the operator to act once a forced review is scheduled', () => {
+		const line = reviewCapStopLine({ ...FORCED_REVIEW_PENDING, reviewCapStop: 'verdict-cap' });
+		expect(line).toMatch(/^Stopped by the review cap/);
+		expect(line).toMatch(/forced a re-review, which is scheduled/);
+		expect(line).not.toMatch(/waiting on the operator/);
+	});
+
+	it('is null for an uncapped run and for a run that merged', () => {
+		expect(reviewCapStopLine({ ...CAP_SPENT_APPROVAL, reviewCapStop: null })).toBeNull();
+		expect(reviewCapStopLine({ ...CAP_SPENT_APPROVAL })).toBeNull();
+		expect(
+			reviewCapStopLine({
+				...CAP_SPENT_APPROVAL,
+				reviewMergeOutcome: 'merged',
+				reviewCapStop: 'verdict-cap',
+			}),
+		).toBeNull();
 	});
 });

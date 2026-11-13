@@ -32,6 +32,7 @@ import {
 	forceReReviewConfirmMessage,
 	forceReviewOfSupersededHeadConfirmMessage,
 	isForcedReviewPending,
+	reviewCapStopLine,
 	showsCapSpentApprovalCallout,
 } from '@/lib/force-re-review.js';
 import {
@@ -2000,6 +2001,7 @@ interface ReviewMergeCalloutProps {
  */
 export function ReviewMergeCallout({ run }: ReviewMergeCalloutProps) {
 	if (run.phase !== 'review' || !run.reviewMergeOutcome) return null;
+	const capStopLine = reviewCapStopLine(run);
 
 	const prLink = run.repository && run.prNumber && (
 		<a
@@ -2012,6 +2014,29 @@ export function ReviewMergeCallout({ run }: ReviewMergeCalloutProps) {
 			<ExternalLink className="h-3 w-3" />
 		</a>
 	);
+
+	// Issue #1447: a review cap stopped this pull request, so the stored message is
+	// the last refusal, not what happens next — lead with the stop and keep the
+	// refusal beneath it as history, never under a "retrying" heading.
+	if (capStopLine) {
+		return (
+			<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex items-start gap-3">
+				<AlertTriangle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />
+				<div>
+					<h3 className="text-xs font-semibold text-red-200">{capStopLine}</h3>
+					{run.reviewMergeMessage && (
+						<div className="mt-1">
+							<p className="text-xs text-red-300/70">Last merge refusal</p>
+							<p className="text-xs text-red-400/80 font-mono whitespace-pre-wrap">
+								{run.reviewMergeMessage}
+							</p>
+						</div>
+					)}
+					{prLink && <div className="text-red-300 hover:text-red-200">{prLink}</div>}
+				</div>
+			</div>
+		);
+	}
 
 	if (run.reviewMergeOutcome === 'merged') {
 		return (
