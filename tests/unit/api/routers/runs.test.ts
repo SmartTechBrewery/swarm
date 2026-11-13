@@ -3161,6 +3161,8 @@ describe('runsRouter', () => {
 				lastReviewedHeadSha: 'head-2',
 				mergeOutcome: 'retry-exhausted',
 				mergeOutcomeMessage: 'checks still pending',
+				lastMergeRefusalMessage: 'checks still pending',
+				waitingOnOperator: false,
 				verdictCount: 2,
 				verdictCap: REVIEW_VERDICT_CAP,
 				supersededCount: 0,
@@ -3206,6 +3208,113 @@ describe('runsRouter', () => {
 				capReached: true,
 				capBound: 'verdict-cap',
 				overrideOutstanding: true,
+			});
+		});
+
+		describe('a pull request the review cap stopped (issue #1447)', () => {
+			const REFUSAL =
+				'SWARM re-ran the failing checks moments ago; it merges this head once they pass';
+
+			beforeEach(() => {
+				vi.mocked(getLatestCompletedReviewRunForPullRequest).mockResolvedValue(
+					makeRun({
+						id: 'review-3',
+						phase: 'review',
+						prNumber: '262',
+						reviewVerdict: 'approve',
+						reviewMergeOutcome: 'not-eligible',
+						reviewMergeMessage: REFUSAL,
+					}),
+				);
+			});
+
+			it('names the verdict-cap stop in place of the last refusal, and keeps the refusal', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(cappedSlots());
+
+				await expect(caller.prStatus(PR)).resolves.toMatchObject({
+					mergeOutcome: 'not-eligible',
+					mergeOutcomeMessage: `Stopped by the review cap (verdict-cap: ${REVIEW_VERDICT_CAP}/${REVIEW_VERDICT_CAP} counted verdicts) — waiting on the operator (Force re-review).`,
+					lastMergeRefusalMessage: REFUSAL,
+					waitingOnOperator: true,
+				});
+			});
+
+			it('words the superseded-bound stop as its own', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(
+					Array.from({ length: REVIEW_SUPERSEDED_CAP }, (_, i) =>
+						slot({ ordinal: 1, headSha: `head-${i + 1}`, superseded: true }),
+					),
+				);
+
+				await expect(caller.prStatus(PR)).resolves.toMatchObject({
+					capBound: 'superseded-bound',
+					mergeOutcomeMessage: `Stopped by the review cap (superseded-bound: ${REVIEW_SUPERSEDED_CAP}/${REVIEW_SUPERSEDED_CAP} approvals superseded by a head change) — waiting on the operator (Force re-review).`,
+					lastMergeRefusalMessage: REFUSAL,
+					waitingOnOperator: true,
+				});
+			});
+
+			it('keeps the stored message while an operator grant is outstanding', async () => {
+				const slots = cappedSlots();
+				slots[slots.length - 1] = {
+					...slots[slots.length - 1],
+					capOverrideGrantedAt: new Date('2026-11-06T09:00:00Z'),
+				};
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(slots);
+
+				await expect(caller.prStatus(PR)).resolves.toMatchObject({
+					capReached: true,
+					mergeOutcomeMessage: REFUSAL,
+					lastMergeRefusalMessage: REFUSAL,
+					waitingOnOperator: false,
+				});
+			});
+
+			it('keeps the stored message while a Review is in flight above the last verdict', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue([
+					...cappedSlots(),
+					slot({
+						ordinal: REVIEW_VERDICT_CAP + 1,
+						state: 'pending',
+						headSha: 'head-next',
+						dispatchActive: true,
+					}),
+				]);
+
+				await expect(caller.prStatus(PR)).resolves.toMatchObject({
+					capReached: true,
+					mergeOutcomeMessage: REFUSAL,
+					waitingOnOperator: false,
+				});
+			});
+
+			it('still reports the stop when the pending slot above is a dead relic', async () => {
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue([
+					...cappedSlots(),
+					slot({ ordinal: REVIEW_VERDICT_CAP + 1, state: 'pending', dispatchActive: false }),
+				]);
+
+				await expect(caller.prStatus(PR)).resolves.toMatchObject({ waitingOnOperator: true });
+			});
+
+			it('does not report a pull request its last Review merged as waiting', async () => {
+				vi.mocked(getLatestCompletedReviewRunForPullRequest).mockResolvedValue(
+					makeRun({
+						id: 'review-3',
+						phase: 'review',
+						prNumber: '262',
+						reviewVerdict: 'approve',
+						reviewMergeOutcome: 'merged',
+						reviewMergeMessage: 'Pull Request successfully merged',
+					}),
+				);
+				vi.mocked(listActiveReviewSlotsForPullRequest).mockResolvedValue(cappedSlots());
+
+				await expect(caller.prStatus(PR)).resolves.toMatchObject({
+					capReached: true,
+					mergeOutcomeMessage: 'Pull Request successfully merged',
+					waitingOnOperator: false,
+				});
 			});
 		});
 
