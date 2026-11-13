@@ -58,8 +58,10 @@ sign in like anyone else.
 
 ### Agent access tokens
 
-An agent access token belongs to the administrator who issued it and acts as
-them, with exactly their access. It differs from a login session in three ways:
+An agent access token belongs to the user who issued it and acts as them, with
+exactly their access: their installation role and their project roles, the same
+as their `swarm login` session. It reaches nothing that session could not. It
+differs from a login session in three ways:
 
 - **It has a name**, so you can tell your tokens apart, and you can list and
   revoke each one on its own.
@@ -77,12 +79,17 @@ most once a minute. Revoking a token takes effect on the next request. Expired
 tokens are deleted lazily, so an expired one can stay on the list for a while,
 marked **Expired**.
 
-Only installation administrators can issue, list or revoke tokens. Nobody else
-sees the MCP tab, so anyone else connects with their [`swarm login`
-session](#using-the-swarm-login-session-instead).
+Every signed-in user can issue, list and revoke their own tokens, and sees the
+MCP tab, including a user with no project membership yet. A token never widens
+what you may do: on `/operator/mcp` it is shown and may call exactly the tools
+[your highest role](#who-may-use-each-tool) reaches, and a project you are not a
+member of reads as `NOT_FOUND`. Only an installation administrator's token
+reaches the installation-wide views and the tools kept for installation
+administrators. You can still connect with your [`swarm login`
+session](#using-the-swarm-login-session-instead) instead.
 
-An administrator can also issue a token limited to some projects and to a fixed
-set of tools, for an autonomous agent: see [Scoped agent
+You can also issue a token limited to some projects and to a fixed set of tools,
+for an autonomous agent: see [Scoped agent
 credentials](#scoped-agent-credentials).
 
 ### Scoped agent credentials
@@ -93,7 +100,7 @@ projects, such as the *Resolve problem* phase, without holding your full
 access. A request made with it acts as you, limited in three ways:
 
 - **It reaches only its projects.** Every other project reads as `NOT_FOUND`,
-  exactly like a project that does not exist, even though you are an installation
+  exactly like a project that does not exist, even if you are an installation
   administrator. A cross-project read such as `runs_list` without a `projectId`
   covers its projects only. The installation-wide forms of `workers_state`,
   `cli_rate_limits` and `control_plane_logs` (no `projectId`) are `FORBIDDEN`.
@@ -115,7 +122,10 @@ access. A request made with it acts as you, limited in three ways:
 
 Inside its projects, the credential has the role you hold there: an installation
 administrator's credential acts as `projectAdmin` of each of them. A role you hold
-on a project outside the credential's list lifts nothing.
+on a project outside the credential's list lifts nothing, so the tools a scoped
+credential is shown come from your roles on its projects alone. Because each
+project must be one you may drive (`member` or above), a user who is only a
+`contributor` everywhere can issue ordinary tokens but not scoped ones.
 
 **Issuing one.** In the dashboard, open your **Profile** and the **MCP** tab:
 

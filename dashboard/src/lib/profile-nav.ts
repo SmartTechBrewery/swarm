@@ -37,8 +37,9 @@ export type ProfileViewer = Pick<SwarmUser, 'instanceAdmin'>;
 /**
  * Whether `viewer` sees a tab at all. **MCP** (issue #1362) exists only for those
  * who may hold agent access tokens — the same `MAY_USE_AGENT_ACCESS_TOKENS`
- * decision the token API enforces — so for anyone else there is no tab, and a
- * deep link to it degrades to Account like an undelivered one.
+ * decision the token API enforces, which admits every signed-in user since issue
+ * #1457, project membership or not. A role that map denies would see no tab, and
+ * a deep link to it would degrade to Account like an undelivered one.
  */
 export function isProfileTabVisibleTo(tab: ProfileTab, viewer: ProfileViewer): boolean {
 	if (!isProfileTabAvailable(tab)) return false;

@@ -14,11 +14,12 @@ import {
 } from '../../../../src/identity/agent-access-token.js';
 
 /**
- * The profile's **MCP** tab (issue #1362): an installation administrator's own
- * agent access tokens — the list, issuing a new one with the one-time reveal of
- * its raw value and a ready `claude mcp add` command for this installation, and
- * revoking one after a confirmation. Ported from Under Control's „Dostęp agenta”
- * screen, whose behaviour it matches.
+ * The profile's **MCP** tab (issue #1362): the signed-in user's own agent access
+ * tokens — the list, issuing a new one with the one-time reveal of its raw value
+ * and a ready `claude mcp add` command for this installation, and revoking one
+ * after a confirmation. Ported from Under Control's „Dostęp agenta” screen, whose
+ * behaviour it matches. Since issue #1457 every signed-in user may hold tokens, each
+ * acting with exactly its holder's project roles.
  *
  * Shown only to those who may hold tokens (`isProfileTabVisibleTo`,
  * `lib/profile-nav.ts`); the `agentAccessTokens` API refuses everyone else too, so
@@ -308,7 +309,8 @@ function ProjectScopePicker({
 			<p id="mcp-scope-help" className="text-xs text-zinc-500 mb-2">
 				Leave every project unchecked for a token with your full access. Check some to issue a
 				scoped agent credential: it reaches only those projects, with the read tools and the
-				recovery tools alone.
+				recovery tools alone. You can limit a token only to projects where you hold at least the
+				member role.
 			</p>
 			{loading ? (
 				<p className="text-xs text-zinc-500">Loading projects…</p>
@@ -453,8 +455,9 @@ export function McpPanel() {
 			<div>
 				<h2 className="text-lg font-semibold text-zinc-100">MCP</h2>
 				<p className="text-xs text-zinc-500 mt-1">
-					Tokens your agent uses to connect to this installation's MCP server. Each token expires by
-					itself, and a revoked one stops working immediately.
+					Tokens your agent uses to connect to this installation's MCP server. A token acts with
+					your own project roles, so it reaches nothing you could not reach yourself. Each token
+					expires by itself, and a revoked one stops working immediately.
 				</p>
 			</div>
 

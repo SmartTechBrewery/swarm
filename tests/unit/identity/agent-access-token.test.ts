@@ -77,10 +77,10 @@ beforeEach(() => {
 });
 
 describe('agent access token rules (issue #1362)', () => {
-	it('lets installation administrators and nobody else hold tokens, one decision per role', () => {
-		expect(MAY_USE_AGENT_ACCESS_TOKENS).toEqual({ instanceAdmin: true, user: false });
+	it('lets every installation role hold tokens, one decision per role (issue #1457)', () => {
+		expect(MAY_USE_AGENT_ACCESS_TOKENS).toEqual({ instanceAdmin: true, user: true });
 		expect(mayUseAgentAccessTokens(ADMIN)).toBe(true);
-		expect(mayUseAgentAccessTokens(MEMBER)).toBe(false);
+		expect(mayUseAgentAccessTokens(MEMBER)).toBe(true);
 	});
 
 	it('expires a token a fixed 30 days after issuing', () => {
@@ -156,7 +156,7 @@ describe('issueAgentAccessToken', () => {
 		});
 	});
 
-	it('refuses a non-admin before any query', async () => {
+	it('issues a non-admin their own token, scoped by the same project rule (issue #1457)', async () => {
 		const mayScopeTo = vi.fn(allowEveryProject);
 		const result = await issueAgentAccessToken({
 			actor: MEMBER,
@@ -165,9 +165,15 @@ describe('issueAgentAccessToken', () => {
 			mayScopeTo,
 		});
 
-		expect(result).toEqual({ outcome: 'forbidden' });
-		expect(mayScopeTo).not.toHaveBeenCalled();
-		expect(insertAgentAccessToken).not.toHaveBeenCalled();
+		expect(result.outcome).toBe('issued');
+		expect(mayScopeTo).toHaveBeenCalledWith('proj-a');
+		expect(insertAgentAccessToken).toHaveBeenCalledWith(
+			expect.objectContaining({
+				userId: MEMBER.id,
+				projectIds: ['proj-a'],
+				expiresAt: agentAccessTokenExpiry(NOW),
+			}),
+		);
 	});
 
 	it('stores the projects of a scoped credential once every one of them is allowed', async () => {
@@ -217,11 +223,11 @@ describe('listAgentAccessTokens / revokeAgentAccessToken', () => {
 		expect(await revokeAgentAccessToken(TOKEN_ID, ADMIN)).toEqual({ outcome: 'unknown-token' });
 	});
 
-	it('refuses a non-admin before any query', async () => {
-		expect(await listAgentAccessTokens(MEMBER)).toEqual({ outcome: 'forbidden' });
-		expect(await revokeAgentAccessToken(TOKEN_ID, MEMBER)).toEqual({ outcome: 'forbidden' });
-		expect(listAgentAccessTokensOfUser).not.toHaveBeenCalled();
-		expect(deleteAgentAccessToken).not.toHaveBeenCalled();
+	it('lists and revokes a non-admin’s own tokens (issue #1457)', async () => {
+		expect(await listAgentAccessTokens(MEMBER)).toEqual({ outcome: 'listed', tokens: [STORED] });
+		expect(listAgentAccessTokensOfUser).toHaveBeenCalledWith(MEMBER.id);
+		expect(await revokeAgentAccessToken(TOKEN_ID, MEMBER)).toEqual({ outcome: 'revoked' });
+		expect(deleteAgentAccessToken).toHaveBeenCalledWith(TOKEN_ID, MEMBER.id);
 	});
 });
 

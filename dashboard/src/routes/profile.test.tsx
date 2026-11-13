@@ -17,23 +17,23 @@ const MEMBER = { instanceAdmin: false };
 const ADMIN = { instanceAdmin: true };
 
 describe('ProfileTabBar', () => {
-	it('renders only the tabs whose content is delivered', () => {
-		render(<ProfileTabBar activeTab="account" viewer={MEMBER} onSelect={vi.fn()} />);
+	// Issue #1457: the MCP tab is every signed-in user's, whatever their role or
+	// project membership — the viewer carries no membership, so none is consulted.
+	it.each([
+		['a user with no installation role', MEMBER],
+		['an installation administrator', ADMIN],
+	])('renders every delivered tab, MCP included, for %s', (_, viewer) => {
+		const onSelect = vi.fn();
+		render(<ProfileTabBar activeTab="account" viewer={viewer} onSelect={onSelect} />);
 
 		expect(screen.getAllByRole('button').map((button) => button.textContent)).toEqual([
 			'Account',
 			'My Workers',
 			'My Projects',
 			'Security',
+			'MCP',
 		]);
-	});
-
-	it('adds the MCP tab for an installation administrator only (issue #1362)', () => {
-		const onSelect = vi.fn();
-		render(<ProfileTabBar activeTab="account" viewer={ADMIN} onSelect={onSelect} />);
-
 		fireEvent.click(screen.getByRole('button', { name: 'MCP' }));
-
 		expect(onSelect).toHaveBeenCalledWith('mcp');
 	});
 
