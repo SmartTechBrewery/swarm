@@ -13,6 +13,7 @@ import {
 	waitingTicketCandidates,
 } from '@/dispatch/resolve-problem-trigger.js';
 import type { WipTicket, WipUsageEntry } from '@/queue/wip-usage.js';
+import { diagnoseFailure, operatorHandoffDiagnosis } from '@/worker/failure-diagnosis.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
 const ON = createMockProjectConfig({ id: 'on', pipeline: { resolveProblem: { enabled: true } } });
@@ -374,6 +375,42 @@ describe('dispatchResolveProblemForWaitingTickets (issue #1425)', () => {
 		expect(scheduleRun).not.toHaveBeenCalled();
 		expect(scheduleTicket.mock.calls.map(([t]) => t.taskId)).toEqual(['3']);
 		expect(created).toEqual([`on/${ON.repo}#3`]);
+	});
+
+	it('skips a holder whose run is a deliberate hand-off to a person, and still takes an ordinary failure (issue #1462)', async () => {
+		const handoff = operatorHandoffDiagnosis({
+			kind: 'approved-head-needs-operator',
+			prNumber: '42',
+			headSha: 'abc123',
+			failedChecks: ['integration'],
+		});
+		const pass = async (failureDiagnosis: RunRow['failureDiagnosis']) => {
+			const scheduleRun = vi.fn(async (_run: Pick<RunRow, 'id'>) => ({ created: true }));
+			const scheduleTicket = vi.fn(async (_t: ResolveProblemTicketCandidate) => ({
+				created: true,
+			}));
+			const created = await dispatchResolveProblemForWaitingTickets({
+				listProjects: async () => [RECORD_ON],
+				loadWaiting: async () => ENTRIES,
+				readRun: async (id) => run(id, id === 'run-failed' ? { failureDiagnosis } : {}),
+				scheduleRun,
+				scheduleTicket,
+				now: () => NOW,
+			});
+			return { created, scheduleRun };
+		};
+
+		const handedOff = await pass(handoff);
+		expect(handedOff.scheduleRun).not.toHaveBeenCalled();
+		expect(handedOff.created).toEqual([`on/${ON.repo}#2`, `on/${ON.repo}#3`]);
+
+		for (const ordinary of [
+			null,
+			diagnoseFailure({ knownCondition: 'provider-rate-limit' }) ?? null,
+		]) {
+			const { scheduleRun } = await pass(ordinary);
+			expect(scheduleRun.mock.calls.map(([r]) => r.id)).toEqual(['run-failed']);
+		}
 	});
 
 	it('logs a failed dispatch and carries on, and never throws when a read fails', async () => {

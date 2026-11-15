@@ -50,7 +50,11 @@ import type { CancellationOrigin } from '../../queue/cancellation.js';
 import type { SwarmJob } from '../../queue/jobs.js';
 import type { ReviewAbsorbed } from '../../scm/delivery.js';
 import type { TriggerPhase } from '../../triggers/types.js';
-import { diagnoseFailure, type FailureDiagnosis } from '../../worker/failure-diagnosis.js';
+import {
+	diagnoseFailure,
+	type FailureDiagnosis,
+	OPERATOR_HANDOFF_DIAGNOSIS_KINDS,
+} from '../../worker/failure-diagnosis.js';
 import { getDb } from '../client.js';
 import { dispatches } from '../schema/dispatches.js';
 import { runAttempts, runLogs, runOutputEvents, runs } from '../schema/runs.js';
@@ -3070,7 +3074,10 @@ export async function listResolveProblemAttemptsForHolders(input: {
  *    would only meet the dedup conflict again);
  *  - nobody cancelled it: no recorded cancellation origin (`runs.cancellation`,
  *    issue #1453). Dashboard/API Terminate and the board move to Backlog are an
- *    operator's own stop, and restarting the run is their call — at any age.
+ *    operator's own stop, and restarting the run is their call — at any age;
+ *  - it is not a deliberate hand-off to a person: its `failure_diagnosis.kind` is
+ *    not one of `OPERATOR_HANDOFF_DIAGNOSIS_KINDS` (issue #1462) — the run SWARM
+ *    wrote to say a person must act, which Resolve problem never attempts.
  *
  * `projectIds` is the scope; an empty one is answered without a query.
  */
@@ -3145,6 +3152,10 @@ export async function listUnrecoveredFailedRuns(options: {
 				or(isNull(runs.nextRetryAt), lte(runs.nextRetryAt, sql`now()`)),
 				isNull(runs.resetStartedAt),
 				isNull(runs.cancellation),
+				or(
+					isNull(runs.failureDiagnosis),
+					notInArray(sql`${runs.failureDiagnosis}->>'kind'`, [...OPERATOR_HANDOFF_DIAGNOSIS_KINDS]),
+				),
 				notExists(activeDispatchForRun),
 				notExists(activeDispatchForTask),
 				notExists(newerRunForTask),
