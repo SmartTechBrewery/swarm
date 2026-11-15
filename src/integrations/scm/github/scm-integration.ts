@@ -26,6 +26,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { getPersonaToken, getPersonaTokenOrNull } from '../../../config/provider.js';
 import type { ProjectConfig } from '../../../config/schema.js';
+import { logger } from '../../../lib/logger.js';
 import { pushLeaseArgs, type ScmDeliveryProvider } from '../../../scm/delivery.js';
 import type { ScmEvent } from '../../../scm/events.js';
 import type {
@@ -34,6 +35,7 @@ import type {
 } from '../../../scm/merge.js';
 import type {
 	AggregateCheckStatus,
+	CheckAttemptRunner,
 	CommitPullRequest,
 	PullRequestDetails,
 	RerunFailedChecksOutcome,
@@ -56,6 +58,7 @@ import {
 	getPullRequestTitle,
 	isBaseContainedInHead,
 	isContainedInBranch,
+	listFailedWorkflowJobAttempts,
 	listOpenPullRequestsForBase,
 	listPullRequestsForCommit,
 	mergePullRequestDirect,
@@ -579,6 +582,33 @@ export class GitHubSCMIntegration implements SCMProvider {
 			return checks.length > 0 ? { status: 'requested', checks } : { status: 'nothing-to-rerun' };
 		} catch (error) {
 			return { status: 'provider-error', message: errorMessage(error) };
+		}
+	}
+
+	/**
+	 * {@link SCMProvider.describeFailedCheckAttempts} — every failed attempt of the
+	 * jobs in the failed latest Actions workflow runs on `ref`, the runs
+	 * {@link GitHubSCMIntegration.rerunFailedChecks} re-runs, with each job's
+	 * `runner_name`. Reads as the **reviewer** by default; any failure is logged and
+	 * answers `[]`.
+	 */
+	async describeFailedCheckAttempts(
+		project: ProjectConfig,
+		ref: string,
+		persona: ScmPersona = 'reviewer',
+	): Promise<CheckAttemptRunner[]> {
+		const [owner, repo] = project.repo.split('/');
+		try {
+			return await this.withPersonaCredentials(project, persona, () =>
+				listFailedWorkflowJobAttempts(owner, repo, ref),
+			);
+		} catch (error) {
+			logger.warn('GitHub: could not read the runners of the failed check attempts', {
+				repository: project.repo,
+				ref,
+				error: errorMessage(error),
+			});
+			return [];
 		}
 	}
 

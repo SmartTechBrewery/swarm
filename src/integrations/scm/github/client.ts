@@ -24,6 +24,7 @@ import type {
 import { deliveryMarker } from '../../../scm/swarm-origin.js';
 import type {
 	AggregateCheckStatus,
+	CheckAttemptRunner,
 	CheckRunState,
 	CommitPullRequest,
 	PullRequestDetails,
@@ -187,6 +188,10 @@ const RERUNNABLE_RUN_CONCLUSIONS: ReadonlySet<string> = new Set([
 	'cancelled',
 ]);
 
+function isRerunnableConclusion(conclusion: string | null | undefined): boolean {
+	return conclusion != null && RERUNNABLE_RUN_CONCLUSIONS.has(conclusion);
+}
+
 /**
  * Re-run the failed jobs of every failed workflow run on `ref`
  * (`POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs`),
@@ -204,10 +209,7 @@ export async function rerunFailedWorkflowRuns(
 	const client = getScopedClient();
 	const latestRuns = await listLatestWorkflowRuns(client, owner, repo, ref);
 	const failedRuns = latestRuns.filter(
-		(run) =>
-			run.status === 'completed' &&
-			run.conclusion !== null &&
-			RERUNNABLE_RUN_CONCLUSIONS.has(run.conclusion),
+		(run) => run.status === 'completed' && isRerunnableConclusion(run.conclusion),
 	);
 
 	const rerun: string[] = [];
@@ -216,6 +218,81 @@ export async function rerunFailedWorkflowRuns(
 		rerun.push(run.name ?? `workflow run ${run.id}`);
 	}
 	return rerun;
+}
+
+/**
+ * The most attempt-jobs reads {@link listFailedWorkflowJobAttempts} makes for one
+ * head. The approved-head policy re-runs at most three times, so a head typically
+ * has one or two failed workflows of four attempts each; the cap only guards
+ * against a head whose workflows were re-run by hand many times over.
+ */
+export const MAX_WORKFLOW_ATTEMPT_READS = 20;
+
+/**
+ * Every failed attempt of each job in the failed latest workflow runs on `ref`,
+ * with the runner (`runner_name`) it ran on — oldest attempt first per run, for the
+ * approved-head operator notice (issue #1468). Runs are picked exactly as
+ * {@link rerunFailedWorkflowRuns} picks them, and each attempt `1..run_attempt` is
+ * read through `GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs`,
+ * keeping the jobs that failed, timed out or were cancelled. An empty `runner_name`
+ * (a job GitHub never placed on a runner) reads as `null`. At most
+ * {@link MAX_WORKFLOW_ATTEMPT_READS} attempts are read; past that the rest are
+ * skipped, logged. Throws on any API failure.
+ */
+export async function listFailedWorkflowJobAttempts(
+	owner: string,
+	repo: string,
+	ref: string,
+): Promise<CheckAttemptRunner[]> {
+	const client = getScopedClient();
+	const latestRuns = await listLatestWorkflowRuns(client, owner, repo, ref);
+	const failedRuns = latestRuns.filter(
+		(run) => run.status === 'completed' && isRerunnableConclusion(run.conclusion),
+	);
+
+	const attempts: CheckAttemptRunner[] = [];
+	let reads = 0;
+	let skipped = 0;
+	for (const run of failedRuns) {
+		const runAttempts = run.run_attempt ?? 1;
+		for (let attempt = 1; attempt <= runAttempts; attempt++) {
+			if (reads >= MAX_WORKFLOW_ATTEMPT_READS) {
+				skipped++;
+				continue;
+			}
+			reads++;
+			attempts.push(...(await readFailedJobsOfAttempt(client, owner, repo, run.id, attempt)));
+		}
+	}
+	if (skipped > 0) {
+		logger.warn('GitHub: skipped reading some workflow run attempts for their runners', {
+			repository: `${owner}/${repo}`,
+			ref,
+			read: reads,
+			skipped,
+		});
+	}
+	return attempts;
+}
+
+/** One attempt of one workflow run: its failed jobs, and the runner each ran on. */
+async function readFailedJobsOfAttempt(
+	client: Octokit,
+	owner: string,
+	repo: string,
+	runId: number,
+	attempt: number,
+): Promise<CheckAttemptRunner[]> {
+	const jobs = await client.paginate(client.actions.listJobsForWorkflowRunAttempt, {
+		owner,
+		repo,
+		run_id: runId,
+		attempt_number: attempt,
+		per_page: 100,
+	});
+	return jobs
+		.filter((job) => isRerunnableConclusion(job.conclusion))
+		.map((job) => ({ check: job.name, attempt, runner: job.runner_name || null }));
 }
 
 /**

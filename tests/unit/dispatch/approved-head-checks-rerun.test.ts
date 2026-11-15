@@ -62,10 +62,11 @@ import {
 	RERUN_SETTLE_RECHECK_DELAY_MS,
 	type RecoverAdjudicatedApprovedHeadInput,
 	recoverAdjudicatedApprovedHead,
+	summarizeAttemptRunners,
 } from '@/dispatch/approved-head-checks-rerun.js';
 import { PullRequestOperatorUnavailableError } from '@/identity/pull-request-operator.js';
 import { deliveryIdentity, type ScmDeliveryProvider } from '@/scm/delivery.js';
-import type { RerunFailedChecksOutcome } from '@/scm/types.js';
+import type { CheckAttemptRunner, RerunFailedChecksOutcome } from '@/scm/types.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
 const PROJECT = createMockProjectConfig({ autoMerge: true });
@@ -85,6 +86,10 @@ const rerunFailedChecks = vi.fn(
 		status: 'requested',
 		checks: ['ci'],
 	}),
+);
+// Where each failed attempt ran (issue #1468). By default the provider reports none.
+const describeFailedCheckAttempts = vi.fn(
+	async (_p: ProjectConfig, _ref: string, _persona?: string): Promise<CheckAttemptRunner[]> => [],
 );
 const postComment = vi.fn(async (_input: unknown) => 1);
 const deliveryProvider = vi.fn(
@@ -109,7 +114,11 @@ function input(
 ): RecoverAdjudicatedApprovedHeadInput {
 	return {
 		project: PROJECT,
-		scm: { rerunFailedChecks, deliveryProvider } as RecoverAdjudicatedApprovedHeadInput['scm'],
+		scm: {
+			rerunFailedChecks,
+			deliveryProvider,
+			describeFailedCheckAttempts,
+		} as RecoverAdjudicatedApprovedHeadInput['scm'],
 		prNumber: '42',
 		headSha: 'abc123',
 		failedChecks: ['ci'],
@@ -129,6 +138,8 @@ beforeEach(() => {
 	createFailedRun.mockClear();
 	releaseReviewDispatch.mockClear();
 	rerunFailedChecks.mockClear();
+	describeFailedCheckAttempts.mockReset();
+	describeFailedCheckAttempts.mockResolvedValue([]);
 	postComment.mockClear();
 	deliveryProvider.mockClear();
 	runAsPullRequestOperator.mockClear();
@@ -299,6 +310,42 @@ describe('recoverAdjudicatedApprovedHead', () => {
 		expect(claimApprovedHeadOperatorNotice).toHaveBeenCalledTimes(2);
 		expect(createFailedRun).toHaveBeenCalledTimes(1);
 		expect(postComment).toHaveBeenCalledTimes(1);
+		// The runner read is made once per head too: not by the caller that lost the claim.
+		expect(describeFailedCheckAttempts).toHaveBeenCalledTimes(1);
+	});
+
+	it('names the runner each failed attempt ran on in the run and the comment', async () => {
+		getApprovedHeadSlot.mockResolvedValue(slot(3, 60 * MINUTE));
+		describeFailedCheckAttempts.mockResolvedValue([
+			{ check: 'Verify', attempt: 1, runner: 'm5_pro_sm_1' },
+			{ check: 'Verify', attempt: 2, runner: 'm5_pro_sm_1' },
+			{ check: 'Verify', attempt: 3, runner: 'm5_pro_sm_1' },
+		]);
+		expect(
+			(await recoverAdjudicatedApprovedHead(input({ failedChecks: ['Verify'] }))).outcome,
+		).toBe('needs-operator');
+		expect(describeFailedCheckAttempts).toHaveBeenCalledWith(PROJECT, 'abc123');
+		const summary = 'All 3 attempts ran on one runner, `m5_pro_sm_1`.';
+		const run = createFailedRun.mock.calls[0][0] as { error: string };
+		expect(run.error).toContain('`Verify` — attempt 1: `m5_pro_sm_1`');
+		expect(run.error).toContain(summary);
+		const comment = postComment.mock.calls[0][0] as { body: string };
+		expect(comment.body).toContain('`Verify` — attempt 3: `m5_pro_sm_1`');
+		expect(comment.body).toContain(summary);
+	});
+
+	it.each([
+		['throws', () => describeFailedCheckAttempts.mockRejectedValueOnce(new Error('HTTP 502'))],
+		['reports no attempts', () => describeFailedCheckAttempts.mockResolvedValueOnce([])],
+	])('still writes the notice, without runners, when the runner read %s', async (_name, arrange) => {
+		getApprovedHeadSlot.mockResolvedValue(slot(3, 60 * MINUTE));
+		arrange();
+		expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('needs-operator');
+		const run = createFailedRun.mock.calls[0][0] as { error: string };
+		expect(run.error).not.toContain('ran on');
+		expect(run.error).toContain('failed every time. Re-run the checks');
+		expect(postComment).toHaveBeenCalledOnce();
+		expect((postComment.mock.calls[0][0] as { body: string }).body).not.toContain('ran on');
 	});
 
 	it('writes nothing on a head already handed to the operator', async () => {
@@ -410,5 +457,91 @@ describe('recoverAdjudicatedApprovedHead', () => {
 		createFailedRun.mockRejectedValueOnce(new Error('db down'));
 		postComment.mockRejectedValueOnce(new Error('HTTP 502'));
 		expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('needs-operator');
+	});
+});
+
+describe('summarizeAttemptRunners', () => {
+	it('lists each attempt of each failed check, grouped by check, oldest first', () => {
+		expect(
+			summarizeAttemptRunners(
+				[
+					{ check: 'lint', attempt: 2, runner: 'runner-b' },
+					{ check: 'test', attempt: 1, runner: 'runner-a' },
+					{ check: 'lint', attempt: 1, runner: 'runner-a' },
+				],
+				['lint', 'test'],
+			),
+		).toBe(
+			'The failed attempts ran on: `lint` — attempt 1: `runner-a`; `lint` — attempt 2: ' +
+				'`runner-b`; `test` — attempt 1: `runner-a`.',
+		);
+	});
+
+	it('says plainly when every attempt ran on one runner', () => {
+		expect(
+			summarizeAttemptRunners(
+				[1, 2, 3].map((attempt) => ({ check: 'Verify', attempt, runner: 'm5_pro_sm_1' })),
+				['Verify'],
+			),
+		).toBe(
+			'The failed attempts ran on: `Verify` — attempt 1: `m5_pro_sm_1`; `Verify` — attempt 2: ' +
+				'`m5_pro_sm_1`; `Verify` — attempt 3: `m5_pro_sm_1`. All 3 attempts ran on one runner, ' +
+				'`m5_pro_sm_1`.',
+		);
+	});
+
+	it('does not call a single attempt "all on one runner"', () => {
+		expect(
+			summarizeAttemptRunners([{ check: 'Verify', attempt: 1, runner: 'r1' }], ['Verify']),
+		).toBe('The failed attempts ran on: `Verify` — attempt 1: `r1`.');
+	});
+
+	it('names an attempt whose runner was not reported, and does not call the rest "all on one"', () => {
+		expect(
+			summarizeAttemptRunners(
+				[
+					{ check: 'Verify', attempt: 1, runner: null },
+					{ check: 'Verify', attempt: 2, runner: 'r1' },
+				],
+				['Verify'],
+			),
+		).toBe(
+			'The failed attempts ran on: `Verify` — attempt 1: runner not reported; `Verify` — attempt 2: `r1`.',
+		);
+	});
+
+	it.each([
+		['no attempts', []],
+		['no attempt names a runner', [{ check: 'Verify', attempt: 1, runner: null }]],
+		['only checks that are not failing', [{ check: 'lint', attempt: 1, runner: 'r1' }]],
+	] as const)('says nothing for %s', (_name, attempts) => {
+		expect(summarizeAttemptRunners(attempts, ['Verify'])).toBeNull();
+	});
+
+	it('ignores attempts of checks not named as failing', () => {
+		expect(
+			summarizeAttemptRunners(
+				[
+					{ check: 'Verify', attempt: 1, runner: 'r1' },
+					{ check: 'lint', attempt: 1, runner: 'r2' },
+				],
+				['Verify'],
+			),
+		).toBe('The failed attempts ran on: `Verify` — attempt 1: `r1`.');
+	});
+
+	it('keeps every attempt when no failing check is named', () => {
+		expect(
+			summarizeAttemptRunners(
+				[
+					{ check: 'Verify', attempt: 1, runner: 'r1' },
+					{ check: 'lint', attempt: 1, runner: 'r1' },
+				],
+				[],
+			),
+		).toBe(
+			'The failed attempts ran on: `Verify` — attempt 1: `r1`; `lint` — attempt 1: `r1`. ' +
+				'All 2 attempts ran on one runner, `r1`.',
+		);
 	});
 });
