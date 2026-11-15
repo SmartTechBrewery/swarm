@@ -3318,10 +3318,12 @@ describe('processMergeAutomationDispatch: an adjudicated red approved head (issu
 		return vi.fn(async (_p: unknown, _n: number, _body: string, _persona?: string) => 1);
 	}
 
-	function adjudicated(outcome: 'rerun-requested' | 'rerun-settling' | 'needs-operator') {
+	function adjudicated(
+		outcome: 'rerun-requested' | 'rerun-settling' | 'rerun-waiting' | 'needs-operator',
+	) {
 		return {
 			hasCiNoFixRecovery: vi.fn(async () => true),
-			recoverAdjudicatedApprovedHead: vi.fn(async () => outcome),
+			recoverAdjudicatedApprovedHead: vi.fn(async () => ({ outcome })),
 		};
 	}
 
@@ -3358,6 +3360,8 @@ describe('processMergeAutomationDispatch: an adjudicated red approved head (issu
 		expect(body).toContain("SWARM's CI agent judged the failure unrelated");
 		expect(body).toContain('re-ran the failing checks');
 		expect(body).toContain('SWARM merges this head');
+		// Issue #1463: the re-runs are bounded and spaced before the operator hand-off.
+		expect(body).toContain('SWARM re-runs them up to 3 times, spaced out, before leaving');
 		// Not the #1124 wording: Respond-to-CI already declined this head.
 		expect(body).not.toContain('Respond-to-CI');
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
@@ -3368,6 +3372,7 @@ describe('processMergeAutomationDispatch: an adjudicated red approved head (issu
 	it.each([
 		'needs-operator',
 		'rerun-settling',
+		'rerun-waiting',
 	] as const)('settles %s without a second comment — the operator notice is the comment', async (result) => {
 		const commentOnPullRequest = commentSpy();
 
@@ -3387,9 +3392,27 @@ describe('processMergeAutomationDispatch: an adjudicated red approved head (issu
 		expect(outcome.result).toBe('not-eligible');
 	});
 
+	it('records that a head waiting for its next spaced re-run is re-run again (issue #1463)', async () => {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest: commentSpy(),
+			...adjudicated('rerun-waiting'),
+		});
+
+		expect(updateReviewMergeOutcome).toHaveBeenCalledExactlyOnceWith(
+			'run-1',
+			expect.objectContaining({
+				message: expect.stringContaining('SWARM re-runs them again shortly'),
+			}),
+		);
+	});
+
 	it('keeps the #1124 refusal for a red that was never adjudicated', async () => {
 		const commentOnPullRequest = commentSpy();
-		const recoverAdjudicatedApprovedHead = vi.fn(async () => 'rerun-requested' as const);
+		const recoverAdjudicatedApprovedHead = vi.fn(async () => ({
+			outcome: 'rerun-requested' as const,
+		}));
 
 		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
 			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
@@ -3411,7 +3434,7 @@ describe('processMergeAutomationDispatch: an adjudicated red approved head (issu
 			getAggregateCheckStatus: checksConcluding('failure'),
 			commentOnPullRequest,
 			hasCiNoFixRecovery: vi.fn(async () => true),
-			recoverAdjudicatedApprovedHead: vi.fn(async () => 'not-applicable' as const),
+			recoverAdjudicatedApprovedHead: vi.fn(async () => ({ outcome: 'not-applicable' as const })),
 		});
 
 		expect(commentOnPullRequest.mock.calls[0]?.[2]).toContain('Respond-to-CI');

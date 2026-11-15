@@ -3,7 +3,10 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ProjectConfig, ProjectRecord } from '@/config/schema.js';
 import type { ActiveDispatchTaskRef } from '@/db/repositories/dispatchesRepository.js';
 import type { RunRow, TaskActivityRow } from '@/db/repositories/runsRepository.js';
-import { RERUN_SETTLE_MS } from '@/dispatch/approved-head-checks-rerun.js';
+import {
+	RERUN_SETTLE_MS,
+	RERUN_SETTLE_RECHECK_DELAY_MS,
+} from '@/dispatch/approved-head-checks-rerun.js';
 import type { ItemLivenessPolicy } from '@/dispatch/item-liveness.js';
 import type { ResolveProblemRedHeadCandidate } from '@/dispatch/resolve-problem.js';
 import { resolveProblemRedHeadDedupKey } from '@/dispatch/resolve-problem-keys.js';
@@ -272,18 +275,41 @@ describe('redHeadHandled (issue #1459)', () => {
 	});
 
 	it('is a recorded "Approved head needs the operator" hand-off', async () => {
-		const handed = reads({ checksRerunAt: at('12:00'), operatorNotifiedAt: at('12:05') });
+		const handed = reads({
+			checksRerunAt: at('12:00'),
+			checksRerunAttempts: 1,
+			operatorNotifiedAt: at('12:05'),
+		});
 		await expect(redHeadHandled(key, true, now, handed)).resolves.toMatch(/handed .* operator/);
 	});
 
-	it('is an approved head’s re-run still settling, and not one past its window', async () => {
-		const fresh = new Date(now.getTime() - RERUN_SETTLE_MS + 1000);
-		const stale = new Date(now.getTime() - RERUN_SETTLE_MS - 1000);
+	const approvedSlot = (checksRerunAttempts: number, agoMs: number) => ({
+		checksRerunAt: new Date(now.getTime() - agoMs),
+		checksRerunAttempts,
+		operatorNotifiedAt: null,
+	});
+
+	it('is an approved head’s last re-run still settling, and not one past its window', async () => {
 		await expect(
-			redHeadHandled(key, true, now, reads({ checksRerunAt: fresh, operatorNotifiedAt: null })),
-		).resolves.toMatch(/settling/);
+			redHeadHandled(key, true, now, reads(approvedSlot(3, RERUN_SETTLE_MS - 1000))),
+		).resolves.toMatch(/re-run 3 of 3 of approved head/);
+		// Every re-run spent and settled with no notice yet: left to the policy's hand-off.
 		await expect(
-			redHeadHandled(key, true, now, reads({ checksRerunAt: stale, operatorNotifiedAt: null })),
+			redHeadHandled(key, true, now, reads(approvedSlot(3, RERUN_SETTLE_MS + 1000))),
+		).resolves.toBeUndefined();
+	});
+
+	it('is an approved head whose next spaced re-run is still to come (issue #1463)', async () => {
+		const dueAt = new Date(now.getTime() + 10 * 60_000).toISOString();
+		await expect(redHeadHandled(key, true, now, reads(approvedSlot(1, 5 * 60_000)))).resolves.toBe(
+			`SWARM has re-run 1 of 3 of approved head ${UPDATED_HEAD}'s checks; the next is due at ${dueAt}`,
+		);
+	});
+
+	it('stops counting a waiting approved head once its re-run is past due and past the grace', async () => {
+		const pastGrace = 15 * 60_000 + RERUN_SETTLE_RECHECK_DELAY_MS + 1000;
+		await expect(
+			redHeadHandled(key, true, now, reads(approvedSlot(1, pastGrace))),
 		).resolves.toBeUndefined();
 	});
 
@@ -308,7 +334,11 @@ describe('redHeadHandled (issue #1459)', () => {
 	});
 
 	it('is an approved head on a repository without auto-merge — a person’s merge gate', async () => {
-		const approved = reads({ checksRerunAt: null, operatorNotifiedAt: null });
+		const approved = reads({
+			checksRerunAt: null,
+			checksRerunAttempts: 0,
+			operatorNotifiedAt: null,
+		});
 		await expect(redHeadHandled(key, false, now, approved)).resolves.toMatch(/person to merge/);
 		await expect(redHeadHandled(key, true, now, approved)).resolves.toBeUndefined();
 	});

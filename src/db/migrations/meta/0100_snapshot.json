@@ -1,5 +1,5 @@
 {
-  "id": "6c554235-6202-4cea-99f5-6b65abdb0c00",
+  "id": "b0fb798b-37be-48ae-b33c-5655c5242c6d",
   "prevId": "ff49d6a1-8ec7-446a-8f18-437bc5c5feaf",
   "version": "7",
   "dialect": "postgresql",
@@ -726,12 +726,6 @@
         "review_absorbed": {
           "name": "review_absorbed",
           "type": "jsonb",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "resolve_problem_outcome": {
-          "name": "resolve_problem_outcome",
-          "type": "text",
           "primaryKey": false,
           "notNull": false
         },
@@ -2079,6 +2073,13 @@
           "type": "timestamp",
           "primaryKey": false,
           "notNull": false
+        },
+        "checks_rerun_attempts": {
+          "name": "checks_rerun_attempts",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
         },
         "operator_notified_at": {
           "name": "operator_notified_at",

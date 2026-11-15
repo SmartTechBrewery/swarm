@@ -99,14 +99,24 @@ export const reviewVerdicts = pgTable(
 		 */
 		capOverrideConsumedAt: timestamp('cap_override_consumed_at'),
 		/**
-		 * When SWARM re-ran the failed checks of this *submitted approval's* head
-		 * because its own Respond-to-CI agent had judged the red not to be the pull
-		 * request's fault (issue #1128, `src/dispatch/approved-head-checks-rerun.ts`).
-		 * The bound on that re-run: claimed by a conditional update that fires only on
-		 * a `submitted` `approve` row with no stamp yet, so an approved head gets one
-		 * automatic re-run, however many events reach it. Never cleared.
+		 * When SWARM last requested a re-run of the failed checks of this *submitted
+		 * approval's* head because its own Respond-to-CI agent had judged the red not
+		 * to be the pull request's fault (issue #1128,
+		 * `src/dispatch/approved-head-checks-rerun.ts`) — the latest of up to
+		 * {@link checksRerunAttempts} re-runs (issue #1463), and the instant the next
+		 * one's spacing is measured from. Written by the same conditional update that
+		 * spends an attempt. Never cleared.
 		 */
 		checksRerunAt: timestamp('checks_rerun_at'),
+		/**
+		 * How many automatic re-runs of this approved head's failed checks SWARM has
+		 * spent (issue #1463). The bound on them: each is claimed by a compare-and-swap
+		 * conditional update on this count, capped at the policy's
+		 * `MAX_APPROVED_HEAD_RERUNS`, so of every caller that read the same count
+		 * exactly one spends the attempt, and no head is ever re-run past the limit.
+		 * Never decremented.
+		 */
+		checksRerunAttempts: integer('checks_rerun_attempts').notNull().default(0),
 		/**
 		 * When SWARM handed this approved head to the operator — the re-run failed
 		 * again, or could not be made — with a durable `failed` Respond-to-CI run and

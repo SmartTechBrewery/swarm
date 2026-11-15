@@ -19,7 +19,8 @@
  * `completed` — a `failed` one belongs to the other two legs, which also covers the
  * "Approved head needs the operator" hand-off run, a Respond-to-CI give-up and a
  * user termination; no review-cap stop; no automatic check re-run on the head still
- * inside its settle window; and no recorded operator hand-off for the head
+ * inside its settle window, nor a spaced approved-head re-run still to come (issue
+ * #1463); and no recorded operator hand-off for the head
  * ({@link redHeadHandled}). Approved and not-yet-approved heads both count — except
  * an approved one on a repository without `autoMerge`, which waits for a person to
  * merge it.
@@ -56,7 +57,12 @@ import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { repoSlugsMatch } from '../scm/repo-slug.js';
 import type { SCMProvider } from '../scm/types.js';
 import { decideAggregateCheckOutcome } from '../triggers/handlers/aggregate-check-decision.js';
-import { RERUN_SETTLE_MS } from './approved-head-checks-rerun.js';
+import {
+	approvedHeadRerunInFlight,
+	MAX_APPROVED_HEAD_RERUNS,
+	nextApprovedHeadRerunDueAt,
+	RERUN_SETTLE_MS,
+} from './approved-head-checks-rerun.js';
 import {
 	foldLivenessUnits,
 	type ItemLivenessPolicy,
@@ -203,9 +209,11 @@ const defaultHandledReads: RedHeadHandledReads = {
  * Why a red head is still being handled — and so not attempted — or `undefined`
  * when nothing is: SWARM already handed the approved head to the operator; one of
  * SWARM's automatic check re-runs on it (the approved head's, issue #1128, or the
- * updated head's, issue #1433) is still inside {@link RERUN_SETTLE_MS}; or the head
- * is approved on a repository without `autoMerge`, so it waits for a person to
- * merge it.
+ * updated head's, issue #1433) is still inside {@link RERUN_SETTLE_MS}; the approved
+ * head's next spaced re-run is still to come (issue #1463 — the policy's own
+ * {@link approvedHeadRerunInFlight}, so the sweep and the policy agree); or the
+ * head is approved on a repository without `autoMerge`, so it waits for a person
+ * to merge it.
  */
 export async function redHeadHandled(
 	key: ReviewVerdictKey,
@@ -220,11 +228,15 @@ export async function redHeadHandled(
 	if (slot && !autoMerge) {
 		return `Head ${key.headSha} is approved on a repository without auto-merge — it waits for a person to merge it`;
 	}
+	if (slot && approvedHeadRerunInFlight(slot, now)) {
+		const spent = slot.checksRerunAttempts;
+		const dueAt = nextApprovedHeadRerunDueAt(slot);
+		const next =
+			dueAt && dueAt.getTime() > now.getTime() ? `; the next is due at ${dueAt.toISOString()}` : '';
+		return `SWARM has re-run ${spent} of ${MAX_APPROVED_HEAD_RERUNS} of approved head ${key.headSha}'s checks${next}`;
+	}
 	const settling = (at: Date | null | undefined): boolean =>
 		!!at && now.getTime() - at.getTime() < RERUN_SETTLE_MS;
-	if (settling(slot?.checksRerunAt)) {
-		return `SWARM re-ran the checks on approved head ${key.headSha} moments ago — the re-run is settling`;
-	}
 	const updated = await reads.findUpdatedHeadReviewRun(key);
 	if (updated?.checksRerunHeadSha === key.headSha && settling(updated.checksRerunAt)) {
 		return `SWARM re-ran the checks on updated head ${key.headSha} moments ago — the re-run is settling`;
