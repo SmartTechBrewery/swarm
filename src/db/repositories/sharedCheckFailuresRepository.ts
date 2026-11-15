@@ -269,8 +269,10 @@ export async function stampEpisodeBaseHead(
 
 /**
  * Resolve an unresolved episode. Conditional on `resolved_at IS NULL`, so of every
- * caller resolving the same episode exactly one wins — `true` only for that one,
- * which is what makes the `base-advanced` resume happen once (issue #1471).
+ * caller resolving the same episode exactly one wins — `true` only for that one.
+ * The `base-advanced` resolution (issue #1471) comes *after* the affected heads are
+ * resumed, so it records that they settled; the resume's own once-only guarantee
+ * is its dispatch dedup key, not this update.
  */
 export async function resolveEpisode(
 	episodeId: string,

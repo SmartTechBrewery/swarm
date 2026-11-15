@@ -565,11 +565,15 @@ export interface ResumeMergeAutomationAfterBaseAdvanceInput {
 	prNumber: string;
 	/** The approved head the shared check failure stopped, confirmed still the pull request's head. */
 	headSha: string;
-	/** The shared check failure episode resolved `base-advanced`. */
+	/** The shared check failure episode the base advanced past, resolved `base-advanced` once its heads settle. */
 	episodeId: string;
 }
 
-/** What {@link resumeMergeAutomationAfterBaseAdvance} did — logged by its caller. */
+/**
+ * What {@link resumeMergeAutomationAfterBaseAdvance} did. Its caller reads it:
+ * `failed` and `dispatch-active` leave the head unsettled, so the episode keeps
+ * standing and the next sweep pass tries again; every other answer settles it.
+ */
 export type MergeResumeResult =
 	| 'resumed'
 	| 'already-resumed'
@@ -595,7 +599,10 @@ export type MergeResumeResult =
  *
  * At most once per (episode, approving run) — {@link mergeResumeDedupKey} — and
  * only for a run whose merge stopped with a re-armable outcome without being
- * superseded, with no dispatch still active on it. Best-effort: never throws.
+ * superseded, with no dispatch still active on it. That dedup key is also what
+ * makes the sweep's retry of an unsettled episode idempotent: a head resumed on an
+ * earlier pass answers `already-resumed`. Best-effort: never throws — a failure
+ * answers `failed`, which the caller treats as retryable.
  */
 export async function resumeMergeAutomationAfterBaseAdvance({
 	project,

@@ -61,8 +61,9 @@ export const sharedCheckFailureObservations = pgTable(
  * `base_head_sha` is the base branch's head when the episode opened (issue #1471,
  * phase 2) — stamped best-effort at opening, or by the next base-branch-health
  * pass when that read failed. A pass that finds the base moved on from it and not
- * red resolves the episode `base-advanced` and resumes the affected pull requests
- * once (`resumeSharedCheckFailures`, `src/dispatch/shared-check-failure.ts`).
+ * red resumes the affected pull requests once and then resolves the episode
+ * `base-advanced` — a pass that cannot settle every head leaves it standing for
+ * the next (`resumeSharedCheckFailures`, `src/dispatch/shared-check-failure.ts`).
  */
 export const sharedCheckFailureEpisodes = pgTable(
 	'shared_check_failure_episodes',

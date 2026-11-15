@@ -13,6 +13,7 @@ import {
 	MAX_SHARED_CHECK_PROBES,
 	type NoteAdjudicatedCheckFailuresInput,
 	noteAdjudicatedCheckFailures,
+	type ResumeAffectedHead,
 	type ResumeSharedCheckFailuresInput,
 	resumeSharedCheckFailures,
 	SHARED_CHECK_EPISODE_MAX_AGE_MS,
@@ -23,6 +24,7 @@ import {
 	summarizeSharedRunners,
 } from '@/dispatch/shared-check-failure.js';
 import type { CheckAttemptRunner, PullRequestDetails } from '@/scm/types.js';
+import type { MergeResumeResult } from '@/worker/merge-automation.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
 const PROJECT = createMockProjectConfig({ autoMerge: true });
@@ -370,7 +372,14 @@ describe('resumeSharedCheckFailures', () => {
 	const getPullRequest = vi.fn(async (_p: ProjectConfig, n: number, _persona?: string) =>
 		pullRequest({ number: n, headSha: `h${n}` }),
 	);
-	const resumeMerge = vi.fn(async (_head: unknown) => 'resumed');
+	// The real resume is deduplicated on `merge-resume:<episodeId>:<reviewRunId>`.
+	const resumedHeads = new Set<string>();
+	const resumeMerge = vi.fn(async (head: ResumeAffectedHead): Promise<MergeResumeResult> => {
+		const key = `${head.episodeId}:${head.prNumber}`;
+		if (resumedHeads.has(key)) return 'already-resumed';
+		resumedHeads.add(key);
+		return 'resumed';
+	});
 
 	function input(
 		overrides: Partial<ResumeSharedCheckFailuresInput> = {},
@@ -391,9 +400,13 @@ describe('resumeSharedCheckFailures', () => {
 		logger.warn.mockClear();
 		getPullRequest.mockClear();
 		resumeMerge.mockClear();
+		resumedHeads.clear();
 		const resolved = new Set<string>();
 		deps = {
-			listStandingEpisodesForRepository: vi.fn(async () => [standing()]),
+			// A resolved episode no longer stands (`resolved_at IS NULL`).
+			listStandingEpisodesForRepository: vi.fn(async () =>
+				[standing()].filter((episode) => !resolved.has(episode.id)),
+			),
 			stampEpisodeBaseHead: vi.fn(async () => true),
 			// The real update is conditional on `resolved_at IS NULL`: one winner.
 			resolveEpisode: vi.fn(async (id: string) => {
@@ -424,9 +437,12 @@ describe('resumeSharedCheckFailures', () => {
 		expect(resumeMerge).not.toHaveBeenCalled();
 	});
 
-	it('resolves the episode once and resumes each affected pull request once when the base advanced green', async () => {
+	it('resumes each affected pull request once and then resolves the episode when the base advanced green', async () => {
 		await resumeSharedCheckFailures(input(), deps);
 		expect(deps.resolveEpisode).toHaveBeenCalledWith('episode-1', 'base-advanced');
+		expect(resumeMerge.mock.invocationCallOrder.at(-1)).toBeLessThan(
+			deps.resolveEpisode.mock.invocationCallOrder[0] ?? 0,
+		);
 		expect(deps.listEpisodeAffectedHeads).toHaveBeenCalledWith(
 			PROJECT.id,
 			PROJECT.repo,
@@ -445,9 +461,17 @@ describe('resumeSharedCheckFailures', () => {
 			expect.objectContaining({ prNumber: '11', headSha: 'h11' }),
 		);
 
-		// A second pass — or a concurrent one — loses the resolution and resumes nothing.
+		// A later pass no longer sees the resolved episode and resumes nothing.
 		await resumeSharedCheckFailures(input(), deps);
 		expect(resumeMerge).toHaveBeenCalledTimes(2);
+		expect(deps.resolveEpisode).toHaveBeenCalledTimes(1);
+	});
+
+	it('settles a head already resumed by another pass and still resolves', async () => {
+		resumedHeads.add('episode-1:10');
+		await resumeSharedCheckFailures(input(), deps);
+		await expect(resumeMerge.mock.results[0]?.value).resolves.toBe('already-resumed');
+		expect(deps.resolveEpisode).toHaveBeenCalledWith('episode-1', 'base-advanced');
 	});
 
 	it('leaves the episode standing when the base moved on but is red', async () => {
@@ -491,14 +515,57 @@ describe('resumeSharedCheckFailures', () => {
 		expect(resumeMerge).toHaveBeenCalledWith(expect.objectContaining({ prNumber: '11' }));
 	});
 
-	it('carries on past a pull request it cannot read', async () => {
+	it('resumes the readable head, keeps the episode standing past a failed read, and finishes next pass', async () => {
 		getPullRequest.mockRejectedValueOnce(new Error('502'));
 		await resumeSharedCheckFailures(input(), deps);
 		expect(resumeMerge).toHaveBeenCalledTimes(1);
+		expect(resumeMerge).toHaveBeenCalledWith(expect.objectContaining({ prNumber: '11' }));
 		expect(logger.warn).toHaveBeenCalledWith(
 			'shared check failure: could not resume an affected pull request',
 			expect.objectContaining({ prNumber: '10' }),
 		);
+		expect(deps.resolveEpisode).not.toHaveBeenCalled();
+
+		// The read is healthy again: the remaining head is resumed, the other one is
+		// already resumed (dedup), and the episode is resolved.
+		await resumeSharedCheckFailures(input(), deps);
+		expect(resumeMerge).toHaveBeenCalledTimes(3);
+		expect(resumeMerge).toHaveBeenNthCalledWith(2, expect.objectContaining({ prNumber: '10' }));
+		expect(deps.resolveEpisode).toHaveBeenCalledWith('episode-1', 'base-advanced');
+	});
+
+	it('keeps the episode standing when the affected heads cannot be read, and resumes them next pass', async () => {
+		deps.listEpisodeAffectedHeads.mockRejectedValueOnce(new Error('db down'));
+		await resumeSharedCheckFailures(input(), deps);
+		expect(resumeMerge).not.toHaveBeenCalled();
+		expect(deps.resolveEpisode).not.toHaveBeenCalled();
+
+		await resumeSharedCheckFailures(input(), deps);
+		expect(resumeMerge).toHaveBeenCalledTimes(2);
+		expect(deps.resolveEpisode).toHaveBeenCalledWith('episode-1', 'base-advanced');
+	});
+
+	it.each([
+		'failed',
+		'dispatch-active',
+	] as const)('keeps the episode standing when a resume answers %s', async (result) => {
+		resumeMerge.mockResolvedValueOnce(result);
+		await resumeSharedCheckFailures(input(), deps);
+		expect(resumeMerge).toHaveBeenCalledTimes(2);
+		expect(deps.resolveEpisode).not.toHaveBeenCalled();
+		expect(logger.warn).toHaveBeenCalledWith(
+			'shared check failure: affected pull request not resumed this pass',
+			expect.objectContaining({ prNumber: '10', result }),
+		);
+	});
+
+	it.each([
+		'auto-merge-off',
+		'no-stopped-approval',
+	] as const)('counts a resume answering %s as settled', async (result) => {
+		resumeMerge.mockResolvedValueOnce(result);
+		await resumeSharedCheckFailures(input(), deps);
+		expect(deps.resolveEpisode).toHaveBeenCalledWith('episode-1', 'base-advanced');
 	});
 
 	it('handles each episode on its own and never throws', async () => {

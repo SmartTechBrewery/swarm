@@ -1901,9 +1901,10 @@ a pull request when all of these hold:
   request's checks by hand: a green re-run merges as usual. A pull request
   failing on its own keeps the per-head re-runs above. When the base branch
   moves on and is not red (a fix merged, or anything else landed), SWARM's
-  five-minute base-branch check closes the shared failure and tries each
-  affected approved pull request once more (issue #1471) — those still open on
-  the head it saw failing and not already handed to you: it brings the head up
+  five-minute base-branch check tries each affected approved pull request once
+  more and then closes the shared failure (issue #1471; a check that cannot
+  reach one of them keeps it open and tries again next time) — those still open
+  on the head it saw failing and not already handed to you: it brings the head up
   to date with the base and waits for that head's own checks, with no fresh
   review. Green merges; red is handled like any updated head that fails (one
   re-run, then Respond-to-CI where enabled); a conflict goes to

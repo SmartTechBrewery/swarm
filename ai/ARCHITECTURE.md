@@ -1194,8 +1194,18 @@ database read and no provider read when there are none) and, per episode: stamps
 a `null` base head with this one and resumes nothing; does nothing while the base
 head is the stamped one; leaves the episode standing when the base moved on but
 reads red (base-blocked attribution, #873, owns a red base); and otherwise
-resolves it `base-advanced` through `resolveEpisode`, conditional on
-`resolved_at IS NULL`, so exactly one caller wins and only the winner resumes.
+resumes the affected heads first and resolves it `base-advanced` through
+`resolveEpisode` (conditional on `resolved_at IS NULL`) only once every head is
+settled. A head is settled when it was resumed or already resumed, is closed or
+on another head, was handed to the operator, or has no stopped approval to
+resume (or `autoMerge` is off); a failed provider read, a resume answering
+`failed` (its dispatch could not be written) or `dispatch-active` (the approving
+run still has one due), or a failed read of the affected heads themselves leaves
+the episode standing, so the next pass retries. The retry is idempotent because
+the resume is deduplicated on `merge-resume:<episodeId>:<reviewRunId>` (an
+all-time unique dispatch key), which is also what keeps two concurrent passes
+from resuming a head twice, and it is bounded by the episode's own
+`SHARED_CHECK_EPISODE_MAX_AGE_MS`, after which the episode no longer stands.
 The affected heads are each pull request's latest sighting of the check since
 `SHARED_CHECK_WINDOW_MS` before the episode opened (`listEpisodeAffectedHeads` —
 the sightings that opened it predate it); each is resumed only when one

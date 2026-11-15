@@ -38,12 +38,13 @@
  *   (`./base-branch-health.ts`) hands every pass's base head to
  *   {@link resumeSharedCheckFailures}. Once the base has moved past the head an
  *   episode opened against and is not red, the episode is resolved
- *   `base-advanced` — exactly once, by a conditional update — so new reds on that
- *   check are judged per head again, and each affected approved pull request
+ *   `base-advanced` — once every affected head has been settled, so new reds on
+ *   that check are judged per head again. Each affected approved pull request
  *   still open on the head it was sighted on, and not already handed to the
- *   operator, is tried once more: its merge is resumed with a flag that brings a
- *   stale red head up to date instead of refusing it, and the updated head's own
- *   CI decides.
+ *   operator, is tried once more first: its merge is resumed with a flag that
+ *   brings a stale red head up to date instead of refusing it, and the updated
+ *   head's own CI decides. A head that could not be settled this pass (a failed
+ *   read or dispatch) keeps the episode standing, so the next pass retries it.
  *
  * Lives under `src/dispatch/` beside the policy it serves.
  */
@@ -70,6 +71,7 @@ import { logger } from '../lib/logger.js';
 import type { SwarmJob } from '../queue/jobs.js';
 import type { CheckAttemptRunner, SCMProvider } from '../scm/types.js';
 import { operatorHandoffDiagnosis } from '../worker/failure-diagnosis.js';
+import type { MergeResumeResult } from '../worker/merge-automation.js';
 
 /** How recent a sighting must be to count toward a shared failure — the red-head leg's lookback. */
 export const SHARED_CHECK_WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -428,10 +430,23 @@ export interface ResumeSharedCheckFailuresInput {
 	 * Merge automation's resume (`resumeMergeAutomationAfterBaseAdvance`,
 	 * `src/worker/merge-automation.ts`) — injected by the sweep rather than imported,
 	 * since merge automation already depends on this module through the approved-head
-	 * re-run policy. Expected never to throw.
+	 * re-run policy (the type-only import above is erased at runtime). Expected never
+	 * to throw: a failure comes back as `failed`, which — like `dispatch-active` —
+	 * leaves the head unsettled, so the episode keeps standing and the next pass
+	 * tries it again.
 	 */
-	resumeMerge: (head: ResumeAffectedHead) => Promise<unknown>;
+	resumeMerge: (head: ResumeAffectedHead) => Promise<MergeResumeResult>;
 }
+
+/**
+ * The answers that leave an affected head for the next pass rather than settling
+ * it: the dispatch could not be written, or the approving run still has one due
+ * (which may yet be refused without the resume flag).
+ */
+const UNSETTLED_RESUME_RESULTS: ReadonlySet<MergeResumeResult> = new Set([
+	'failed',
+	'dispatch-active',
+]);
 
 /**
  * The base-branch-health sweep's half of a shared check failure (issue #1471):
@@ -441,9 +456,15 @@ export interface ResumeSharedCheckFailuresInput {
  * - the base head is still the recorded one → nothing;
  * - the base moved on but is red → nothing: base-blocked attribution (issue #873)
  *   owns a red base, and the episode keeps standing;
- * - the base moved on and is not red → resolve the episode `base-advanced`, and
- *   whoever wins that once-only resolution tries each affected approved pull
- *   request once more ({@link resumeAffectedHeads}).
+ * - the base moved on and is not red → try each affected approved pull request
+ *   once more ({@link resumeAffectedHeads}), and only once every head is settled
+ *   resolve the episode `base-advanced`. Resuming first is what keeps a transient
+ *   failure (a provider read, a dispatch write, the affected-heads read itself)
+ *   from losing a head for good: the episode keeps standing and the next pass
+ *   retries, while `merge-resume:<episodeId>:<reviewRunId>` keeps a head already
+ *   resumed — by an earlier pass, or a concurrent one — from being resumed again.
+ *   The retries are bounded by the episode's own age: past
+ *   {@link SHARED_CHECK_EPISODE_MAX_AGE_MS} it no longer stands.
  *
  * Never throws: each episode is handled on its own and a failure is logged, so
  * the sweep pass carries on.
@@ -489,12 +510,20 @@ export async function resumeSharedCheckFailures(
 				});
 				continue;
 			}
-			if (!(await deps.resolveEpisode(episode.id, 'base-advanced'))) continue;
-			logger.info('shared check failure: the base advanced — resolved, resuming affected heads', {
+			logger.info('shared check failure: the base advanced — resuming affected heads', {
 				...context,
 				episodeBaseHeadSha: episode.baseHeadSha,
 			});
-			await resumeAffectedHeads(input, episode, deps);
+			if (!(await resumeAffectedHeads(input, episode, deps))) {
+				logger.warn(
+					'shared check failure: an affected head could not be settled — episode stands, retrying next pass',
+					context,
+				);
+				continue;
+			}
+			if (await deps.resolveEpisode(episode.id, 'base-advanced')) {
+				logger.info('shared check failure: resolved base-advanced', context);
+			}
 		} catch (err) {
 			logger.warn('shared check failure: could not act on the base advancing', {
 				...context,
@@ -505,17 +534,26 @@ export async function resumeSharedCheckFailures(
 }
 
 /**
- * Try each head a `base-advanced` episode covered once more: only a pull request
- * still open on the very head it was sighted failing on (one provider read; a
- * failed read skips it), and only one SWARM has not already handed to the operator
- * — the #1128 notice is the operator's, not something a base push undoes.
+ * Try each head an episode covered once more, before it is resolved
+ * `base-advanced`: only a pull request still open on the very head it was sighted
+ * failing on (one provider read), and only one SWARM has not already handed to the
+ * operator — the #1128 notice is the operator's, not something a base push undoes.
+ *
+ * Answers whether every head is **settled** — resumed, already resumed, closed,
+ * moved to another head, handed to the operator, or with no stopped approval to
+ * resume — so the caller may resolve the episode. A head whose read throws, or
+ * whose resume answers `failed` / `dispatch-active`, is unsettled: the loop still
+ * carries on to the other heads, but the episode keeps standing for the next pass.
+ * A throw from reading the affected heads themselves reaches the caller, which
+ * leaves the episode standing too.
  */
 async function resumeAffectedHeads(
 	input: ResumeSharedCheckFailuresInput,
 	episode: StandingSharedCheckFailureEpisode,
 	deps: SharedCheckResumeDeps,
-): Promise<void> {
+): Promise<boolean> {
 	const { project } = input;
+	let settled = true;
 	const heads = await deps.listEpisodeAffectedHeads(
 		project.id,
 		project.repo,
@@ -546,12 +584,21 @@ async function resumeAffectedHeads(
 				});
 				continue;
 			}
-			await input.resumeMerge({ ...head, episodeId: episode.id, project });
+			const result = await input.resumeMerge({ ...head, episodeId: episode.id, project });
+			if (UNSETTLED_RESUME_RESULTS.has(result)) {
+				logger.warn('shared check failure: affected pull request not resumed this pass', {
+					...context,
+					result,
+				});
+				settled = false;
+			}
 		} catch (err) {
 			logger.warn('shared check failure: could not resume an affected pull request', {
 				...context,
 				error: describeError(err),
 			});
+			settled = false;
 		}
 	}
+	return settled;
 }
