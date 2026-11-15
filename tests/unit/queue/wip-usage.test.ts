@@ -521,6 +521,7 @@ describe('foldResolveProblemAttempts', () => {
 			resolvesRunId: 'run-1',
 			status: 'running',
 			error: null,
+			resolveProblemOutcome: null,
 			startedAt: AFTER_SLOT,
 			completedAt: null,
 			...overrides,
@@ -605,6 +606,44 @@ describe('foldResolveProblemAttempts', () => {
 		expect(
 			folded(failedHolder(), { runs: [makeAttempt({ status: 'deferred' })] }).resolveProblem?.state,
 		).toBe('queued');
+	});
+
+	// Issue #1462: a completed attempt that handed the problem to a person reads apart
+	// from one that resolved it, and carries what the person should do.
+	it('reads a completed hand-off as handed-off, with its headline as the message', () => {
+		const headline =
+			'Resolve problem handed the stuck ticket to a person — Move the card to Ready. Tried: no recovery action.';
+		expect(
+			folded(failedHolder(), {
+				runs: [
+					makeAttempt({
+						status: 'completed',
+						completedAt: LATER,
+						resolveProblemOutcome: 'handed-off',
+						error: headline,
+					}),
+				],
+			}).resolveProblem,
+		).toEqual({
+			runId: 'attempt-1',
+			state: 'handed-off',
+			message: headline,
+			at: LATER.toISOString(),
+		});
+		for (const resolveProblemOutcome of ['resolved', 'already-resolved'] as const) {
+			expect(
+				folded(failedHolder(), {
+					runs: [
+						makeAttempt({
+							status: 'completed',
+							completedAt: LATER,
+							resolveProblemOutcome,
+							error: resolveProblemOutcome === 'already-resolved' ? 'nothing left' : null,
+						}),
+					],
+				}).resolveProblem,
+			).toEqual({ runId: 'attempt-1', state: 'resolved', at: LATER.toISOString() });
+		}
 	});
 
 	it('reads a queued dispatch with no run yet as queued', () => {

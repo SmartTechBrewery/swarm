@@ -124,8 +124,18 @@ export type WipOperatorReason = z.infer<typeof WipOperatorReasonSchema>;
 export const WipPipelineReasonSchema = z.enum(['waiting-for-checks']);
 export type WipPipelineReason = z.infer<typeof WipPipelineReasonSchema>;
 
-/** What a Resolve problem attempt on a waiting holder concluded (issue #1428). */
-export const WipResolveProblemStateSchema = z.enum(['queued', 'running', 'resolved', 'unresolved']);
+/**
+ * What a Resolve problem attempt on a waiting holder concluded (issue #1428).
+ * `handed-off` (issue #1462): the attempt diagnosed the situation and a person
+ * must act — a completed run, told apart from `resolved` by its recorded outcome.
+ */
+export const WipResolveProblemStateSchema = z.enum([
+	'queued',
+	'running',
+	'resolved',
+	'handed-off',
+	'unresolved',
+]);
 export type WipResolveProblemState = z.infer<typeof WipResolveProblemStateSchema>;
 
 /**
@@ -136,7 +146,10 @@ export const WipResolveProblemSchema = z.object({
 	/** The attempt run; absent while the attempt is only queued. */
 	runId: z.string().optional(),
 	state: WipResolveProblemStateSchema,
-	/** `unresolved` only: the run's own error — its summary and the actions it tried. */
+	/**
+	 * `unresolved` and `handed-off` only: the run's own headline — its summary (for
+	 * `handed-off`, what the person should do) and the actions it tried.
+	 */
 	message: z.string().optional(),
 	/** ISO 8601 — when the attempt was queued, started, or settled. */
 	at: z.string(),
@@ -499,11 +512,17 @@ export interface WipResolveProblemAttempts {
 	queued: readonly ActiveDedupDispatch[];
 }
 
-/** A run's status as the attempt's conclusion; a retry pending reads as queued again. */
-function attemptState(status: string): WipResolveProblemState {
+/**
+ * A run's status as the attempt's conclusion; a retry pending reads as queued again.
+ * A completed run whose report named `handed-off` reads as that (issue #1462).
+ */
+function attemptState(
+	status: string,
+	outcome: WipResolveProblemAttemptRow['resolveProblemOutcome'],
+): WipResolveProblemState {
 	switch (status) {
 		case 'completed':
-			return 'resolved';
+			return outcome === 'handed-off' ? 'handed-off' : 'resolved';
 		case 'failed':
 			return 'unresolved';
 		case 'deferred':
@@ -515,12 +534,14 @@ function attemptState(status: string): WipResolveProblemState {
 }
 
 function attemptFromRun(run: WipResolveProblemAttemptRow): WipResolveProblem {
-	const state = attemptState(run.status);
+	const state = attemptState(run.status, run.resolveProblemOutcome);
 	const at = state === 'running' ? run.startedAt : (run.completedAt ?? run.startedAt);
 	return {
 		runId: run.id,
 		state,
-		...(state === 'unresolved' && run.error ? { message: run.error } : {}),
+		...((state === 'unresolved' || state === 'handed-off') && run.error
+			? { message: run.error }
+			: {}),
 		at: at.toISOString(),
 	};
 }

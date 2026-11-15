@@ -1006,7 +1006,8 @@ export const TaskExecutionResultSchema = z.object({
 	resolveProblem: z
 		.object({
 			// `already-resolved` (issue #1441): the failure was already fixed outside SWARM.
-			outcome: z.enum(['resolved', 'already-resolved', 'unresolved']),
+			// `handed-off` (issue #1462): diagnosed, and only a person can act.
+			outcome: z.enum(['resolved', 'already-resolved', 'handed-off', 'unresolved']),
 			bugReportId: z.string().min(1),
 			actions: z.array(z.object({ tool: z.string(), target: z.string(), result: z.string() })),
 			summary: z.string(),

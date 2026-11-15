@@ -43,6 +43,7 @@ import { isRestartingUpdateStatus } from '../../identity/worker-update-rollout.j
 import type { WorkerUpdateStatus } from '../../lib/build-identity.js';
 import type { Checkpoint } from '../../pipeline/checkpoint.js';
 import type { ProposedScope } from '../../pipeline/planning.js';
+import type { ResolveProblemOutcome } from '../../pipeline/resolve-problem.js';
 import type { ReviewAutomationOutcome, ReviewVerdict } from '../../pipeline/review.js';
 import { BOARD_DRIVEN_PHASES } from '../../pm/pipeline.js';
 import type { CancellationOrigin } from '../../queue/cancellation.js';
@@ -612,6 +613,12 @@ export interface CompleteRunInput {
 	 */
 	reviewAbsorbed?: ReviewAbsorbed[];
 	/**
+	 * The successful outcome a completed Resolve problem run's report named (issue
+	 * #1462). Set only by a Resolve problem run that settled `completed`; omitted
+	 * (left as-is) for every other phase and settle.
+	 */
+	resolveProblemOutcome?: ResolveProblemOutcome;
+	/**
 	 * The PR this run *produced*, as reported in its phase result — the PR half of
 	 * the worker→PR attribution record (ADR-004 §4, issue #398). Set only by a
 	 * PR-producing phase (Implementation); omitted (left as-is) for every other
@@ -708,6 +715,7 @@ async function completeRunIn(
 			reviewOrdinal: input.reviewOrdinal,
 			reviewAutomationOutcome: input.reviewAutomationOutcome,
 			reviewAbsorbed: input.reviewAbsorbed,
+			resolveProblemOutcome: input.resolveProblemOutcome,
 			producedPrUrl: input.producedPrUrl,
 			// Spread rather than assigned so an omitted `recovery` still leaves the
 			// column untouched, while a supplied one goes through the sticky-key merge
@@ -833,6 +841,9 @@ async function resetRunRowToRunning(
 			// it or it is not claimed, so a retry must never leave a stale one behind
 			// for a later merge to act on.
 			reviewAbsorbed: null,
+			// Same for a Resolve problem attempt's outcome (issue #1462): a retry
+			// re-records it once it settles `completed` again.
+			resolveProblemOutcome: null,
 			// Same for merge-automation state (issue #278): a re-run Review that
 			// approves again starts a fresh outcome generation rather than showing
 			// a previous attempt's stale merge status while it re-submits.
@@ -2987,6 +2998,8 @@ export interface WipResolveProblemAttemptRow extends ResolveProblemAttempt {
 	repository: string | null;
 	taskId: string | null;
 	resolvesRunId: string | null;
+	/** The outcome a `completed` attempt's report named (issue #1462); null otherwise. */
+	resolveProblemOutcome: ResolveProblemOutcome | null;
 }
 
 /**
@@ -3031,6 +3044,7 @@ export async function listResolveProblemAttemptsForHolders(input: {
 			resolvesRunId: runs.resolvesRunId,
 			status: runs.status,
 			error: runs.error,
+			resolveProblemOutcome: runs.resolveProblemOutcome,
 			startedAt: runs.startedAt,
 			completedAt: runs.completedAt,
 		})

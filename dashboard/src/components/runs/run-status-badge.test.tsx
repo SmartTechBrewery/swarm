@@ -286,6 +286,46 @@ describe('RunStatusBadge', () => {
 		});
 	});
 
+	describe('a Resolve problem hand-off to a person (issue #1462)', () => {
+		it('renders a handed-off attempt as an amber "Handed off" badge, not "Completed"', () => {
+			render(
+				<RunStatusBadge
+					status="completed"
+					phase="resolve-problem"
+					resolveProblemOutcome="handed-off"
+				/>,
+			);
+			const badge = screen.getByText('Handed off');
+			expect(badge.className).toContain('text-amber-400');
+			expect(badge.getAttribute('title')).toMatch(/a person must act/);
+			expect(screen.queryByText('Completed')).toBeNull();
+		});
+
+		it('keeps "Completed" for a resolved or already-resolved attempt', () => {
+			render(
+				<>
+					<RunStatusBadge
+						status="completed"
+						phase="resolve-problem"
+						resolveProblemOutcome="resolved"
+					/>
+					<RunStatusBadge
+						status="completed"
+						phase="resolve-problem"
+						resolveProblemOutcome="already-resolved"
+					/>
+				</>,
+			);
+			expect(screen.getAllByText('Completed')).toHaveLength(2);
+			expect(screen.queryByText('Handed off')).toBeNull();
+		});
+
+		it('keeps a failed attempt red "Failed"', () => {
+			render(<RunStatusBadge status="failed" phase="resolve-problem" />);
+			expect(screen.getByText('Failed').className).toContain('text-red-400');
+		});
+	});
+
 	describe('cancelled runs (issue #1453)', () => {
 		it('renders a cancelled failure as an orange "Canceled" badge, not "Failed"', () => {
 			render(<RunStatusBadge status="failed" cancelled />);
