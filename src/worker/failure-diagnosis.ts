@@ -18,6 +18,8 @@ export const FailureDiagnosisKindSchema = z.enum([
 	'merge-verification-refused',
 	'review-waiting-for-checks',
 	'review-provider-unreachable',
+	'approved-head-needs-operator',
+	'ci-fix-attempts-exhausted',
 ]);
 
 export type FailureDiagnosisKind = z.infer<typeof FailureDiagnosisKindSchema>;
@@ -42,7 +44,31 @@ export type KnownFailureCondition = Exclude<
 	| 'provider-stalled-early'
 	| 'review-waiting-for-checks'
 	| 'review-provider-unreachable'
+	| OperatorHandoffDiagnosisKind
 >;
+
+/**
+ * The diagnosis kinds that mark a run SWARM wrote **on purpose** to hand a
+ * situation to a person (issue #1462): the approved head whose checks stayed red
+ * after its one re-run (`handToOperator`, `src/dispatch/approved-head-checks-rerun.ts`)
+ * and the Respond-to-CI fix-attempt cap (`recordAbandonedCiFix`,
+ * `src/triggers/handlers/review.ts`). Such a run is `failed` only so it is
+ * visible; Resolve problem never attempts it, and every one of its sweep legs
+ * reads this set rather than the run's error text.
+ */
+export const OPERATOR_HANDOFF_DIAGNOSIS_KINDS = [
+	'approved-head-needs-operator',
+	'ci-fix-attempts-exhausted',
+] as const satisfies readonly FailureDiagnosisKind[];
+
+export type OperatorHandoffDiagnosisKind = (typeof OPERATOR_HANDOFF_DIAGNOSIS_KINDS)[number];
+
+/** Whether a diagnosis kind marks a deliberate hand-off to a person (issue #1462). */
+export function isOperatorHandoffDiagnosis(
+	kind: string | null | undefined,
+): kind is OperatorHandoffDiagnosisKind {
+	return (OPERATOR_HANDOFF_DIAGNOSIS_KINDS as readonly string[]).includes(kind ?? '');
+}
 
 /**
  * The opening words of the failure Implementation raises when its agent changed
@@ -203,6 +229,44 @@ export function abandonedReviewDiagnosis(input: AbandonedReviewDiagnosisInput): 
 		`${input.providerLabel} didn't respond while SWARM was checking this pull request`,
 		'SWARM stopped waiting, so this Review will not start by itself.',
 		`Use Retry now once ${input.providerLabel} is reachable.`,
+	);
+}
+
+/** The deliberate hand-offs to a person (issue #1462), each carrying the values its copy names. */
+export type OperatorHandoffDiagnosisInput =
+	| {
+			kind: 'approved-head-needs-operator';
+			prNumber: string;
+			headSha: string;
+			failedChecks: string[];
+	  }
+	| {
+			kind: 'ci-fix-attempts-exhausted';
+			prNumber: string;
+			attempt: number;
+			maxAttempts: number;
+	  };
+
+/**
+ * The headline of a run SWARM wrote to hand a situation to a person (issue
+ * #1462). The `kind` is the durable marker Resolve problem reads to leave the run
+ * alone; the raw `error` stays on the run unchanged.
+ */
+export function operatorHandoffDiagnosis(input: OperatorHandoffDiagnosisInput): FailureDiagnosis {
+	if (input.kind === 'approved-head-needs-operator') {
+		const checks = input.failedChecks.length > 0 ? input.failedChecks.join(', ') : 'none named';
+		return diagnosis(
+			input.kind,
+			'Approved head needs the operator',
+			`PR #${input.prNumber} at ${input.headSha} is approved, but its checks are still red (${checks}) after SWARM's one re-run. SWARM's CI agent judged the failure unrelated to this pull request, so SWARM handed it to a person and will not act on this head again.`,
+			'Re-run the checks — SWARM merges this head once they pass — or push a fix, which gets its own review.',
+		);
+	}
+	return diagnosis(
+		input.kind,
+		'CI fix attempts exhausted',
+		`PR #${input.prNumber} has used every permitted Respond-to-CI attempt (${input.attempt}/${input.maxAttempts}), so SWARM will not attempt another automated fix and handed it to a person.`,
+		'Fix the build by hand and push; the new head gets its own review.',
 	);
 }
 

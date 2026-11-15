@@ -11,7 +11,10 @@
  * while nothing else has picked it up and no operator cancelled it: no retry or
  * continuation of the run, no Reset, no recorded cancellation origin (dashboard/API
  * Terminate or a board move to Backlog, issue #1453), no other dispatch or newer run
- * on its task or pull request, and no attempt for it yet. The database half of that — everything but the project opt-in — is
+ * on its task or pull request, and no attempt for it yet. A run SWARM wrote as a
+ * deliberate hand-off to a person — a `failure_diagnosis.kind` in
+ * `OPERATOR_HANDOFF_DIAGNOSIS_KINDS` (*Approved head needs the operator*, *CI fix
+ * abandoned*; issue #1462) — never qualifies. The database half of that — everything but the project opt-in — is
  * `listUnrecoveredFailedRuns` (`../db/repositories/runsRepository.ts`). Only
  * `status = 'failed'` is read there, so `deferred`, `checkpointed` and every other
  * self-retrying state never qualify.
@@ -27,7 +30,9 @@
  * becomes the same run attempt the first leg would dispatch; a `stalled` holder a
  * ticket attempt, anchored to its latest run when it has one. A holder whose
  * anchor run an operator cancelled is never attempted, even where the panel shows
- * it as `failed` (a user termination in a non-board phase, issue #1453).
+ * it as `failed` (a user termination in a non-board phase, issue #1453), and neither
+ * is one whose anchor run is a deliberate hand-off to a person (issue #1462), even
+ * though the panel reads that run as `failed`.
  *
  * **Red pull-request heads** ({@link dispatchResolveProblemForRedHeads}, issue
  * #1459). An open SWARM pull request whose current head has red checks while
@@ -38,7 +43,8 @@
  * (repository, pull request, head) — see `./resolve-problem-red-head.ts`. A holder
  * that already carries an attempt for its current situation (one anchored to its
  * latest run, a red-head attempt included) is not given a second one by the
- * Waiting-on-you leg.
+ * Waiting-on-you leg, and a head whose latest run is a deliberate hand-off to a
+ * person (issue #1462) is not attempted at all.
  *
  * One attempt per situation: the attempt is a `resolve-problem` run, which is never
  * ticket activity and so never qualifies itself or changes a holder's
@@ -48,7 +54,9 @@
  * one dispatch. Nothing is dispatched while a dispatch is queued for the holder or
  * a newer run moved it (the classifier reads those as the pipeline's), nor while
  * its anchor run is being Reset or has a retry of its own scheduled. The claim-time
- * re-check (`./resolve-problem.ts`) skips a cancelled anchor run too.
+ * re-check (`./resolve-problem.ts`) skips a cancelled anchor run too, and all three
+ * legs and that re-check skip a deliberate hand-off through one predicate,
+ * `resolveProblemAnchorHandedOff`.
  *
  * Best-effort and logged, like the rest of the reconciler: this never throws.
  */
@@ -73,6 +81,7 @@ import {
 	type ResolveProblemTicketCandidate,
 	resolveProblemAnchorBusy,
 	resolveProblemAnchorCancelled,
+	resolveProblemAnchorHandedOff,
 	scheduleResolveProblem,
 	scheduleResolveProblemForRedHead,
 	scheduleResolveProblemForTicket,
@@ -275,8 +284,8 @@ function candidateLabel(candidate: WaitingTicketCandidate): string {
 }
 
 /**
- * Schedule one candidate's attempt unless its anchor run is gone or being acted on
- * (a Reset, a self-scheduled retry). Whether a dispatch was created.
+ * Schedule one candidate's attempt unless its anchor run is gone, cancelled, a
+ * deliberate hand-off to a person, or being acted on (a Reset, a self-scheduled retry). Whether a dispatch was created.
  */
 async function scheduleWaitingCandidate(
 	candidate: WaitingTicketCandidate,
@@ -292,6 +301,15 @@ async function scheduleWaitingCandidate(
 			projectId: candidate.projectId,
 			taskId: candidate.taskId,
 			reason: cancelled,
+		});
+		return false;
+	}
+	const handedOff = anchor ? resolveProblemAnchorHandedOff(anchor) : undefined;
+	if (handedOff) {
+		logger.debug('resolve-problem trigger: holder’s run is a deliberate hand-off; skipping', {
+			projectId: candidate.projectId,
+			taskId: candidate.taskId,
+			reason: handedOff,
 		});
 		return false;
 	}
@@ -438,7 +456,10 @@ async function scheduleRedHeadCandidate(
 	}
 	const anchor = await deps.readRun(candidate.latestRunId);
 	if (!anchor) return undefined;
-	const held = resolveProblemAnchorCancelled(anchor) ?? resolveProblemAnchorBusy(anchor, at);
+	const held =
+		resolveProblemAnchorCancelled(anchor) ??
+		resolveProblemAnchorHandedOff(anchor) ??
+		resolveProblemAnchorBusy(anchor, at);
 	if (held) {
 		logger.debug('resolve-problem trigger: red head’s latest run is held; skipping', {
 			...context,

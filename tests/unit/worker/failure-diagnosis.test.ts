@@ -7,8 +7,11 @@ import {
 	IMPLEMENTATION_NOTHING_TO_DELIVER,
 	isImplementationNothingToDeliverFailure,
 	isMergeVerificationRefusal,
+	isOperatorHandoffDiagnosis,
 	MERGE_VERIFICATION_REFUSED,
 	MIN_SCOPE_STALL_DURATION_MS,
+	OPERATOR_HANDOFF_DIAGNOSIS_KINDS,
+	operatorHandoffDiagnosis,
 } from '@/worker/failure-diagnosis.js';
 
 const MULTI_CONCERN_SCOPE: ProposedScope = {
@@ -223,5 +226,50 @@ describe('abandonedReviewDiagnosis (issue #1203)', () => {
 		);
 		expect(diagnosis.message).toContain('will not start by itself');
 		expect(diagnosis.recovery).toBe('Use Retry now once GitHub is reachable.');
+	});
+});
+
+describe('operator hand-off diagnoses (issue #1462)', () => {
+	it('names the approved head, its red checks and how a person unblocks it', () => {
+		const diagnosis = operatorHandoffDiagnosis({
+			kind: 'approved-head-needs-operator',
+			prNumber: '42',
+			headSha: 'abc123',
+			failedChecks: ['integration', 'lint'],
+		});
+
+		expect(diagnosis.kind).toBe('approved-head-needs-operator');
+		expect(diagnosis.title).toBe('Approved head needs the operator');
+		expect(diagnosis.message).toContain('PR #42 at abc123');
+		expect(diagnosis.message).toContain('integration, lint');
+		expect(diagnosis.recovery).toContain('Re-run the checks');
+	});
+
+	it('names the spent CI-fix budget and tells a person to fix the build', () => {
+		const diagnosis = operatorHandoffDiagnosis({
+			kind: 'ci-fix-attempts-exhausted',
+			prNumber: '9',
+			attempt: 4,
+			maxAttempts: 3,
+		});
+
+		expect(diagnosis.kind).toBe('ci-fix-attempts-exhausted');
+		expect(diagnosis.title).toBe('CI fix attempts exhausted');
+		expect(diagnosis.message).toContain('PR #9');
+		expect(diagnosis.message).toContain('4/3');
+		expect(diagnosis.recovery).toContain('Fix the build by hand');
+	});
+
+	it('marks only the two hand-off kinds as hand-offs', () => {
+		expect([...OPERATOR_HANDOFF_DIAGNOSIS_KINDS]).toEqual([
+			'approved-head-needs-operator',
+			'ci-fix-attempts-exhausted',
+		]);
+		for (const kind of OPERATOR_HANDOFF_DIAGNOSIS_KINDS) {
+			expect(isOperatorHandoffDiagnosis(kind)).toBe(true);
+		}
+		for (const kind of [undefined, null, '', 'user-terminated', 'review-provider-unreachable']) {
+			expect(isOperatorHandoffDiagnosis(kind)).toBe(false);
+		}
 	});
 });

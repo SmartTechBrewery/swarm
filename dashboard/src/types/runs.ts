@@ -71,6 +71,8 @@ export const failureDiagnosisSchema = z.object({
 		'merge-verification-refused',
 		'review-waiting-for-checks',
 		'review-provider-unreachable',
+		'approved-head-needs-operator',
+		'ci-fix-attempts-exhausted',
 	]),
 	title: z.string(),
 	message: z.string(),

@@ -296,7 +296,11 @@ import { repoSlugsMatch } from '../../scm/repo-slug.js';
 import { SWARM_GENERATED_FOOTER } from '../../scm/swarm-origin.js';
 import type { AggregateCheckStatus, PullRequestDetails, SCMProvider } from '../../scm/types.js';
 import { resolveAgentTimeoutMs } from '../../worker/agent-timeout.js';
-import { abandonedReviewDiagnosis, type FailureDiagnosis } from '../../worker/failure-diagnosis.js';
+import {
+	abandonedReviewDiagnosis,
+	type FailureDiagnosis,
+	operatorHandoffDiagnosis,
+} from '../../worker/failure-diagnosis.js';
 import { rearmMergeAutomationForGreenHead } from '../../worker/merge-automation.js';
 import { noteSkip } from '../decline.js';
 import { buildConflictResolutionKey, claimConflictResolution } from '../resolve-conflicts-dedup.js';
@@ -692,6 +696,14 @@ async function recordAbandonedCiFix(
 			phase: 'respond-to-ci',
 			prNumber,
 			jobPayload: baseReviewJobPayload(ctx),
+			// The durable marker that this run is a deliberate hand-off, so Resolve
+			// problem never attempts it (issue #1462).
+			failureDiagnosis: operatorHandoffDiagnosis({
+				kind: 'ci-fix-attempts-exhausted',
+				prNumber,
+				attempt,
+				maxAttempts: MAX_FIX_ATTEMPTS,
+			}),
 			error:
 				`CI fix abandoned: PR #${prNumber} at ${headSha} has used every permitted ` +
 				`Respond-to-CI attempt (${attempt}/${MAX_FIX_ATTEMPTS}).` +

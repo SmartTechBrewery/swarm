@@ -23,6 +23,7 @@ import {
 	RESOLVE_PROBLEM_LOOKBACK_MS,
 } from '@/dispatch/resolve-problem-trigger.js';
 import type { AggregateCheckStatus, PullRequestDetails } from '@/scm/types.js';
+import { operatorHandoffDiagnosis } from '@/worker/failure-diagnosis.js';
 import { createMockProjectRecord } from '../../helpers/factories.js';
 
 const REPO = 'SmartTechBrewery/under-control-platform';
@@ -385,7 +386,7 @@ describe('dispatchResolveProblemForRedHeads (issue #1459)', () => {
 		expect(off.probe).not.toHaveBeenCalled();
 	});
 
-	it('schedules nothing for a head that is not red, is being handled, or whose run is held', async () => {
+	it('schedules nothing for a head that is not red, is being handled, or whose run is held or handed off', async () => {
 		const now = at('12:30');
 		const notRed = deps(now, {
 			probe: vi.fn(
@@ -405,7 +406,22 @@ describe('dispatchResolveProblemForRedHeads (issue #1459)', () => {
 				async () => ({ ...ANCHOR, cancellation: { source: 'dashboard' } }) as unknown as RunRow,
 			),
 		});
-		for (const pass of [notRed, handled, reset, cancelled]) {
+		// A deliberate hand-off to a person is never attempted (issue #1462).
+		const handedOff = deps(now, {
+			readRun: vi.fn(
+				async () =>
+					({
+						...ANCHOR,
+						failureDiagnosis: operatorHandoffDiagnosis({
+							kind: 'ci-fix-attempts-exhausted',
+							prNumber: '2401',
+							attempt: 4,
+							maxAttempts: 3,
+						}),
+					}) as unknown as RunRow,
+			),
+		});
+		for (const pass of [notRed, handled, reset, cancelled, handedOff]) {
 			expect(await dispatchResolveProblemForRedHeads(pass)).toEqual([]);
 			expect(pass.schedule).not.toHaveBeenCalled();
 		}

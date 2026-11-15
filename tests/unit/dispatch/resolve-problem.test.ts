@@ -22,6 +22,7 @@ import {
 	RESOLVE_PROBLEM_TOKEN_GRACE_MS,
 	type ReadRedHeadAtClaim,
 	resolveProblemAnchorCancelled,
+	resolveProblemAnchorHandedOff,
 	resolveProblemDedupKey,
 	resolveProblemTicketDedupKey,
 	resolveProblemTrigger,
@@ -37,6 +38,7 @@ import { RED_HEAD_BUG_REPORT_TITLE } from '@/pipeline/prompts/resolve-problem.js
 import type { ResolveProblemReport } from '@/pipeline/resolve-problem.js';
 import type { ResolveProblemJob } from '@/queue/jobs.js';
 import type { WipTicket } from '@/queue/wip-usage.js';
+import { diagnoseFailure, operatorHandoffDiagnosis } from '@/worker/failure-diagnosis.js';
 import { createMockProjectConfig } from '../../helpers/factories.js';
 
 const PROJECT = createMockProjectConfig({
@@ -55,6 +57,22 @@ const FAILED_RUN = {
 	error: 'Agent did not write required hand-off implementation_handoff.json',
 	failureDiagnosis: null,
 } as unknown as RunRow;
+
+/** The two deliberate hand-offs SWARM writes to a person (issue #1462). */
+const HANDOFF_DIAGNOSES = [
+	operatorHandoffDiagnosis({
+		kind: 'approved-head-needs-operator',
+		prNumber: '42',
+		headSha: 'abc123',
+		failedChecks: ['integration'],
+	}),
+	operatorHandoffDiagnosis({
+		kind: 'ci-fix-attempts-exhausted',
+		prNumber: '42',
+		attempt: 4,
+		maxAttempts: 3,
+	}),
+];
 
 const JOB: ResolveProblemJob = {
 	type: 'resolve-problem',
@@ -178,6 +196,53 @@ describe('resolveProblemTrigger', () => {
 				readRun({ ...FAILED_RUN, cancellation: null } as RunRow),
 			),
 		).toMatchObject({ phase: 'resolve-problem', failedRunId: FAILED_RUN.id });
+	});
+
+	it.each(
+		HANDOFF_DIAGNOSES.map((diagnosis) => [diagnosis.kind, diagnosis] as const),
+	)('skips a failed run SWARM wrote as a deliberate hand-off (%s, issue #1462)', async (_kind, failureDiagnosis) => {
+		expect(
+			await resolveProblemTrigger(
+				JOB,
+				PROJECT,
+				readRun({ ...FAILED_RUN, failureDiagnosis } as RunRow),
+			),
+		).toEqual({
+			skip: `Run ${FAILED_RUN.id} is a deliberate hand-off to a person (${failureDiagnosis.title}) — Resolve problem does not attempt it`,
+			taskId: '1395',
+		});
+	});
+
+	it('still resolves an ordinary failed run — with no diagnosis or any other kind (issue #1462)', async () => {
+		for (const failureDiagnosis of [
+			null,
+			diagnoseFailure({ knownCondition: 'provider-rate-limit' }),
+		]) {
+			expect(
+				await resolveProblemTrigger(
+					JOB,
+					PROJECT,
+					readRun({ ...FAILED_RUN, failureDiagnosis } as RunRow),
+				),
+			).toMatchObject({ phase: 'resolve-problem', failedRunId: FAILED_RUN.id });
+		}
+	});
+});
+
+describe('resolveProblemAnchorHandedOff (issue #1462)', () => {
+	it('names a deliberate hand-off, and nothing for an ordinary failure', () => {
+		for (const failureDiagnosis of HANDOFF_DIAGNOSES) {
+			expect(resolveProblemAnchorHandedOff({ id: 'run-1', failureDiagnosis })).toBe(
+				`Run run-1 is a deliberate hand-off to a person (${failureDiagnosis.title}) — Resolve problem does not attempt it`,
+			);
+		}
+		expect(resolveProblemAnchorHandedOff({ id: 'run-1', failureDiagnosis: null })).toBeUndefined();
+		expect(
+			resolveProblemAnchorHandedOff({
+				id: 'run-1',
+				failureDiagnosis: diagnoseFailure({ knownCondition: 'user-terminated' }) ?? null,
+			}),
+		).toBeUndefined();
 	});
 });
 
@@ -382,6 +447,15 @@ describe('resolveProblemTrigger — ticket attempts (issue #1425)', () => {
 			}),
 		).toEqual({
 			skip: expect.stringContaining('cancelled by an operator (dashboard)'),
+			taskId: '1425',
+		});
+	});
+
+	it('skips when its anchor run is a deliberate hand-off to a person (issue #1462)', async () => {
+		expect(
+			await resolve(HELD, { ...ANCHOR, status: 'failed', failureDiagnosis: HANDOFF_DIAGNOSES[1] }),
+		).toEqual({
+			skip: expect.stringContaining('deliberate hand-off to a person (CI fix attempts exhausted)'),
 			taskId: '1425',
 		});
 	});
@@ -696,6 +770,10 @@ describe('resolveProblemTrigger — red-head attempts (issue #1459)', () => {
 		});
 		expect(await claim(readRedHead, reset)).toMatchObject({
 			skip: expect.stringContaining('being Reset'),
+		});
+		const handedOff = { ...ANCHOR, failureDiagnosis: HANDOFF_DIAGNOSES[0] } as unknown as RunRow;
+		expect(await claim(readRedHead, handedOff)).toMatchObject({
+			skip: expect.stringContaining('deliberate hand-off to a person'),
 		});
 		expect(
 			await resolveProblemTrigger(
