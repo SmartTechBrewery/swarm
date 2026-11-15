@@ -167,6 +167,25 @@ describe('SwarmJobSchema', () => {
 			expect(SwarmJobSchema.parse(roundTrip(anchored))).toEqual(anchored);
 		});
 
+		it('parses a red-head attempt (issue #1459)', () => {
+			const job = {
+				type: 'resolve-problem',
+				projectId: 'swarm',
+				repository: 'acme/widgets',
+				failedRunId: RUN_ID,
+				redHead: {
+					prNumber: '2401',
+					headSha: '372520d3',
+					taskId: '2401-ci',
+					failedChecks: ['integration'],
+					workItemId: 'card',
+				},
+			};
+			expect(SwarmJobSchema.parse(roundTrip(job))).toEqual(job);
+			const unnamed = { ...job, redHead: { ...job.redHead, headSha: '' } };
+			expect(() => SwarmJobSchema.parse(roundTrip(unnamed))).toThrow();
+		});
+
 		it('rejects a ticket attempt for a reason it does not take on', () => {
 			const job = {
 				type: 'resolve-problem',

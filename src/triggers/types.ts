@@ -25,6 +25,7 @@ import { z } from 'zod';
 import type { ProjectConfig } from '../config/schema.js';
 import type {
 	ResolveProblemFailedRun,
+	ResolveProblemRedHead,
 	ResolveProblemStuckTicket,
 } from '../pipeline/prompts/resolve-problem.js';
 import type { PmEvent } from '../pm/events.js';
@@ -365,6 +366,12 @@ export type TriggerResult =
 			failedRun?: ResolveProblemFailedRun;
 			/** A ticket attempt (issue #1425): the stuck WIP slot holder it is about. */
 			ticket?: ResolveProblemStuckTicket;
+			/**
+			 * A red-head attempt (issue #1459): the open pull request's red head nothing
+			 * in SWARM acts on, with the failing checks read at claim. `failedRun` is
+			 * then the pull request's latest run.
+			 */
+			redHead?: ResolveProblemRedHead;
 	  });
 
 export interface TriggerHandler {

@@ -786,12 +786,18 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				expect(await claimApprovedHeadChecksRerun(key('sha-1'))).toBe(true);
 			});
 
-			it('getApprovedHeadSlot reads the re-run stamp of a submitted approval only', async () => {
+			it('getApprovedHeadSlot reads the two stamps of a submitted approval only', async () => {
 				await submit('sha-1', 'approve');
-				expect(await getApprovedHeadSlot(key('sha-1'))).toEqual({ checksRerunAt: null });
+				expect(await getApprovedHeadSlot(key('sha-1'))).toEqual({
+					checksRerunAt: null,
+					operatorNotifiedAt: null,
+				});
 
 				await claimApprovedHeadChecksRerun(key('sha-1'));
 				expect((await getApprovedHeadSlot(key('sha-1')))?.checksRerunAt).toBeInstanceOf(Date);
+				// The operator hand-off Resolve problem's red-head leg leaves alone (issue #1459).
+				await claimApprovedHeadOperatorNotice(key('sha-1'));
+				expect((await getApprovedHeadSlot(key('sha-1')))?.operatorNotifiedAt).toBeInstanceOf(Date);
 
 				await submit('sha-changes', 'request-changes');
 				expect(await getApprovedHeadSlot(key('sha-changes'))).toBeUndefined();

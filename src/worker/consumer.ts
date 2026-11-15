@@ -5112,6 +5112,7 @@ async function skipResolveProblemDispatch(
 		projectId: project.id,
 		failedRunId: job.failedRunId,
 		ticketTaskId: job.ticket?.taskId,
+		redHead: job.redHead ? `#${job.redHead.prNumber}@${job.redHead.headSha}` : undefined,
 		reason: skip.skip,
 	});
 	if (job.runId) {
@@ -5121,7 +5122,12 @@ async function skipResolveProblemDispatch(
 	return {
 		status: 'skipped-not-eligible',
 		phase: 'resolve-problem',
-		taskId: skip.taskId ?? job.ticket?.taskId ?? job.failedRunId ?? 'resolve-problem',
+		taskId:
+			skip.taskId ??
+			job.ticket?.taskId ??
+			job.redHead?.taskId ??
+			job.failedRunId ??
+			'resolve-problem',
 		reason: skip.skip,
 	};
 }
@@ -6924,7 +6930,7 @@ async function processClaimedDispatch(
 				runId,
 				report: result.resolveProblem,
 				agent: result.agent,
-				subject: trigger.ticket ? 'ticket' : 'failed-run',
+				subject: trigger.redHead ? 'red-head' : trigger.ticket ? 'ticket' : 'failed-run',
 			});
 			completedHeadline = settle.headline;
 		}

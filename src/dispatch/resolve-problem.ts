@@ -18,7 +18,7 @@ import {
 	resolveProblemMaxWriteActions,
 } from '../config/resolve-problem.js';
 import type { ProjectConfig } from '../config/schema.js';
-import { findOccurrenceFiledByRun } from '../db/repositories/bugReportsRepository.js';
+import { findOccurrenceFiledByRun, getBugReport } from '../db/repositories/bugReportsRepository.js';
 import type { DispatchRow } from '../db/repositories/dispatchesRepository.js';
 import { findProjectRecordByIdFromDb } from '../db/repositories/projectsRepository.js';
 import { getRunByIdFromDb, type RunRow } from '../db/repositories/runsRepository.js';
@@ -31,13 +31,27 @@ import {
 import { resolveWebhookCallbackBaseUrl } from '../lib/env.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
+import {
+	RED_HEAD_BUG_REPORT_TITLE,
+	type ResolveProblemRedHead,
+} from '../pipeline/prompts/resolve-problem.js';
 import type { ResolveProblemReport } from '../pipeline/resolve-problem.js';
 import type { ResolveProblemJob } from '../queue/jobs.js';
 import { priorityFor } from '../queue/producer.js';
 import type { WipTicket } from '../queue/wip-usage.js';
 import type { TriggerResult } from '../triggers/types.js';
 import { createAndPublishDispatch } from './dispatcher.js';
-import { resolveProblemDedupKey, resolveProblemTicketDedupKey } from './resolve-problem-keys.js';
+import {
+	resolveProblemDedupKey,
+	resolveProblemRedHeadDedupKey,
+	resolveProblemTicketDedupKey,
+} from './resolve-problem-keys.js';
+import {
+	probeRedHead,
+	type RedHeadCandidate,
+	type RedHeadProbe,
+	redHeadHandled,
+} from './resolve-problem-red-head.js';
 import { resolveProblemScopeFor } from './resolve-problem-scope.js';
 import { loadWipUsageEntries } from './wip-usage-loader.js';
 
@@ -51,7 +65,11 @@ export const OPERATOR_MCP_ROUTE = '/operator/mcp';
  */
 export const RESOLVE_PROBLEM_TOKEN_GRACE_MS = 10 * 60 * 1000;
 
-export { resolveProblemDedupKey, resolveProblemTicketDedupKey } from './resolve-problem-keys.js';
+export {
+	resolveProblemDedupKey,
+	resolveProblemRedHeadDedupKey,
+	resolveProblemTicketDedupKey,
+} from './resolve-problem-keys.js';
 
 /** A Resolve problem trigger, narrowed. */
 export type ResolveProblemTrigger = Extract<TriggerResult, { phase: 'resolve-problem' }>;
@@ -130,6 +148,46 @@ export async function scheduleResolveProblemForTicket(
 	});
 }
 
+/** A red head the sweep schedules an attempt for (issue #1459), as it read it. */
+export type ResolveProblemRedHeadCandidate = Omit<RedHeadCandidate, 'autoMerge'> & {
+	headSha: string;
+	failedChecks: string[];
+};
+
+/**
+ * Schedule a Resolve problem attempt for a red pull-request head (issue #1459).
+ * Idempotent on the head ({@link resolveProblemRedHeadDedupKey}): one attempt per
+ * (repository, pull request, head), whatever the pull request's latest run, and a
+ * new head is a new situation. The pull request's latest run is the anchor
+ * (`failedRunId`, so the attempt's `runs.resolves_run_id` names it). Re-checked
+ * against the provider when claimed ({@link resolveProblemTrigger}).
+ */
+export async function scheduleResolveProblemForRedHead(
+	head: ResolveProblemRedHeadCandidate,
+): Promise<{ dispatch: DispatchRow; created: boolean }> {
+	const job: ResolveProblemJob = {
+		type: 'resolve-problem',
+		projectId: head.projectId,
+		repository: head.repository,
+		failedRunId: head.latestRunId,
+		redHead: {
+			prNumber: head.prNumber,
+			headSha: head.headSha,
+			taskId: head.taskId,
+			failedChecks: head.failedChecks,
+			...(head.workItemId ? { workItemId: head.workItemId } : {}),
+		},
+	};
+	return createAndPublishDispatch({
+		projectId: head.projectId,
+		jobPayload: job,
+		dedupKey: resolveProblemRedHeadDedupKey(head),
+		priority: priorityFor(job) ?? 0,
+		source: 'synthetic',
+		phase: 'resolve-problem',
+	});
+}
+
 /** A claimed Resolve problem dispatch that should not run, and why. */
 export interface ResolveProblemSkip {
 	skip: string;
@@ -147,6 +205,28 @@ export type LoadHeldTicket = (
 	repository: string,
 	taskId: string,
 ) => Promise<WipTicket | undefined>;
+
+/**
+ * A red-head attempt's claim-time read (issue #1459): the pull request's live head
+ * ({@link probeRedHead}) and, when it is still red, whether something now handles
+ * it ({@link redHeadHandled}). `project` is scoped to the pull request's repository.
+ */
+export type ReadRedHeadAtClaim = (
+	project: ProjectConfig,
+	prNumber: string,
+	now: Date,
+) => Promise<{ probe: RedHeadProbe; handled?: string }>;
+
+const readRedHeadAtClaim: ReadRedHeadAtClaim = async (project, prNumber, now) => {
+	const probe = await probeRedHead(project, prNumber);
+	if (probe.state !== 'red') return { probe };
+	const handled = await redHeadHandled(
+		{ projectId: project.id, repository: project.repo, prNumber, headSha: probe.headSha },
+		project.autoMerge === true,
+		now,
+	);
+	return handled ? { probe, handled } : { probe };
+};
 
 const loadHeldTicket: LoadHeldTicket = async (project, repository, taskId) => {
 	const record = await findProjectRecordByIdFromDb(project.id);
@@ -202,11 +282,15 @@ export async function resolveProblemTrigger(
 	readRun: (id: string) => Promise<RunRow | undefined> = getRunByIdFromDb,
 	loadTicket: LoadHeldTicket = loadHeldTicket,
 	now: () => Date = () => new Date(),
+	readRedHead: ReadRedHeadAtClaim = readRedHeadAtClaim,
 ): Promise<ResolveProblemTrigger | ResolveProblemSkip> {
 	if (!isResolveProblemEnabled(project.pipeline)) {
 		return {
 			skip: `Resolve problem is not enabled for project '${project.id}' (pipeline.resolveProblem.enabled)`,
 		};
+	}
+	if (job.redHead) {
+		return resolveRedHeadAttempt(job, job.redHead, project, readRun, readRedHead, now());
 	}
 	if (job.ticket) return resolveTicketAttempt(job, job.ticket, project, readRun, loadTicket, now());
 	if (!job.failedRunId) {
@@ -343,6 +427,78 @@ async function resolveTicketAttempt(
 	};
 }
 
+/**
+ * A red-head attempt's claim-time re-check (issue #1459). It runs only while the
+ * pull request is still open, still on the head the attempt was scheduled for,
+ * that head is still red, nothing handles it now ({@link redHeadHandled}), and the
+ * anchor run may be worked on — the same anchor rules a ticket attempt applies.
+ * Anything else is a different situation, which the next sweep decides afresh. The
+ * failing checks are the fresh read's, not the sweep's.
+ */
+async function resolveRedHeadAttempt(
+	job: ResolveProblemJob,
+	redHead: NonNullable<ResolveProblemJob['redHead']>,
+	project: ProjectConfig,
+	readRun: (id: string) => Promise<RunRow | undefined>,
+	readRedHead: ReadRedHeadAtClaim,
+	now: Date,
+): Promise<ResolveProblemTrigger | ResolveProblemSkip> {
+	const { taskId, prNumber, headSha } = redHead;
+	const repository = job.repository;
+	if (!repository || !job.failedRunId) {
+		return {
+			skip: `The Resolve problem dispatch for pull request #${prNumber} names no repository or anchor run`,
+			taskId,
+		};
+	}
+	const anchor = await readTicketAnchor(job.failedRunId, project, readRun, now);
+	if ('skip' in anchor) return { ...anchor, taskId };
+	let read: Awaited<ReturnType<ReadRedHeadAtClaim>>;
+	try {
+		read = await readRedHead(project, prNumber, now);
+	} catch (err) {
+		return {
+			skip: `Pull request #${prNumber} could not be read from the source-control provider (${describeError(err)}) — the next sweep decides it afresh`,
+			taskId,
+		};
+	}
+	const { probe, handled } = read;
+	if (probe.state === 'not-open') {
+		return { skip: `Pull request #${prNumber} is no longer open`, taskId };
+	}
+	if (probe.headSha !== headSha) {
+		return {
+			skip: `Pull request #${prNumber} moved from head ${headSha} to ${probe.headSha} since this attempt was scheduled`,
+			taskId,
+		};
+	}
+	if (probe.state === 'not-red') {
+		return {
+			skip: `Head ${headSha} of pull request #${prNumber} is no longer red (its checks are ${probe.checks === 'defer' ? 'running' : 'green'})`,
+			taskId,
+		};
+	}
+	if (handled) return { skip: handled, taskId };
+	const workItemId = redHead.workItemId ?? anchor.workItemId ?? undefined;
+	const fresh: ResolveProblemRedHead = {
+		repository,
+		prNumber,
+		headSha,
+		taskId,
+		failedChecks: probe.failedChecks,
+		...(workItemId ? { workItemId } : {}),
+	};
+	return {
+		phase: 'resolve-problem',
+		taskId,
+		failedRunId: anchor.id,
+		failedRun: failedRunRecord(anchor),
+		prNumber,
+		...(workItemId ? { workItemId } : {}),
+		redHead: fresh,
+	};
+}
+
 /** The operator MCP endpoint on SWARM's public base URL, when one is configured. */
 export function operatorMcpUrl(baseUrl = resolveWebhookCallbackBaseUrl()): string | undefined {
 	return baseUrl ? `${baseUrl}${OPERATOR_MCP_ROUTE}` : undefined;
@@ -429,10 +585,14 @@ export async function verifyResolveProblemOutcome(
 		runId: string | undefined;
 		report: ResolveProblemReport | undefined;
 		agent: AgentCliResult;
-		/** What the attempt was about — a failed run (the default) or a stuck ticket. */
-		subject?: 'failed-run' | 'ticket';
+		/**
+		 * What the attempt was about — a failed run (the default), a stuck ticket, or a
+		 * red pull-request head (issue #1459).
+		 */
+		subject?: 'failed-run' | 'ticket' | 'red-head';
 	},
 	findOccurrence: typeof findOccurrenceFiledByRun = findOccurrenceFiledByRun,
+	readReport: (id: string) => Promise<{ title: string } | undefined> = (id) => getBugReport(id),
 ): Promise<ResolveProblemSettle> {
 	const { runId, report, agent } = input;
 	const fail = (message: string): never => {
@@ -446,7 +606,22 @@ export async function verifyResolveProblemOutcome(
 			`Resolve problem filed no bug report for this run — it must create one or add an occurrence with filedByRunId ${runId ?? '(unknown run)'}. Its own summary: ${verified.summary} ${describeActions(verified)}`,
 		);
 	}
-	const subject = input.subject === 'ticket' ? 'stuck ticket' : 'failed run';
+	if (input.subject === 'red-head') {
+		// Every red-head occurrence lands on the one class report, so its
+		// `occurrenceCount` is the count the operator reads (issue #1459).
+		const filedOn = occurrence ? await readReport(occurrence.reportId) : undefined;
+		if (filedOn?.title !== RED_HEAD_BUG_REPORT_TITLE) {
+			fail(
+				`Resolve problem recorded this red pull-request head on a bug report titled "${filedOn?.title ?? '(unreadable)'}" — every occurrence must land on the report titled "${RED_HEAD_BUG_REPORT_TITLE}". Its own summary: ${verified.summary} ${describeActions(verified)}`,
+			);
+		}
+	}
+	const subject =
+		input.subject === 'ticket'
+			? 'stuck ticket'
+			: input.subject === 'red-head'
+				? 'red pull-request head'
+				: 'failed run';
 	if (verified.outcome === 'unresolved') {
 		fail(
 			`Resolve problem could not resolve the ${subject}: ${verified.summary} ${describeActions(verified)}`,

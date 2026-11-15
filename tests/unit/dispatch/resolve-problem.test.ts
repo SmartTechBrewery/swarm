@@ -20,17 +20,20 @@ import {
 	mintResolveProblemAccess,
 	operatorMcpUrl,
 	RESOLVE_PROBLEM_TOKEN_GRACE_MS,
+	type ReadRedHeadAtClaim,
 	resolveProblemAnchorCancelled,
 	resolveProblemDedupKey,
 	resolveProblemTicketDedupKey,
 	resolveProblemTrigger,
 	revokeResolveProblemAccess,
 	scheduleResolveProblem,
+	scheduleResolveProblemForRedHead,
 	scheduleResolveProblemForTicket,
 	verifyResolveProblemOutcome,
 } from '@/dispatch/resolve-problem.js';
 import type { AgentCliResult } from '@/harness/agent-cli.js';
 import { AgentRunError } from '@/harness/agent-failure.js';
+import { RED_HEAD_BUG_REPORT_TITLE } from '@/pipeline/prompts/resolve-problem.js';
 import type { ResolveProblemReport } from '@/pipeline/resolve-problem.js';
 import type { ResolveProblemJob } from '@/queue/jobs.js';
 import type { WipTicket } from '@/queue/wip-usage.js';
@@ -555,5 +558,214 @@ describe('verifyResolveProblemOutcome', () => {
 			verifyResolveProblemOutcome({ runId: 'run-resolve', report: undefined, agent: AGENT }, filed),
 		);
 		expect(error.message).toContain('without a report');
+	});
+});
+
+describe('scheduleResolveProblemForRedHead (issue #1459)', () => {
+	it('anchors the attempt on the latest run and deduplicates it on the head', async () => {
+		await scheduleResolveProblemForRedHead({
+			projectId: PROJECT.id,
+			repository: PROJECT.repo,
+			prNumber: '2401',
+			latestRunId: FAILED_RUN.id,
+			taskId: '2401-ci',
+			workItemId: 'card',
+			headSha: 'abc123',
+			failedChecks: ['integration'],
+		});
+		expect(createAndPublishDispatch).toHaveBeenCalledWith(
+			expect.objectContaining({
+				projectId: PROJECT.id,
+				dedupKey: `resolve-problem:red-head:${PROJECT.id}:${PROJECT.repo}:2401:abc123`,
+				phase: 'resolve-problem',
+				source: 'synthetic',
+				jobPayload: {
+					type: 'resolve-problem',
+					projectId: PROJECT.id,
+					repository: PROJECT.repo,
+					failedRunId: FAILED_RUN.id,
+					redHead: {
+						prNumber: '2401',
+						headSha: 'abc123',
+						taskId: '2401-ci',
+						failedChecks: ['integration'],
+						workItemId: 'card',
+					},
+				},
+			}),
+		);
+	});
+});
+
+describe('resolveProblemTrigger — red-head attempts (issue #1459)', () => {
+	const ANCHOR = {
+		...FAILED_RUN,
+		phase: 'respond-to-ci',
+		status: 'completed',
+		taskId: '2401-ci',
+		prNumber: '2401',
+		error: null,
+	} as unknown as RunRow;
+	const RED_JOB: ResolveProblemJob = {
+		type: 'resolve-problem',
+		projectId: PROJECT.id,
+		repository: PROJECT.repo,
+		failedRunId: ANCHOR.id,
+		redHead: {
+			prNumber: '2401',
+			headSha: 'abc123',
+			taskId: '2401-ci',
+			failedChecks: ['stale-name'],
+			workItemId: 'card',
+		},
+	};
+	const NOW = new Date('2026-11-15T12:20:00Z');
+	const readRun = (run: RunRow | undefined) => async () => run;
+	const noTicket = vi.fn(async () => undefined);
+	const red =
+		(result: Awaited<ReturnType<ReadRedHeadAtClaim>>): ReadRedHeadAtClaim =>
+		async () =>
+			result;
+	const claim = (readRedHead: ReadRedHeadAtClaim, run: RunRow | undefined = ANCHOR) =>
+		resolveProblemTrigger(RED_JOB, PROJECT, readRun(run), noTicket, () => NOW, readRedHead);
+
+	it('runs while the head is still red and unhandled, with the fresh failing checks', async () => {
+		const readRedHead = vi.fn(
+			red({ probe: { state: 'red', headSha: 'abc123', failedChecks: ['integration'] } }),
+		);
+		expect(await claim(readRedHead)).toEqual({
+			phase: 'resolve-problem',
+			taskId: '2401-ci',
+			failedRunId: ANCHOR.id,
+			failedRun: {
+				id: ANCHOR.id,
+				phase: 'respond-to-ci',
+				taskId: '2401-ci',
+				prNumber: '2401',
+				error: null,
+				failureDiagnosis: null,
+			},
+			prNumber: '2401',
+			workItemId: 'card',
+			redHead: {
+				repository: PROJECT.repo,
+				prNumber: '2401',
+				headSha: 'abc123',
+				taskId: '2401-ci',
+				failedChecks: ['integration'],
+				workItemId: 'card',
+			},
+		});
+		expect(readRedHead).toHaveBeenCalledWith(PROJECT, '2401', NOW);
+		expect(noTicket).not.toHaveBeenCalled();
+	});
+
+	it('skips a pull request that closed, moved on, went green or is still running', async () => {
+		expect(await claim(red({ probe: { state: 'not-open' } }))).toMatchObject({
+			skip: expect.stringContaining('no longer open'),
+			taskId: '2401-ci',
+		});
+		expect(
+			await claim(red({ probe: { state: 'red', headSha: 'def456', failedChecks: [] } })),
+		).toMatchObject({ skip: expect.stringContaining('moved from head abc123 to def456') });
+		expect(
+			await claim(red({ probe: { state: 'not-red', headSha: 'abc123', checks: 'review' } })),
+		).toMatchObject({ skip: expect.stringContaining('no longer red (its checks are green)') });
+		expect(
+			await claim(red({ probe: { state: 'not-red', headSha: 'abc123', checks: 'defer' } })),
+		).toMatchObject({ skip: expect.stringContaining('running') });
+	});
+
+	it('skips a head something now handles — an operator hand-off, a settling re-run', async () => {
+		const handled = red({
+			probe: { state: 'red', headSha: 'abc123', failedChecks: ['integration'] },
+			handled: 'SWARM already handed approved head abc123 to the operator',
+		});
+		expect(await claim(handled)).toEqual({
+			skip: 'SWARM already handed approved head abc123 to the operator',
+			taskId: '2401-ci',
+		});
+	});
+
+	it('skips while its anchor run is cancelled, being Reset or gone — before any provider read', async () => {
+		const readRedHead = vi.fn(red({ probe: { state: 'not-open' } }));
+		const cancelled = { ...ANCHOR, cancellation: { source: 'dashboard' } } as unknown as RunRow;
+		const reset = { ...ANCHOR, resetStartedAt: NOW } as unknown as RunRow;
+		expect(await claim(readRedHead, cancelled)).toMatchObject({
+			skip: expect.stringContaining('cancelled by an operator'),
+		});
+		expect(await claim(readRedHead, reset)).toMatchObject({
+			skip: expect.stringContaining('being Reset'),
+		});
+		expect(
+			await resolveProblemTrigger(
+				RED_JOB,
+				PROJECT,
+				readRun(undefined),
+				noTicket,
+				() => NOW,
+				readRedHead,
+			),
+		).toMatchObject({
+			skip: expect.stringContaining('does not exist'),
+		});
+		expect(readRedHead).not.toHaveBeenCalled();
+	});
+
+	it('skips, rather than fails, when the provider cannot be read', async () => {
+		const unreadable: ReadRedHeadAtClaim = async () => {
+			throw new Error('502');
+		};
+		expect(await claim(unreadable)).toMatchObject({
+			skip: expect.stringContaining('could not be read'),
+		});
+	});
+
+	it('skips a red-head dispatch that names no repository', async () => {
+		const { repository: _repository, ...job } = RED_JOB;
+		expect(
+			await resolveProblemTrigger(job, PROJECT, readRun(ANCHOR), noTicket, () => NOW),
+		).toMatchObject({ skip: expect.stringContaining('names no repository') });
+	});
+});
+
+describe('verifyResolveProblemOutcome — red-head attempts (issue #1459)', () => {
+	const filed = vi.fn(async (_runId: string) => ({ id: 'occ-1', reportId: 'report-1' }));
+	const report = (title: string) => vi.fn(async (_id: string) => ({ title }));
+	const verify = (outcome: ResolveProblemReport['outcome'], title: string) =>
+		verifyResolveProblemOutcome(
+			{ runId: 'run-resolve', report: { ...REPORT, outcome }, agent: AGENT, subject: 'red-head' },
+			filed,
+			report(title),
+		);
+
+	it('fails an attempt that recorded its occurrence on any other report than the class one', async () => {
+		const error = await verify('resolved', 'Some other problem').catch((err: unknown) => err);
+		expect(error).toBeInstanceOf(AgentRunError);
+		expect((error as AgentRunError).message).toContain(
+			`must land on the report titled "${RED_HEAD_BUG_REPORT_TITLE}"`,
+		);
+	});
+
+	it('accepts the class report, and keeps the usual outcome handling', async () => {
+		await expect(verify('resolved', RED_HEAD_BUG_REPORT_TITLE)).resolves.toEqual({});
+		const settle = await verify('already-resolved', RED_HEAD_BUG_REPORT_TITLE);
+		expect(settle.headline).toContain('the red pull-request head was already fixed');
+		const error = await verify('unresolved', RED_HEAD_BUG_REPORT_TITLE).catch(
+			(err: unknown) => err,
+		);
+		expect((error as AgentRunError).message).toContain(
+			'could not resolve the red pull-request head',
+		);
+	});
+
+	it('never reads the report for a failed-run or ticket attempt', async () => {
+		const read = report('anything');
+		await verifyResolveProblemOutcome(
+			{ runId: 'run-resolve', report: REPORT, agent: AGENT },
+			filed,
+			read,
+		);
+		expect(read).not.toHaveBeenCalled();
 	});
 });

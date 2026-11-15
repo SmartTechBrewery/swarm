@@ -16,8 +16,10 @@ import { runs } from '../../../src/db/schema/runs.js';
 import { wipSlots } from '../../../src/db/schema/wipSlots.js';
 import { ITEM_STALL_AFTER_MS } from '../../../src/dispatch/item-liveness.js';
 import { resolveProblemTrigger } from '../../../src/dispatch/resolve-problem.js';
+import type { RedHeadProbe } from '../../../src/dispatch/resolve-problem-red-head.js';
 import {
 	dispatchResolveProblemForFailedRuns,
+	dispatchResolveProblemForRedHeads,
 	dispatchResolveProblemForWaitingTickets,
 	RESOLVE_PROBLEM_DELAY_MS,
 	RESOLVE_PROBLEM_LOOKBACK_MS,
@@ -49,7 +51,7 @@ async function settledRun(
 		minutesAgo?: number;
 		taskId?: string;
 		prNumber?: string;
-		phase?: 'implementation' | 'review' | 'resolve-problem';
+		phase?: 'implementation' | 'review' | 'respond-to-ci' | 'resolve-problem';
 		projectId?: string;
 		repository?: string;
 		resolvesRunId?: string;
@@ -469,6 +471,103 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_
 			await markRunResetStarted(id);
 
 			expect(await dispatchResolveProblemForWaitingTickets()).toEqual([]);
+		});
+	},
+);
+
+describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE || !process.env.SWARM_TEST_REDIS_AVAILABLE)(
+	'dispatchResolveProblemForRedHeads (integration, Postgres + Redis, issue #1459)',
+	() => {
+		beforeEach(async () => {
+			await truncateAll();
+			await seedProject({ id: PROJECT_ID, repo: REPO });
+			await enableResolveProblem(PROJECT_ID);
+		});
+
+		afterAll(async () => {
+			await closeQueue();
+		});
+
+		/** The provider read, faked: the pull request is open on `headSha` and red. */
+		const redAt = (headSha: string) => async (): Promise<RedHeadProbe> => ({
+			state: 'red',
+			headSha,
+			failedChecks: ['integration'],
+		});
+
+		/** The incident's shape: a Respond-to-CI that settled (no fix) on PR #7, then nothing. */
+		async function quietRespondToCi(): Promise<string> {
+			return settledRun({
+				phase: 'respond-to-ci',
+				status: 'completed',
+				taskId: '7-ci',
+				prNumber: '7',
+				minutesAgo: 15,
+			});
+		}
+
+		async function redHeadDispatches() {
+			return getDb().select().from(dispatches).where(eq(dispatches.phase, 'resolve-problem'));
+		}
+
+		it('creates one dispatch per head from two concurrent passes, and a second for a new head', async () => {
+			const anchor = await quietRespondToCi();
+
+			const passes = await Promise.all([
+				dispatchResolveProblemForRedHeads({ probe: redAt('abc123') }),
+				dispatchResolveProblemForRedHeads({ probe: redAt('abc123') }),
+			]);
+			expect(passes.flat()).toEqual([`${PROJECT_ID}/${REPO}#7@abc123`]);
+			expect(await dispatchResolveProblemForRedHeads({ probe: redAt('abc123') })).toEqual([]);
+
+			const rows = await redHeadDispatches();
+			expect(rows).toHaveLength(1);
+			expect(rows[0]).toMatchObject({
+				projectId: PROJECT_ID,
+				dedupKey: `resolve-problem:red-head:${PROJECT_ID}:${REPO}:7:abc123`,
+				source: 'synthetic',
+				state: 'pending',
+			});
+			expect(rows[0].jobPayload).toMatchObject({
+				type: 'resolve-problem',
+				failedRunId: anchor,
+				repository: REPO,
+				redHead: {
+					prNumber: '7',
+					headSha: 'abc123',
+					taskId: '7-ci',
+					failedChecks: ['integration'],
+				},
+			});
+
+			expect(await dispatchResolveProblemForRedHeads({ probe: redAt('def456') })).toEqual([
+				`${PROJECT_ID}/${REPO}#7@def456`,
+			]);
+			expect(await redHeadDispatches()).toHaveLength(2);
+		});
+
+		it('dispatches nothing while the pull request has a dispatch of its own', async () => {
+			await quietRespondToCi();
+			await createDispatch({
+				projectId: PROJECT_ID,
+				jobPayload: job(),
+				source: 'webhook',
+				taskId: '7',
+				phase: 'review',
+			});
+
+			expect(await dispatchResolveProblemForRedHeads({ probe: redAt('abc123') })).toEqual([]);
+			expect(await redHeadDispatches()).toHaveLength(0);
+		});
+
+		it('dispatches nothing for a pull request whose latest run failed — the other legs’ case', async () => {
+			await settledRun({
+				phase: 'respond-to-ci',
+				status: 'failed',
+				taskId: '7-ci',
+				prNumber: '7',
+			});
+			expect(await dispatchResolveProblemForRedHeads({ probe: redAt('abc123') })).toEqual([]);
 		});
 	},
 );

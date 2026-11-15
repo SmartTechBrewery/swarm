@@ -58,6 +58,8 @@ import {
 	reconcileDispatchesPeriodically,
 } from '../dispatch/reconciler.js';
 import { mintResolveProblemAccess } from '../dispatch/resolve-problem.js';
+import { RED_HEAD_SWEEP_INTERVAL_MS } from '../dispatch/resolve-problem-red-head.js';
+import { dispatchResolveProblemForRedHeads } from '../dispatch/resolve-problem-trigger.js';
 import {
 	recoverUnreviewedPullRequests,
 	UNREVIEWED_PR_SWEEP_INTERVAL_MS,
@@ -1192,6 +1194,17 @@ export async function startControlPlaneDispatch(options: {
 	);
 	reviewRecoveryInterval.unref();
 
+	// Resolve problem on an open pull request left on a red head with nothing acting
+	// on it (issue #1459). Its own interval, not a leg of the reconciler's Resolve
+	// problem pass, for the reason the review sweep above gives: a pass reads the
+	// provider for every quiet pull request in an opted-in project. Not run at
+	// startup either, for the same reason.
+	const redHeadInterval = setInterval(
+		() => void dispatchResolveProblemForRedHeads(),
+		RED_HEAD_SWEEP_INTERVAL_MS,
+	);
+	redHeadInterval.unref();
+
 	// Detect and report a red base branch (issue #872 phase 1). Its own interval
 	// again, and a shorter one than the review-recovery sweep's: a healthy pass is
 	// two provider reads per repository rather than a list read plus one read per
@@ -1228,6 +1241,7 @@ export async function startControlPlaneDispatch(options: {
 		close: async () => {
 			clearInterval(reconcileInterval);
 			clearInterval(reviewRecoveryInterval);
+			clearInterval(redHeadInterval);
 			clearInterval(baseHealthInterval);
 			clearInterval(wipSlotInterval);
 			// Drain the consumer first: an in-flight dispatch still reads the durable

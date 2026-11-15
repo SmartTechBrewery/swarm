@@ -124,12 +124,14 @@ export function wipLimitFrom(records: Map<string, ProjectRecord>) {
  * acted, and the ticket is the pipeline's again.
  *
  * One ledger read per distinct pull request held in a slot (bounded by the sum of
- * the WIP limits), plus one run read only for a spent allowance. Best-effort per
+ * the WIP limits), plus one run read only for a spent allowance. Resolve problem's
+ * red-head leg (issue #1459) asks the same question of its candidate pull requests,
+ * which is why it takes any `(project, repository, prNumber)` rather than slots. Best-effort per
  * pull request: a failed read logs and leaves that ticket uncapped rather than
  * failing the view.
  */
 export async function loadWipCappedPullRequests(
-	slots: readonly WipSlotRow[],
+	slots: readonly (Pick<WipSlotRow, 'projectId' | 'repository'> & { prNumber?: string | null })[],
 ): Promise<WipCappedPullRequest[]> {
 	const pullRequests = new Map<
 		string,

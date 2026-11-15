@@ -2,7 +2,8 @@
  * The Resolve problem trigger (issues #1396, #1425) — the periodic control-plane
  * sweep that starts the phase by itself. `./resolve-problem.ts` schedules and runs
  * one attempt; this decides *when*. A pass ({@link sweepResolveProblem}) reads the
- * opted-in projects once and runs two legs over them.
+ * opted-in projects once and runs two legs over them; a third, which reads the
+ * source-control provider, runs on its own interval.
  *
  * **Failed runs** ({@link dispatchResolveProblemForFailedRuns}, issue #1396). A run
  * qualifies once it has been `failed` for {@link RESOLVE_PROBLEM_DELAY_MS}, within
@@ -28,6 +29,17 @@
  * anchor run an operator cancelled is never attempted, even where the panel shows
  * it as `failed` (a user termination in a non-board phase, issue #1453).
  *
+ * **Red pull-request heads** ({@link dispatchResolveProblemForRedHeads}, issue
+ * #1459). An open SWARM pull request whose current head has red checks while
+ * nothing in SWARM acts on it — every run on it `completed`, so neither leg above
+ * sees it before the 2 h stall window, and an approval would rest it as
+ * `approved-awaiting-merge` forever. Quiet for `RED_HEAD_QUIET_MS` (the same 10
+ * minutes as a failed run), read live from the provider, and deduplicated per
+ * (repository, pull request, head) — see `./resolve-problem-red-head.ts`. A holder
+ * that already carries an attempt for its current situation (one anchored to its
+ * latest run, a red-head attempt included) is not given a second one by the
+ * Waiting-on-you leg.
+ *
  * One attempt per situation: the attempt is a `resolve-problem` run, which is never
  * ticket activity and so never qualifies itself or changes a holder's
  * classification, and the dispatch is deduplicated on the failed run or the stuck
@@ -41,11 +53,14 @@
  * Best-effort and logged, like the rest of the reconciler: this never throws.
  */
 
+import { scopeProjectToRepository } from '../config/project-repository.js';
 import { isResolveProblemEnabled } from '../config/resolve-problem.js';
 import type { ProjectConfig, ProjectRecord } from '../config/schema.js';
+import { listActiveDispatchTaskRefs } from '../db/repositories/dispatchesRepository.js';
 import { listAllProjectRecordsFromDb } from '../db/repositories/projectsRepository.js';
 import {
 	getRunByIdFromDb,
+	listTaskActivitySince,
 	listUnrecoveredFailedRuns,
 	type PipelineRunRow,
 	type RunRow,
@@ -54,14 +69,28 @@ import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
 import type { WipTicket, WipUsageEntry } from '../queue/wip-usage.js';
 import {
+	type ResolveProblemRedHeadCandidate,
 	type ResolveProblemTicketCandidate,
 	resolveProblemAnchorBusy,
 	resolveProblemAnchorCancelled,
 	scheduleResolveProblem,
+	scheduleResolveProblemForRedHead,
 	scheduleResolveProblemForTicket,
 } from './resolve-problem.js';
+import {
+	probeRedHead,
+	RED_HEAD_LOOKBACK_MS,
+	type RedHeadCandidate,
+	type RedHeadProbe,
+	redHeadCandidates,
+	redHeadHandled,
+} from './resolve-problem-red-head.js';
 import { resolveProblemScopeFor } from './resolve-problem-scope.js';
-import { loadWipUsageEntries } from './wip-usage-loader.js';
+import {
+	itemLivenessPolicyFor,
+	loadWipCappedPullRequests,
+	loadWipUsageEntries,
+} from './wip-usage-loader.js';
 
 /** How long a run must have been `failed` before Resolve problem is dispatched for it. */
 export const RESOLVE_PROBLEM_DELAY_MS = 10 * 60 * 1000;
@@ -184,6 +213,10 @@ function waitingTicketCandidate(
 ): WaitingTicketCandidate | undefined {
 	if (ticket.state !== 'waiting-on-operator') return undefined;
 	if (!resolveProblemScopeFor(ticket.operatorReason).inScope) return undefined;
+	// An attempt already exists for this holder's current situation — anchored to
+	// its latest run, e.g. a red-head attempt (issue #1459) — so a second one, under
+	// another dedup key, would only diagnose the same thing again.
+	if (ticket.resolveProblem) return undefined;
 	const since = Date.parse(ticket.lastActivityAt ?? ticket.openedAt);
 	if (now.getTime() - since < RESOLVE_PROBLEM_DELAY_MS) return undefined;
 	const { projectId, repository } = entry;
@@ -326,6 +359,167 @@ export async function dispatchResolveProblemForWaitingTickets(
 		}
 	} catch (err) {
 		logger.error('resolve-problem trigger: Waiting-on-you sweep failed (continuing)', {
+			error: describeError(err),
+		});
+	}
+	return created;
+}
+
+export interface ResolveProblemRedHeadSweepDeps {
+	listProjects: () => Promise<readonly ProjectRecord[]>;
+	listActivity: typeof listTaskActivitySince;
+	listActiveDispatches: typeof listActiveDispatchTaskRefs;
+	loadCapped: typeof loadWipCappedPullRequests;
+	/** The live read, against `project` scoped to the pull request's repository. */
+	probe: (project: ProjectConfig, prNumber: string) => Promise<RedHeadProbe>;
+	handled: typeof redHeadHandled;
+	readRun: (id: string) => Promise<RunRow | undefined>;
+	schedule: (head: ResolveProblemRedHeadCandidate) => Promise<{ created: boolean }>;
+	now: () => Date;
+}
+
+// Wrapped rather than referenced, so a suite that mocks one of these modules
+// without the leg's reads can still import this one.
+const defaultRedHeadDeps: ResolveProblemRedHeadSweepDeps = {
+	listProjects: () => listAllProjectRecordsFromDb(),
+	listActivity: (input) => listTaskActivitySince(input),
+	listActiveDispatches: (projectIds) => listActiveDispatchTaskRefs(projectIds),
+	loadCapped: (pullRequests) => loadWipCappedPullRequests(pullRequests),
+	probe: (project, prNumber) => probeRedHead(project, prNumber),
+	handled: (key, autoMerge, now) => redHeadHandled(key, autoMerge, now),
+	readRun: (id) => getRunByIdFromDb(id),
+	schedule: (head) => scheduleResolveProblemForRedHead(head),
+	now: () => new Date(),
+};
+
+/** The name a created red-head attempt is logged and returned under. */
+function redHeadLabel(candidate: RedHeadCandidate, headSha: string): string {
+	return `${candidate.projectId}/${candidate.repository}#${candidate.prNumber}@${headSha}`;
+}
+
+/**
+ * Read one candidate's head and schedule its attempt when it is red and nothing
+ * handles it (issue #1459). The label of a created attempt, else `undefined`.
+ */
+async function scheduleRedHeadCandidate(
+	record: ProjectRecord,
+	candidate: RedHeadCandidate,
+	at: Date,
+	deps: Pick<ResolveProblemRedHeadSweepDeps, 'probe' | 'handled' | 'readRun' | 'schedule'>,
+): Promise<string | undefined> {
+	const context = {
+		projectId: candidate.projectId,
+		repository: candidate.repository,
+		prNumber: candidate.prNumber,
+	};
+	let probe: RedHeadProbe;
+	try {
+		probe = await deps.probe(
+			scopeProjectToRepository(record, candidate.repository),
+			candidate.prNumber,
+		);
+	} catch (err) {
+		logger.debug('resolve-problem trigger: pull request unreadable; next pass retries', {
+			...context,
+			error: describeError(err),
+		});
+		return undefined;
+	}
+	if (probe.state !== 'red') return undefined;
+	const { headSha, failedChecks } = probe;
+	const handled = await deps.handled({ ...context, headSha }, candidate.autoMerge, at);
+	if (handled) {
+		logger.debug('resolve-problem trigger: red head is being handled; skipping', {
+			...context,
+			headSha,
+			reason: handled,
+		});
+		return undefined;
+	}
+	const anchor = await deps.readRun(candidate.latestRunId);
+	if (!anchor) return undefined;
+	const held = resolveProblemAnchorCancelled(anchor) ?? resolveProblemAnchorBusy(anchor, at);
+	if (held) {
+		logger.debug('resolve-problem trigger: red head’s latest run is held; skipping', {
+			...context,
+			headSha,
+			reason: held,
+		});
+		return undefined;
+	}
+	const { autoMerge: _autoMerge, ...head } = candidate;
+	const result = await deps.schedule({ ...head, headSha, failedChecks });
+	return result.created ? redHeadLabel(candidate, headSha) : undefined;
+}
+
+/**
+ * One pass of the red-head leg (issue #1459, `./resolve-problem-red-head.ts`):
+ * dispatch a Resolve problem attempt for every open SWARM pull request, in a
+ * project that turned the phase on, whose current head is red while nothing in
+ * SWARM acts on it. Candidates come from the database ({@link redHeadCandidates},
+ * minus pull requests the review cap stopped on a refused approval), and each is
+ * confirmed by one live provider read before anything is scheduled. Returns the
+ * attempts this pass created as `project/repository#pr@head`; a head another pass
+ * got to first is not one of them. Runs on its own interval
+ * (`RED_HEAD_SWEEP_INTERVAL_MS`, `src/router/dispatcher.ts`), because it reads the
+ * provider. Never throws.
+ */
+export async function dispatchResolveProblemForRedHeads(
+	deps: Partial<ResolveProblemRedHeadSweepDeps> = {},
+): Promise<string[]> {
+	const resolved = { ...defaultRedHeadDeps, ...deps };
+	const created: string[] = [];
+	try {
+		const records = await resolved.listProjects();
+		const projectIds = resolveProblemProjectIds(records);
+		if (projectIds.length === 0) return created;
+		const at = resolved.now();
+		const [activity, activeDispatches] = await Promise.all([
+			resolved.listActivity({ since: new Date(at.getTime() - RED_HEAD_LOOKBACK_MS), projectIds }),
+			resolved.listActiveDispatches(projectIds),
+		]);
+		const byId = new Map(records.map((record) => [record.id, record]));
+		const candidates = redHeadCandidates(
+			activity,
+			activeDispatches,
+			Object.fromEntries(projectIds.map((id) => [id, itemLivenessPolicyFor(byId.get(id))])),
+			at,
+		);
+		if (candidates.length === 0) return created;
+		const capped = await resolved.loadCapped(candidates);
+		const isCapped = (candidate: RedHeadCandidate): boolean =>
+			capped.some(
+				(pr) =>
+					pr.projectId === candidate.projectId &&
+					pr.repository === candidate.repository &&
+					pr.prNumber === candidate.prNumber,
+			);
+		for (const candidate of candidates) {
+			const record = byId.get(candidate.projectId);
+			if (!record || isCapped(candidate)) continue;
+			try {
+				const label = await scheduleRedHeadCandidate(record, candidate, at, resolved);
+				if (label) created.push(label);
+			} catch (err) {
+				logger.warn('resolve-problem trigger: failed to dispatch an attempt (next pass retries)', {
+					projectId: candidate.projectId,
+					repository: candidate.repository,
+					prNumber: candidate.prNumber,
+					error: describeError(err),
+				});
+			}
+		}
+		if (created.length > 0) {
+			logger.info(
+				'resolve-problem trigger: dispatched Resolve problem for red pull-request heads',
+				{
+					count: created.length,
+					attempts: created,
+				},
+			);
+		}
+	} catch (err) {
+		logger.error('resolve-problem trigger: red-head sweep failed (continuing)', {
 			error: describeError(err),
 		});
 	}

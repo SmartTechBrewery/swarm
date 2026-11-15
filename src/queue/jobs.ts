@@ -685,9 +685,11 @@ export const WorkerUpdateJobSchema = jobBase.extend({
  * (`resolve-problem:<failedRunId>`). A ticket attempt names `ticket`, plus
  * `failedRunId` when the ticket has a latest run (its anchor), and is deduplicated
  * on the stuck situation: that run's key, or the slot's own key when the ticket
- * never ran. At least one of the two is required; that rule is enforced where the
- * job is claimed (`resolveProblemTrigger`), because a discriminated union member
- * must stay a plain object schema.
+ * never ran. Since issue #1459 a red-head attempt names `redHead` plus
+ * `failedRunId` (the pull request's latest run), and is deduplicated on the head.
+ * At least one of `failedRunId` and `ticket` is required; that rule is enforced
+ * where the job is claimed (`resolveProblemTrigger`), because a discriminated union
+ * member must stay a plain object schema.
  */
 export const ResolveProblemJobSchema = jobBase.extend({
 	type: z.literal('resolve-problem'),
@@ -715,6 +717,25 @@ export const ResolveProblemJobSchema = jobBase.extend({
 			/** ISO 8601 — when the slot the ticket holds was opened. */
 			slotOpenedAt: z.string().datetime(),
 			prNumber: z.string().min(1).optional(),
+			workItemId: z.string().min(1).optional(),
+		})
+		.optional(),
+	/**
+	 * A red-head attempt (issue #1459): an open pull request whose current head has
+	 * red checks while nothing in SWARM acts on it, as the sweep saw it.
+	 * `failedRunId` names the pull request's latest run (the anchor), and the
+	 * dispatch is deduplicated on the head (`resolveProblemRedHeadDedupKey`).
+	 * Re-checked against the provider when claimed — the pull request must still be
+	 * open, on this head, and red, with nothing acting on it.
+	 */
+	redHead: z
+		.object({
+			prNumber: z.string().min(1),
+			headSha: z.string().min(1),
+			/** The anchor run's own task id — for display and the board comment. */
+			taskId: z.string().min(1),
+			/** The failing checks' names, as the sweep read them. */
+			failedChecks: z.array(z.string()),
 			workItemId: z.string().min(1).optional(),
 		})
 		.optional(),
@@ -789,9 +810,9 @@ export type SwarmJob = z.infer<typeof swarmJobVariants>;
  *   (`ProjectRepository.pmRoutingToken`), and a card claiming none or two is
  *   refused at ingress rather than enqueued. `undefined` only for a row written
  *   before that — the default entry, exactly as it ran then.
- * - `resolve-problem` — the failed run's own repository, or a stuck ticket's slot
- *   repository, copied onto the job when the dispatch was scheduled (issues #1395,
- *   #1425).
+ * - `resolve-problem` — the failed run's own repository, a stuck ticket's slot
+ *   repository, or a red head's pull-request repository, copied onto the job when
+ *   the dispatch was scheduled (issues #1395, #1425, #1459).
  * - `worker-update` — none, stated rather than defaulted (see the case below).
  *
  * One `switch` exhaustive over the discriminator rather than a lookup with a

@@ -541,6 +541,12 @@ export async function claimApprovedHeadChecksRerun(key: ReviewVerdictKey): Promi
 export interface ApprovedHeadSlot {
 	/** When SWARM re-ran this head's failed checks, or `null` while that re-run is unspent. */
 	checksRerunAt: Date | null;
+	/**
+	 * When SWARM handed this head to the operator ("Approved head needs the
+	 * operator"), or `null` while it has not — read by Resolve problem's red-head leg
+	 * (issue #1459), which leaves a head already handed off alone.
+	 */
+	operatorNotifiedAt: Date | null;
 }
 
 /** This head's `submitted` `approve` slot, or `undefined` when the head was not approved. */
@@ -548,7 +554,10 @@ export async function getApprovedHeadSlot(
 	key: ReviewVerdictKey,
 ): Promise<ApprovedHeadSlot | undefined> {
 	const rows = await getDb()
-		.select({ checksRerunAt: reviewVerdicts.checksRerunAt })
+		.select({
+			checksRerunAt: reviewVerdicts.checksRerunAt,
+			operatorNotifiedAt: reviewVerdicts.operatorNotifiedAt,
+		})
 		.from(reviewVerdicts)
 		.where(submittedApprovalOf(key))
 		.limit(1);

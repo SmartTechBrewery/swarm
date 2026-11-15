@@ -1834,7 +1834,9 @@ Each reason is in scope or excluded (`src/dispatch/resolve-problem-scope.ts`):
 - **Plan awaiting greenlight** — excluded. The plan waits for the operator's
   greenlight, a deliberate human gate.
 - **Approved, awaiting merge** — excluded. The approved pull request waits for a
-  person to merge it, a deliberate human gate.
+  person to merge it, a deliberate human gate. An approved pull request whose
+  merge was refused only because its checks are red, on a repository with
+  `autoMerge` on, is not a person's gate: the red-head leg below takes it on.
 
 A ticket is attempted once it has waited at least the same ten minutes since it
 last moved. It gets **one attempt per stuck situation**: the situation is its
@@ -1849,6 +1851,54 @@ and that run must not have been cancelled by an operator. Otherwise the attempt 
 skipped. A run attempt is re-checked the same way: it is skipped once the run is no
 longer `failed` or an operator cancelled it. If no SWARM tool can move the ticket, the agent
 reports it `unresolved` and says what the person should do.
+
+**Red pull-request heads (issue #1459).** A third leg catches an **open SWARM
+pull request whose current head has red checks while nothing in SWARM acts on
+it** — the shape where every run on the pull request is `completed` (typically a
+Respond to CI that settled `no-fix` on a head merge automation brought up to date),
+so neither leg above sees it: the WIP panel calls it settling for two hours, and an
+approval would rest it as "Approved, awaiting merge" for good. The leg
+(`src/dispatch/resolve-problem-red-head.ts`, run every 10 minutes on its own
+interval because it reads the source-control provider) dispatches one attempt for
+a pull request when all of these hold:
+
+- its project has the phase turned on, and its latest run is `completed` (a
+  `failed` one is the two legs above's), is not a review-cap stop, settled at
+  least **10 minutes ago** and less than 24 hours ago;
+- nothing is acting on it: no run is running and no dispatch is waiting for the
+  pull request (Resolve problem's own do not count), and it was not merged;
+- the provider reports the pull request open and its current head's checks red —
+  failed or cancelled. A check still running, a re-run in progress included, is
+  not red;
+- SWARM has not already handed that head to the operator ("Approved head needs
+  the operator"), and none of SWARM's automatic check re-runs on it is still
+  inside its two-minute settle window;
+- the head is not an approval waiting for a person to merge it on a repository
+  without `autoMerge`. Approved heads with `autoMerge` on, and heads not yet
+  approved, both count.
+
+So the worst case from going quiet to an attempt is about 20 minutes, not two
+hours. The dispatch is deduplicated on the head
+(`resolve-problem:red-head:<project>:<repository>:<pr>:<headSha>`): one attempt per
+head, two sweeps running at once create one, and a new head is a new situation.
+The attempt is anchored to the pull request's latest run, so the Waiting on you
+leg does not dispatch a second one for the same situation later. When it is
+claimed, the pull request is read again: it must still be open, on the same head,
+red, and not handed off, and its latest run must not be cancelled or being reset.
+The agent is told no SWARM tool re-runs checks, so `unresolved` — with what a
+person should do, e.g. re-run the failed job — is the expected outcome when
+nothing can move the pull request. It never overrides a deliberate stop.
+
+**Counting them.** Every red-head attempt must record its occurrence on the one
+bug report titled **"Open pull request left on a red head with nothing acting on
+it"** — adding to the oldest report with that title, or creating it the first
+time. SWARM checks the title and fails the attempt otherwise. So
+`bug_reports_list` with `query` set to that title shows how often it happened
+(`occurrenceCount`) and over what period (`firstSeenAt`, `lastSeenAt`), and
+`bug_report_get` lists each occurrence's repository, pull request and a note
+naming the head, the failing checks, what SWARM last did and why nothing
+followed. The count is per project: a run's credential sees only its own
+project's reports.
 
 **Seeing the attempts (issue #1428).** A Waiting on you ticket in the **Tickets in
 progress** section shows the attempt on its current situation: queued, running,
