@@ -8,15 +8,23 @@
  * head (issue #1124) and leaves it to Respond-to-CI; Respond-to-CI already
  * declined; the `no-fix` hand-back's Review met a slot already `submitted` and
  * dropped as a same-head retry. The card sat in **In review** with nothing
- * scheduled and nothing said. So SWARM now re-runs the failed checks itself,
- * **once**, through `SCMProvider.rerunFailedChecks`:
+ * scheduled and nothing said. So SWARM now re-runs the failed checks itself
+ * through `SCMProvider.rerunFailedChecks` — up to {@link MAX_APPROVED_HEAD_RERUNS}
+ * times, spaced by a growing delay ({@link APPROVED_HEAD_RERUN_GAPS_MS}: the
+ * requests land at about 0, +15 and +45 minutes, issue #1463), because an
+ * environmental failure (a runner image, a flaky service) often needs longer to
+ * clear than one immediate re-run gives it:
  *
  *  - if they pass, the green `checks` event re-arms the merge (issue #1128 phase
  *    1, `rearmMergeAutomationForGreenHead`), which re-reads the checks and merges
  *    — no merge ever happens here, so merge automation still never merges a red
  *    or pending head;
- *  - if they fail again, or the provider cannot re-run them, SWARM hands the head
- *    to the operator once — so does a head with no operator to re-run them as,
+ *  - if they fail again before the last re-run, the head waits for the next one
+ *    (`rerun-waiting`); the `pr-review` trigger re-reads it when it falls due, on
+ *    the coalesced recheck that does not draw the CI-wait budget;
+ *  - if the last re-run fails too, or the provider cannot re-run them at all,
+ *    SWARM hands the head to the operator once — so does a head with no operator
+ *    to re-run them as,
  *    since the re-run is a write made for the pull request's author with the stored
  *    credential of the operator whose worker produced it (issue #1249). The
  *    hand-off is one durable `failed` Respond-to-CI run (the
@@ -29,11 +37,15 @@
  * approved head — `src/triggers/handlers/review.ts`) and merge automation (a
  * Review that approved an adjudicated red head, then the merge refusing it —
  * `src/worker/merge-automation.ts`). Whichever reaches the head first spends the
- * re-run; the other finds it spent.
+ * attempt that is due; the other finds it spent.
  *
  * **Bounded by construction**, so a check that stays red cannot spin:
- *  - one re-run per approved head — `review_verdicts.checks_rerun_at`, claimed by
- *    a conditional update ({@link claimApprovedHeadChecksRerun});
+ *  - at most {@link MAX_APPROVED_HEAD_RERUNS} re-runs per approved head —
+ *    `review_verdicts.checks_rerun_attempts`, spent by a compare-and-swap
+ *    conditional update on the count ({@link claimApprovedHeadChecksRerun}), so
+ *    concurrent callers that read the same count spend that attempt once;
+ *  - spaced — an attempt is not claimed before its gap from the previous request
+ *    (`review_verdicts.checks_rerun_at`) has passed;
  *  - one operator notice per head — `review_verdicts.operator_notified_at`, the
  *    same way ({@link claimApprovedHeadOperatorNotice});
  *  - one `no-fix` recovery per head — that module's own dedup key, which is also
@@ -49,6 +61,7 @@
 
 import type { ProjectConfig } from '../config/schema.js';
 import {
+	type ApprovedHeadSlot,
 	claimApprovedHeadChecksRerun,
 	claimApprovedHeadOperatorNotice,
 	getApprovedHeadSlot,
@@ -96,21 +109,103 @@ export const RERUN_SETTLE_MS = 2 * 60 * 1000;
 export const RERUN_SETTLE_RECHECK_DELAY_MS = RERUN_SETTLE_MS + 15_000;
 
 /**
+ * The wait before each automatic re-run of an adjudicated red approved head
+ * (issue #1463), indexed by the re-runs already spent and measured from the
+ * previous re-run's request (`review_verdicts.checks_rerun_at`, the only durable
+ * instant): the first is immediate, and the requests land at about 0, +15 and +45
+ * minutes. A re-run whose CI takes longer than the next gap is followed as soon as
+ * its red arrives — the spacing exists to let transient state clear, and that much
+ * time has passed anyway. Coded rather than configured, on {@link RERUN_SETTLE_MS}'s
+ * precedent.
+ */
+export const APPROVED_HEAD_RERUN_GAPS_MS = [0, 15 * 60 * 1000, 30 * 60 * 1000] as const;
+
+/**
+ * How many times SWARM re-runs an adjudicated red approved head's failed checks
+ * before handing it to the operator (issue #1463). Derived from
+ * {@link APPROVED_HEAD_RERUN_GAPS_MS}, so the schedule and the bound cannot
+ * disagree.
+ */
+export const MAX_APPROVED_HEAD_RERUNS = APPROVED_HEAD_RERUN_GAPS_MS.length;
+
+/**
+ * How far past a re-run's due instant a caller re-reads a `rerun-waiting` head —
+ * the {@link RERUN_SETTLE_RECHECK_DELAY_MS} margin, so the re-read never lands a
+ * moment before the attempt falls due and waits again.
+ */
+export const RERUN_DUE_RECHECK_MARGIN_MS = 15_000;
+
+/** The two durable facts the spacing reads off an approved head's slot. */
+type RerunSchedule = Pick<ApprovedHeadSlot, 'checksRerunAt' | 'checksRerunAttempts'>;
+
+/**
+ * When this approved head's next automatic re-run falls due, or `null` once every
+ * one is spent. The first is due at once (the epoch); a later one its gap after
+ * the previous request — or at once when, defensively, a spent attempt carries no
+ * stamp to measure from.
+ */
+export function nextApprovedHeadRerunDueAt(slot: RerunSchedule): Date | null {
+	const attempts = slot.checksRerunAttempts;
+	if (attempts >= MAX_APPROVED_HEAD_RERUNS) return null;
+	if (attempts === 0 || !slot.checksRerunAt) return new Date(0);
+	return new Date(slot.checksRerunAt.getTime() + APPROVED_HEAD_RERUN_GAPS_MS[attempts]);
+}
+
+/**
+ * Whether SWARM is still acting on this approved head's red through its automatic
+ * re-runs at `now` — read by Resolve problem's red-head leg (issue #1459), so the
+ * sweep and this policy cannot disagree about it: the latest re-run is still
+ * inside {@link RERUN_SETTLE_MS}, or a re-run is spent, another is still to come,
+ * the operator has not been handed the head, and the next is not yet past its due
+ * instant by more than {@link RERUN_SETTLE_RECHECK_DELAY_MS} — the grace the
+ * `pr-review` trigger's scheduled re-read needs to fire and spend it. Past that
+ * grace the head no longer counts as acted on, so a lost re-read cannot hide a
+ * red head from the sweep for good.
+ */
+export function approvedHeadRerunInFlight(
+	slot: RerunSchedule & Pick<ApprovedHeadSlot, 'operatorNotifiedAt'>,
+	now: Date,
+): boolean {
+	const at = slot.checksRerunAt;
+	if (slot.checksRerunAttempts > 0 && at && now.getTime() - at.getTime() < RERUN_SETTLE_MS) {
+		return true;
+	}
+	if (slot.checksRerunAttempts < 1 || slot.operatorNotifiedAt) return false;
+	const dueAt = nextApprovedHeadRerunDueAt(slot);
+	return dueAt !== null && now.getTime() < dueAt.getTime() + RERUN_SETTLE_RECHECK_DELAY_MS;
+}
+
+/**
  * What {@link recoverAdjudicatedApprovedHead} did:
- *  - `rerun-requested` — this call spent the head's one re-run and the provider
- *    accepted it; the re-run's own `checks` event decides what happens next;
- *  - `rerun-settling` — the re-run was requested within {@link RERUN_SETTLE_MS},
- *    so a red read now may still be the state from before it;
- *  - `needs-operator` — the re-run failed again, or could not be made; the
- *    once-only notice has been written (or already was);
+ *  - `rerun-requested` — this call spent the attempt that was due and the
+ *    provider accepted it; the re-run's own `checks` event decides what happens
+ *    next;
+ *  - `rerun-settling` — a re-run was requested within {@link RERUN_SETTLE_MS} (or
+ *    another caller spent this attempt a moment ago), so a red read now may still
+ *    be the state from before it;
+ *  - `rerun-waiting` — a re-run failed again, and the next one is not due yet;
+ *  - `needs-operator` — the last re-run failed again, or one could not be made;
+ *    the once-only notice has been written (or already was);
  *  - `not-applicable` — merge automation is off for the repository, or the head
  *    has no submitted approval, so the policy does not apply.
  */
 export type AdjudicatedApprovedHeadOutcome =
 	| 'rerun-requested'
 	| 'rerun-settling'
+	| 'rerun-waiting'
 	| 'needs-operator'
 	| 'not-applicable';
+
+/** {@link recoverAdjudicatedApprovedHead}'s answer: what it did, and when to look again. */
+export interface AdjudicatedApprovedHeadDecision {
+	outcome: AdjudicatedApprovedHeadOutcome;
+	/**
+	 * Set on `rerun-settling` and `rerun-waiting`: how long the caller waits before
+	 * re-reading the head, so the re-read is decided off the re-run's verdict, or
+	 * spends the attempt that has fallen due.
+	 */
+	recheckAfterMs?: number;
+}
 
 export interface RecoverAdjudicatedApprovedHeadInput {
 	project: ProjectConfig;
@@ -129,19 +224,29 @@ export interface RecoverAdjudicatedApprovedHeadInput {
 	jobPayload?: SwarmJob;
 }
 
+const NOT_APPLICABLE: AdjudicatedApprovedHeadDecision = { outcome: 'not-applicable' };
+const NEEDS_OPERATOR: AdjudicatedApprovedHeadDecision = { outcome: 'needs-operator' };
+const SETTLING: AdjudicatedApprovedHeadDecision = {
+	outcome: 'rerun-settling',
+	recheckAfterMs: RERUN_SETTLE_RECHECK_DELAY_MS,
+};
+
 /**
  * Apply the adjudicated-approved-head policy to one red read. See the module
- * header for the bounds. Never throws: a database error answers `not-applicable`
- * (logged), which leaves each caller on its pre-#1128 behaviour rather than
- * spending a re-run or a notice it could not record — the `pr-review` trigger
- * routes the red on to the base-branch attribution and Respond-to-CI, and merge
- * automation refuses the red head as before.
+ * header for the bounds. Reads the head's slot, then — only when an attempt is
+ * due — spends it by a compare-and-swap on the count it read, so a concurrent
+ * caller that read the same count loses the claim and settles instead. Never
+ * throws: a database error answers `not-applicable` (logged), which leaves each
+ * caller on its pre-#1128 behaviour rather than spending a re-run or a notice it
+ * could not record — the `pr-review` trigger routes the red on to the base-branch
+ * attribution and Respond-to-CI, and merge automation refuses the red head as
+ * before.
  */
 export async function recoverAdjudicatedApprovedHead(
 	input: RecoverAdjudicatedApprovedHeadInput,
-): Promise<AdjudicatedApprovedHeadOutcome> {
+): Promise<AdjudicatedApprovedHeadDecision> {
 	const { project, prNumber, headSha } = input;
-	if (project.autoMerge !== true) return 'not-applicable';
+	if (project.autoMerge !== true) return NOT_APPLICABLE;
 	const key: ReviewVerdictKey = {
 		projectId: project.id,
 		repository: project.repo,
@@ -149,48 +254,109 @@ export async function recoverAdjudicatedApprovedHead(
 		headSha,
 	};
 
-	let claimed: boolean;
-	let checksRerunAt: Date | null = null;
+	let slot: ApprovedHeadSlot | undefined;
 	try {
-		claimed = await claimApprovedHeadChecksRerun(key);
-		if (!claimed) {
-			const slot = await getApprovedHeadSlot(key);
-			if (!slot) return 'not-applicable';
-			checksRerunAt = slot.checksRerunAt;
-		}
+		slot = await getApprovedHeadSlot(key);
 	} catch (err) {
-		logger.error('approved head: could not read or claim its checks re-run — leaving it', {
+		logger.error('approved head: could not read its checks re-runs — leaving it', {
 			prNumber,
 			headSha,
 			error: describeError(err),
 		});
-		return 'not-applicable';
+		return NOT_APPLICABLE;
+	}
+	if (!slot) return NOT_APPLICABLE;
+	// Already handed off: every later red finds the notice written and writes nothing.
+	if (slot.operatorNotifiedAt) return NEEDS_OPERATOR;
+
+	const attempts = slot.checksRerunAttempts;
+	const now = Date.now();
+	if (attempts > 0 && slot.checksRerunAt) {
+		const sinceRerunMs = now - slot.checksRerunAt.getTime();
+		if (sinceRerunMs < RERUN_SETTLE_MS) {
+			logger.debug('approved head: re-run requested moments ago — letting it settle', {
+				prNumber,
+				headSha,
+				attempt: attempts,
+				sinceRerunMs,
+			});
+			return SETTLING;
+		}
 	}
 
-	if (claimed) return requestRerun(input, key);
-
-	// The claim lost to an earlier caller, so the re-run is spent. A stamp is always
-	// present on a spent re-run; a null one would be a slot approved between the
-	// two reads, which is the first call's to make, not this one's.
-	if (!checksRerunAt) return 'not-applicable';
-	const sinceRerunMs = Date.now() - checksRerunAt.getTime();
-	if (sinceRerunMs < RERUN_SETTLE_MS) {
-		logger.debug('approved head: re-run requested moments ago — letting it settle', {
+	const dueAt = nextApprovedHeadRerunDueAt(slot);
+	if (!dueAt) {
+		await handToOperator(input, key, exhaustedReruns());
+		return NEEDS_OPERATOR;
+	}
+	if (now < dueAt.getTime()) {
+		logger.info('approved head: re-run failed again — waiting for the next one', {
 			prNumber,
 			headSha,
-			sinceRerunMs,
+			nextAttempt: attempts + 1,
+			maxAttempts: MAX_APPROVED_HEAD_RERUNS,
+			dueAt: dueAt.toISOString(),
 		});
-		return 'rerun-settling';
+		return {
+			outcome: 'rerun-waiting',
+			recheckAfterMs: dueAt.getTime() - now + RERUN_DUE_RECHECK_MARGIN_MS,
+		};
 	}
-	await handToOperator(input, key, 'SWARM re-ran the failing checks once, and they failed again.');
-	return 'needs-operator';
+
+	let claimed: boolean;
+	try {
+		claimed = await claimApprovedHeadChecksRerun(key, attempts, MAX_APPROVED_HEAD_RERUNS);
+	} catch (err) {
+		logger.error('approved head: could not claim its checks re-run — leaving it', {
+			prNumber,
+			headSha,
+			error: describeError(err),
+		});
+		return NOT_APPLICABLE;
+	}
+	if (!claimed) {
+		// Another caller that read the same count spent this attempt moments ago.
+		logger.debug('approved head: this re-run was just spent by another caller', {
+			prNumber,
+			headSha,
+			attempt: attempts + 1,
+		});
+		return SETTLING;
+	}
+	return requestRerun(input, key, attempts + 1);
 }
 
-/** Spend the head's one re-run — the claim is already taken — and act on the provider's answer. */
+/** The hand-off's account of the re-runs when every one of them failed. */
+function exhaustedReruns(): string {
+	const spanMinutes = Math.round(
+		APPROVED_HEAD_RERUN_GAPS_MS.reduce((total, gap) => total + gap, 0) / 60_000,
+	);
+	return (
+		`SWARM re-ran the failing checks ${MAX_APPROVED_HEAD_RERUNS} times over at least ` +
+		`${spanMinutes} minutes, and they failed every time.`
+	);
+}
+
+/** The hand-off's account of a re-run that could not be made, naming the ones before it. */
+function couldNotRerun(attempt: number, reason: string): string {
+	if (attempt <= 1) return `SWARM could not re-run the failing checks: ${reason}.`;
+	const spent = attempt - 1;
+	return (
+		`SWARM re-ran the failing checks ${spent === 1 ? 'once' : `${spent} times`} and they ` +
+		`failed again, then could not re-run them again: ${reason}.`
+	);
+}
+
+/**
+ * Make re-run `attempt` — its claim is already taken — and act on the provider's
+ * answer. A re-run the provider refuses, or one with no operator to make it as,
+ * hands the head off at once, on any attempt: waiting would only fail the same way.
+ */
 async function requestRerun(
 	input: RecoverAdjudicatedApprovedHeadInput,
 	key: ReviewVerdictKey,
-): Promise<AdjudicatedApprovedHeadOutcome> {
+	attempt: number,
+): Promise<AdjudicatedApprovedHeadDecision> {
 	const { project, scm, prNumber, headSha } = input;
 	let outcome: RerunFailedChecksOutcome;
 	try {
@@ -204,12 +370,8 @@ async function requestRerun(
 		});
 	} catch (err) {
 		if (err instanceof PullRequestOperatorUnavailableError) {
-			await handToOperator(
-				input,
-				key,
-				`SWARM could not re-run the failing checks: ${err.message}.`,
-			);
-			return 'needs-operator';
+			await handToOperator(input, key, couldNotRerun(attempt, err.message));
+			return NEEDS_OPERATOR;
 		}
 		// The contract never throws; this keeps a provider that does from escaping.
 		outcome = { status: 'provider-error', message: describeError(err) };
@@ -224,18 +386,16 @@ async function requestRerun(
 		logger.info("approved head: re-ran the checks SWARM's CI agent judged unrelated", {
 			prNumber,
 			headSha,
+			attempt,
+			maxAttempts: MAX_APPROVED_HEAD_RERUNS,
 			failedChecks: input.failedChecks,
 			rerunChecks: outcome.checks,
 		});
-		return 'rerun-requested';
+		return { outcome: 'rerun-requested' };
 	}
 
-	await handToOperator(
-		input,
-		key,
-		`SWARM could not re-run the failing checks: ${describeRerunRefusal(outcome)}.`,
-	);
-	return 'needs-operator';
+	await handToOperator(input, key, couldNotRerun(attempt, describeRerunRefusal(outcome)));
+	return NEEDS_OPERATOR;
 }
 
 function describeRerunRefusal(
@@ -271,7 +431,7 @@ async function handToOperator(
 		});
 		return;
 	}
-	logger.warn('approved head: red after its one re-run — handing it to the operator', {
+	logger.warn('approved head: red after its re-runs — handing it to the operator', {
 		...context,
 		rerun,
 	});

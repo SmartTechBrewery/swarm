@@ -135,16 +135,17 @@
  * reuses the held claim, and a delayed ordinary completed-check event for the
  * same head is locked out of starting a second CI fix.
  *
- * **An adjudicated red on an approved head is re-run once, not re-fixed** (issue
+ * **An adjudicated red on an approved head is re-run, not re-fixed** (issue
  * #1128). When the head the CI agent declined is one this PR already approved —
  * the hand-back's Review meets a slot already `submitted` `approve` (approve, then
  * red, then `no-fix`), or an ordinary red event meets an approved head with a
  * recorded `no-fix` recovery (`no-fix`, then the approving Review, then a red
  * re-read) — the head goes to `recoverAdjudicatedApprovedHead`
  * (`src/dispatch/approved-head-checks-rerun.ts`) instead of Review or
- * Respond-to-CI. That re-runs the failed checks once per approved head; a re-run
- * that passes re-arms the merge below, and one that fails again (or cannot be
- * made) leaves a once-only operator notice. The ordinary-red form is decided in
+ * Respond-to-CI. That re-runs the failed checks up to three times per approved
+ * head, spaced out (issue #1463); a re-run that passes re-arms the merge below,
+ * and the last one failing again (or one that cannot be made) leaves a once-only
+ * operator notice. The ordinary-red form is decided in
  * `resolveAggregateCheckReview`, before `blocked-by-base` and so before the
  * PR+SHA claim, so no claim, fix attempt or slot is consumed — which is what
  * guarantees an adjudicated approved head never routes back to Respond-to-CI. It
@@ -1014,7 +1015,7 @@ async function isAdjudicatedApprovedHead(
 const ADJUDICATED_RED_OUTCOMES: Record<'rerun-requested' | 'needs-operator', string> = {
 	'rerun-requested': 'it re-ran them, and that re-run decides what happens next',
 	'needs-operator':
-		'its one re-run already failed again or could not be made, so the pull request needs an operator',
+		'its re-runs already failed again or one could not be made, so the pull request needs an operator',
 };
 
 /**
@@ -1024,10 +1025,13 @@ const ADJUDICATED_RED_OUTCOMES: Record<'rerun-requested' | 'needs-operator', str
  * re-run's own `checks` event must still be decidable. A re-run requested moments
  * ago (`rerun-settling`) is re-read once the settle window has passed, so the
  * head is decided off the re-run's verdict rather than a lagging read of the
- * state before it ({@link scheduleRerunSettleRecheck}).
+ * state before it; a head whose next re-run is not due yet (`rerun-waiting`,
+ * issue #1463) is re-read when it falls due, which is what spends it. Both waits
+ * use {@link scheduleRerunSettleRecheck} with the delay the policy returned.
  *
  * Returns `false` only when the policy answered `not-applicable` — it did
- * nothing — so the ordinary-red caller can fall open to its pre-#1128 routing.
+ * nothing — so the ordinary-red caller can fall open to its pre-#1128 routing,
+ * and a waiting head never reaches Respond-to-CI.
  */
 async function handleAdjudicatedRed(
 	ctx: ScmTriggerContext,
@@ -1035,7 +1039,7 @@ async function handleAdjudicatedRed(
 	headSha: string,
 	failedChecks: string[],
 ): Promise<boolean> {
-	const outcome = await recoverAdjudicatedApprovedHead({
+	const { outcome, recheckAfterMs } = await recoverAdjudicatedApprovedHead({
 		project: ctx.project,
 		scm: ctx.scm,
 		prNumber,
@@ -1049,8 +1053,8 @@ async function handleAdjudicatedRed(
 		failedChecks,
 		outcome,
 	});
-	if (outcome === 'rerun-settling') {
-		await scheduleRerunSettleRecheck(ctx, prNumber, headSha, failedChecks);
+	if (outcome === 'rerun-settling' || outcome === 'rerun-waiting') {
+		await scheduleRerunSettleRecheck(ctx, prNumber, headSha, failedChecks, recheckAfterMs);
 	} else if (outcome !== 'not-applicable') {
 		noteSkip(
 			ctx,
@@ -1107,19 +1111,24 @@ async function handleUpdatedHeadRed(
 /**
  * Re-read a `rerun-settling` head once the settle window has passed, on the
  * aggregate-check recheck's coalesce key — for either re-run policy: the
- * adjudicated approved head's (issue #1128) and the updated head's (issue #1433). Deliberately **not**
- * {@link scheduleReviewRecheck}: the wait is a fixed provider-lag guard, not CI
- * still running, so it neither draws nor advances the `state-pending` budget — a
- * short `reviewChecksWaitMinutes` would otherwise run out inside the window and
- * end the head as an abandoned Review instead of the policy's own verdict. Bounded
- * by construction: the re-read lands past the window, where the policy answers off
- * the re-run's verdict and never settles again.
+ * adjudicated approved head's (issue #1128) and the updated head's (issue #1433).
+ * Also re-reads an adjudicated approved head whose next spaced re-run is not due
+ * yet (`rerun-waiting`, issue #1463) once it falls due, `delayMs` being the wait
+ * the policy returned. Deliberately **not** {@link scheduleReviewRecheck}: the
+ * wait is a provider-lag guard or a re-run's spacing, not CI still running, so it
+ * neither draws nor advances the `state-pending` budget — a short
+ * `reviewChecksWaitMinutes` would otherwise run out inside the window and end the
+ * head as an abandoned Review instead of the policy's own verdict. A later
+ * schedule on the key supersedes an earlier one. Bounded by construction: the
+ * re-read lands past the window or the due instant, where the policy answers off
+ * the re-run's verdict or spends the attempt, and the attempts are bounded.
  */
 async function scheduleRerunSettleRecheck(
 	ctx: ScmTriggerContext,
 	prNumber: string,
 	headSha: string,
 	failedChecks: string[],
+	delayMs: number = RERUN_SETTLE_RECHECK_DELAY_MS,
 ): Promise<void> {
 	const recheckAttempt = ctx.recheckAttempt ?? 0;
 	await scheduleCoalescedDispatch(
@@ -1128,23 +1137,23 @@ async function scheduleRerunSettleRecheck(
 			...(recheckAttempt > 0 ? { recheckAttempt } : {}),
 		},
 		checkRecheckCoalesceKey(ctx.project.repo, prNumber, headSha),
-		RERUN_SETTLE_RECHECK_DELAY_MS,
+		delayMs,
 		'recheck',
 	);
-	const delaySec = Math.round(RERUN_SETTLE_RECHECK_DELAY_MS / 1000);
+	const delaySec = Math.round(delayMs / 1000);
 	ctx.noteDecline?.({
 		kind: 'recheck-scheduled',
 		reason:
-			`Waiting for the re-run of the failing checks on pull request #${prNumber} at head ` +
-			`'${headSha}' to report. SWARM re-checks in ${describeWait(delaySec)}.` +
-			" This phase's disposition did not change.",
+			`Waiting on SWARM's re-run of the failing checks on pull request #${prNumber} at head ` +
+			`'${headSha}' — for it to report, or for the next one to fall due. SWARM re-checks in ` +
+			`${describeWait(delaySec)}. This phase's disposition did not change.`,
 		retryAfterSec: delaySec,
 	});
-	logger.debug('review: checks re-run settling — re-checking after the settle window', {
+	logger.debug('review: checks re-run settling or spaced — re-checking after the wait', {
 		prNumber,
 		headSha,
 		failedChecks,
-		delayMs: RERUN_SETTLE_RECHECK_DELAY_MS,
+		delayMs,
 	});
 }
 

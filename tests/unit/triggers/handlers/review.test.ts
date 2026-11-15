@@ -314,7 +314,7 @@ beforeEach(() => {
 	hasCiNoFixRecovery.mockReset();
 	hasCiNoFixRecovery.mockResolvedValue(false);
 	recoverAdjudicatedApprovedHead.mockReset();
-	recoverAdjudicatedApprovedHead.mockResolvedValue('rerun-requested');
+	recoverAdjudicatedApprovedHead.mockResolvedValue({ outcome: 'rerun-requested' });
 	getPullRequest.mockReset();
 	// `issue-42` matches `createMockProjectConfig()`'s `branchPrefix`, so the
 	// ownership gate resolves this PR to work item 42. `authorLogin` is a plain
@@ -2886,7 +2886,10 @@ describe('review trigger — a red on an adjudicated approved head (issue #1128)
 	// of that budget: the attempt count rides through untouched.
 	it('re-reads a settling re-run after the settle window, off the CI-wait budget', async () => {
 		adjudicatedAndApproved();
-		recoverAdjudicatedApprovedHead.mockResolvedValue('rerun-settling');
+		recoverAdjudicatedApprovedHead.mockResolvedValue({
+			outcome: 'rerun-settling',
+			recheckAfterMs: 135_000,
+		});
 		const noteDecline = vi.fn();
 
 		expect(await handler.handle(autoCtx({ recheckAttempt: 3, noteDecline }))).toBeNull();
@@ -2907,7 +2910,10 @@ describe('review trigger — a red on an adjudicated approved head (issue #1128)
 	// Review: the settle recheck still lands, and its read hands the head on.
 	it('still re-reads a settling re-run when the CI-wait budget is already spent', async () => {
 		adjudicatedAndApproved();
-		recoverAdjudicatedApprovedHead.mockResolvedValue('rerun-settling');
+		recoverAdjudicatedApprovedHead.mockResolvedValue({
+			outcome: 'rerun-settling',
+			recheckAfterMs: 135_000,
+		});
 		const shortWait = createMockProjectConfig({ autoMerge: true, reviewChecksWaitMinutes: 1 });
 
 		expect(await handler.handle(ctx(checks, { project: shortWait, recheckAttempt: 2 }))).toBeNull();
@@ -2917,9 +2923,62 @@ describe('review trigger — a red on an adjudicated approved head (issue #1128)
 		expect(createFailedRun).not.toHaveBeenCalled();
 	});
 
+	// Issue #1463: a re-run failed again before the next one is due. The head is
+	// re-read when it falls due — the delay the policy returned, off the CI-wait
+	// budget — and never reaches Respond-to-CI meanwhile.
+	it('re-reads a head waiting for its next spaced re-run when it falls due', async () => {
+		adjudicatedAndApproved();
+		recoverAdjudicatedApprovedHead.mockResolvedValue({
+			outcome: 'rerun-waiting',
+			recheckAfterMs: 615_000,
+		});
+		const noteDecline = vi.fn();
+
+		expect(await handler.handle(autoCtx({ recheckAttempt: 1, noteDecline }))).toBeNull();
+
+		expect(scheduleCoalescedJob).toHaveBeenCalledTimes(1);
+		const [job, , delayMs, waitReason] = scheduleCoalescedJob.mock.calls[0];
+		expect(job).toMatchObject({ recheckAttempt: 1 });
+		expect(delayMs).toBe(615_000);
+		expect(waitReason).toBe('recheck');
+		expect(noteDecline).toHaveBeenCalledWith(
+			expect.objectContaining({ kind: 'recheck-scheduled', retryAfterSec: 615 }),
+		);
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+		expect(createFailedRun).not.toHaveBeenCalled();
+	});
+
+	// Issue #1463: a re-run that passes before the last one is spent merges through
+	// the existing green re-arm — the policy is never consulted on a green head.
+	it('re-arms the merge on a green head with re-runs still outstanding', async () => {
+		adjudicatedAndApproved();
+		getApprovedHeadSlot.mockResolvedValue({
+			checksRerunAt: new Date(),
+			checksRerunAttempts: 1,
+			operatorNotifiedAt: null,
+		});
+		getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'success']]));
+		reserveReviewVerdict.mockResolvedValue({
+			status: 'reused',
+			id: 'v1',
+			ordinal: 1,
+			state: 'submitted',
+		});
+
+		expect(await handler.handle(autoCtx())).toBeNull();
+
+		expect(recoverAdjudicatedApprovedHead).not.toHaveBeenCalled();
+		expect(rearmMergeAutomationForGreenHead).toHaveBeenCalledExactlyOnceWith({
+			project: AUTO_MERGE,
+			prNumber: '9',
+			headSha: 'cafe',
+		});
+	});
+
 	it('drops the event once the head is handed to the operator', async () => {
 		adjudicatedAndApproved();
-		recoverAdjudicatedApprovedHead.mockResolvedValue('needs-operator');
+		recoverAdjudicatedApprovedHead.mockResolvedValue({ outcome: 'needs-operator' });
 
 		expect(await handler.handle(autoCtx())).toBeNull();
 		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
@@ -2953,7 +3012,7 @@ describe('review trigger — a red on an adjudicated approved head (issue #1128)
 	// the red falls open to the routing it would have had without #1128.
 	it('falls open to Respond-to-CI when the policy answers not-applicable', async () => {
 		adjudicatedAndApproved();
-		recoverAdjudicatedApprovedHead.mockResolvedValue('not-applicable');
+		recoverAdjudicatedApprovedHead.mockResolvedValue({ outcome: 'not-applicable' });
 
 		expect(await handler.handle(autoCtx())).toMatchObject({ phase: 'respond-to-ci' });
 		expect(recoverAdjudicatedApprovedHead).toHaveBeenCalledOnce();

@@ -748,16 +748,23 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			});
 		});
 
-		// Issue #1128: the bounds on an adjudicated red approved head — one automatic
-		// re-run and one operator notice, each only on a submitted approval.
-		describe('approved-head stamps (issue #1128)', () => {
+		// Issues #1128, #1463: the bounds on an adjudicated red approved head — a
+		// counted number of automatic re-runs and one operator notice, each only on a
+		// submitted approval.
+		describe('approved-head stamps (issues #1128, #1463)', () => {
+			const MAX = 3;
+
 			async function submit(headSha: string, verdict: string): Promise<void> {
 				await reserveReviewVerdict(key(headSha), owner);
 				await markReviewVerdictSubmitted(key(headSha), { verdict });
 			}
 
+			/** The first re-run's claim, with the count every caller reads off a fresh approval. */
+			const claimFirstRerun = (k: ReturnType<typeof key>) =>
+				claimApprovedHeadChecksRerun(k, 0, MAX);
+
 			it.each([
-				['claimApprovedHeadChecksRerun', claimApprovedHeadChecksRerun],
+				['claimApprovedHeadChecksRerun', claimFirstRerun],
 				['claimApprovedHeadOperatorNotice', claimApprovedHeadOperatorNotice],
 			] as const)('%s is exactly-once on a submitted approval', async (_name, claim) => {
 				await submit('sha-1', 'approve');
@@ -768,7 +775,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			});
 
 			it.each([
-				['claimApprovedHeadChecksRerun', claimApprovedHeadChecksRerun],
+				['claimApprovedHeadChecksRerun', claimFirstRerun],
 				['claimApprovedHeadOperatorNotice', claimApprovedHeadOperatorNotice],
 			] as const)('%s never stamps a slot that is not a submitted approval', async (_name, claim) => {
 				await submit('sha-changes', 'request-changes');
@@ -780,21 +787,50 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				expect(await claim(key('never-reserved'))).toBe(false);
 			});
 
+			it('spends each re-run once against the count it read, and never past the limit', async () => {
+				await submit('sha-1', 'approve');
+
+				for (let spent = 0; spent < MAX; spent++) {
+					// Concurrent callers that read the same count: exactly one spends it.
+					const results = await Promise.all([
+						claimApprovedHeadChecksRerun(key('sha-1'), spent, MAX),
+						claimApprovedHeadChecksRerun(key('sha-1'), spent, MAX),
+					]);
+					expect(results.filter(Boolean)).toHaveLength(1);
+					// A stale count loses.
+					expect(await claimApprovedHeadChecksRerun(key('sha-1'), spent, MAX)).toBe(false);
+					expect((await getApprovedHeadSlot(key('sha-1')))?.checksRerunAttempts).toBe(spent + 1);
+				}
+
+				// The budget is spent: no count, however it was read, re-runs the head again.
+				expect(await claimApprovedHeadChecksRerun(key('sha-1'), MAX, MAX)).toBe(false);
+			});
+
 			it('keeps the two stamps independent', async () => {
 				await submit('sha-1', 'approve');
 				expect(await claimApprovedHeadOperatorNotice(key('sha-1'))).toBe(true);
-				expect(await claimApprovedHeadChecksRerun(key('sha-1'))).toBe(true);
+				expect(await claimFirstRerun(key('sha-1'))).toBe(true);
 			});
 
-			it('getApprovedHeadSlot reads the two stamps of a submitted approval only', async () => {
+			it('getApprovedHeadSlot reads the stamps of a submitted approval only', async () => {
 				await submit('sha-1', 'approve');
 				expect(await getApprovedHeadSlot(key('sha-1'))).toEqual({
 					checksRerunAt: null,
+					checksRerunAttempts: 0,
 					operatorNotifiedAt: null,
 				});
 
-				await claimApprovedHeadChecksRerun(key('sha-1'));
-				expect((await getApprovedHeadSlot(key('sha-1')))?.checksRerunAt).toBeInstanceOf(Date);
+				await claimFirstRerun(key('sha-1'));
+				const first = await getApprovedHeadSlot(key('sha-1'));
+				expect(first?.checksRerunAt).toBeInstanceOf(Date);
+				expect(first?.checksRerunAttempts).toBe(1);
+				// The latest request is what the next re-run's spacing is measured from.
+				await claimApprovedHeadChecksRerun(key('sha-1'), 1, MAX);
+				const second = await getApprovedHeadSlot(key('sha-1'));
+				expect(second?.checksRerunAttempts).toBe(2);
+				expect(second?.checksRerunAt?.getTime()).toBeGreaterThanOrEqual(
+					first?.checksRerunAt?.getTime() ?? Number.POSITIVE_INFINITY,
+				);
 				// The operator hand-off Resolve problem's red-head leg leaves alone (issue #1459).
 				await claimApprovedHeadOperatorNotice(key('sha-1'));
 				expect((await getApprovedHeadSlot(key('sha-1')))?.operatorNotifiedAt).toBeInstanceOf(Date);

@@ -1871,8 +1871,11 @@ a pull request when all of these hold:
   failed or cancelled. A check still running, a re-run in progress included, is
   not red;
 - SWARM has not already handed that head to the operator ("Approved head needs
-  the operator"), and none of SWARM's automatic check re-runs on it is still
-  inside its two-minute settle window;
+  the operator"), none of SWARM's automatic check re-runs on it is still inside
+  its two-minute settle window, and no further approved-head re-run is still to
+  come. An approved head whose red SWARM's CI agent judged unrelated is re-run up
+  to 3 times, at about 0, +15 and +45 minutes, before that operator notice; it
+  counts as acted on until its next re-run is a couple of minutes overdue;
 - the head is not an approval waiting for a person to merge it on a repository
   without `autoMerge`. Approved heads with `autoMerge` on, and heads not yet
   approved, both count.
