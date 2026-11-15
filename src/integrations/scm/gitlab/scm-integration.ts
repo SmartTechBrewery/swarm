@@ -43,6 +43,7 @@ import {
 } from '../../../scm/pull-request-context.js';
 import type {
 	AggregateCheckStatus,
+	CheckAttemptRunner,
 	CommitPullRequest,
 	PullRequestDetails,
 	RerunFailedChecksOutcome,
@@ -443,6 +444,20 @@ export class GitLabSCMIntegration implements SCMProvider {
 		} catch (error) {
 			return { status: 'provider-error', message: errorMessage(error) };
 		}
+	}
+
+	/**
+	 * {@link SCMProvider.describeFailedCheckAttempts} for GitLab — a **declared**
+	 * `[]` for now (issue #1468). GitLab does report it: a pipeline's jobs listed with
+	 * `include_retried=true` carry every retry, each with its `runner.description`.
+	 * Reading that is a follow-up; until then the operator notice omits the runners.
+	 */
+	async describeFailedCheckAttempts(
+		_project: ProjectConfig,
+		_ref: string,
+		_persona?: ScmPersona,
+	): Promise<CheckAttemptRunner[]> {
+		return [];
 	}
 
 	/**

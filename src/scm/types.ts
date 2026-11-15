@@ -159,6 +159,20 @@ export type RerunFailedChecksOutcome =
 	| { status: 'provider-error'; message: string };
 
 /**
+ * One failed attempt of one check, and the runner (the machine or agent the
+ * provider ran it on) — what {@link SCMProvider.describeFailedCheckAttempts}
+ * answers, so an operator handed a red head can tell a broken runner from a broken
+ * check (issue #1468). `check` is the name {@link CheckRunState.name} reports;
+ * `attempt` is the provider's own 1-based attempt number; `runner` is `null` when
+ * the provider ran the attempt but did not say where.
+ */
+export interface CheckAttemptRunner {
+	check: string;
+	attempt: number;
+	runner: string | null;
+}
+
+/**
  * A pull request a commit belongs to — just enough to tie a CI event back to the
  * pull request it ran for (see {@link SCMProvider.listPullRequestsForCommit}).
  *
@@ -411,6 +425,23 @@ export interface SCMProvider extends ScmMergeProvider {
 		ref: string,
 		persona?: ScmPersona,
 	): Promise<RerunFailedChecksOutcome>;
+
+	/**
+	 * Every failed attempt of each failed check on `ref` (a commit SHA), oldest first,
+	 * with the runner each ran on — read once when an approved head that stayed red
+	 * through its re-runs is handed to the operator (issue #1468). Covers the same
+	 * checks {@link SCMProvider.getAggregateCheckStatus} reads.
+	 *
+	 * **Never throws**, and the answer is informational only: any failure comes back
+	 * as `[]`, and so does every attempt on a provider that does not report runners —
+	 * which declares that in its own implementation rather than stubbing the method.
+	 * Omitting `persona` reads as the **reviewer**, like the aggregate read.
+	 */
+	describeFailedCheckAttempts(
+		project: ProjectConfig,
+		ref: string,
+		persona?: ScmPersona,
+	): Promise<CheckAttemptRunner[]>;
 
 	/**
 	 * The pull requests commit `sha` belongs to — the ingress path's commit→pull

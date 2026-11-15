@@ -33,6 +33,7 @@ import type {
 } from '../../../scm/merge.js';
 import type {
 	AggregateCheckStatus,
+	CheckAttemptRunner,
 	CommitPullRequest,
 	PullRequestDetails,
 	RerunFailedChecksOutcome,
@@ -434,6 +435,20 @@ export class AzureDevOpsSCMIntegration implements SCMProvider {
 		} catch (error) {
 			return { status: 'provider-error', message: errorMessage(error) };
 		}
+	}
+
+	/**
+	 * {@link SCMProvider.describeFailedCheckAttempts} for Azure DevOps — a
+	 * **declared** `[]` for now (issue #1468). Azure does report it: a build's
+	 * timeline records carry the agent's `workerName` and their `previousAttempts`.
+	 * Reading that is a follow-up; until then the operator notice omits the runners.
+	 */
+	async describeFailedCheckAttempts(
+		_project: ProjectConfig,
+		_ref: string,
+		_persona?: ScmPersona,
+	): Promise<CheckAttemptRunner[]> {
+		return [];
 	}
 
 	/**

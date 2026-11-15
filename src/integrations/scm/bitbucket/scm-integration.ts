@@ -43,6 +43,7 @@ import {
 } from '../../../scm/pull-request-context.js';
 import type {
 	AggregateCheckStatus,
+	CheckAttemptRunner,
 	CommitPullRequest,
 	PullRequestDetails,
 	RerunFailedChecksOutcome,
@@ -423,6 +424,20 @@ export class BitbucketSCMIntegration implements SCMProvider {
 			status: 'unsupported',
 			message: `Bitbucket Cloud exposes no API for re-running the builds reported on commit ${ref} of ${project.repo}, so its failed checks cannot be re-run automatically`,
 		};
+	}
+
+	/**
+	 * {@link SCMProvider.describeFailedCheckAttempts} for Bitbucket — a **declared**
+	 * `[]`, not a gap (issue #1468). A Bitbucket build status carries no runner and no
+	 * attempt history, since whatever CI posted it is outside Bitbucket's API, so
+	 * there is nothing to read.
+	 */
+	async describeFailedCheckAttempts(
+		_project: ProjectConfig,
+		_ref: string,
+		_persona?: ScmPersona,
+	): Promise<CheckAttemptRunner[]> {
+		return [];
 	}
 
 	/**

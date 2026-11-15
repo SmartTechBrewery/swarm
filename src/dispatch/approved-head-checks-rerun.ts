@@ -23,8 +23,9 @@
  *    (`rerun-waiting`); the `pr-review` trigger re-reads it when it falls due, on
  *    the coalesced recheck that does not draw the CI-wait budget;
  *  - if the last re-run fails too, or the provider cannot re-run them at all,
- *    SWARM hands the head to the operator once — so does a head with no operator
- *    to re-run them as,
+ *    SWARM hands the head to the operator once, naming the runner each failed
+ *    attempt ran on where the provider reports it (issue #1468) — so does a head
+ *    with no operator to re-run them as,
  *    since the re-run is a write made for the pull request's author with the stored
  *    credential of the operator whose worker produced it (issue #1249). The
  *    hand-off is one durable `failed` Respond-to-CI run (the
@@ -78,7 +79,7 @@ import { logger } from '../lib/logger.js';
 import type { SwarmJob } from '../queue/jobs.js';
 import { deliveryIdentity } from '../scm/delivery.js';
 import { SWARM_GENERATED_FOOTER } from '../scm/swarm-origin.js';
-import type { RerunFailedChecksOutcome, SCMProvider } from '../scm/types.js';
+import type { CheckAttemptRunner, RerunFailedChecksOutcome, SCMProvider } from '../scm/types.js';
 import {
 	buildReviewDispatchKey,
 	releaseReviewDispatch,
@@ -210,8 +211,11 @@ export interface AdjudicatedApprovedHeadDecision {
 
 export interface RecoverAdjudicatedApprovedHeadInput {
 	project: ProjectConfig;
-	/** The two writes the policy makes through the provider: the re-run, and the notice. */
-	scm: Pick<SCMProvider, 'rerunFailedChecks' | 'deliveryProvider'>;
+	/**
+	 * The two writes the policy makes through the provider — the re-run, and the
+	 * notice — and the one read the notice adds: where each failed attempt ran.
+	 */
+	scm: Pick<SCMProvider, 'rerunFailedChecks' | 'deliveryProvider' | 'describeFailedCheckAttempts'>;
 	prNumber: string;
 	/** The approved head whose red was adjudicated. */
 	headSha: string;
@@ -432,10 +436,14 @@ async function handToOperator(
 		});
 		return;
 	}
+	// Read only once the claim is won, so it is made once per head.
+	const runners = await describeAttemptRunners(input);
 	logger.warn('approved head: red after its re-runs — handing it to the operator', {
 		...context,
 		rerun,
+		...(runners ? { runners } : {}),
 	});
+	const account = runners ? `${rerun} ${runners}` : rerun;
 
 	const checks = failedChecks.length > 0 ? failedChecks.join(', ') : 'none named';
 	try {
@@ -457,7 +465,7 @@ async function handToOperator(
 			error:
 				`Approved head needs the operator: PR #${prNumber} at ${headSha} is approved, but its ` +
 				`checks are red (${checks}). SWARM's CI agent judged the failure unrelated to this ` +
-				`pull request. ${rerun} Re-run the checks — SWARM merges this head once they pass — ` +
+				`pull request. ${account} Re-run the checks — SWARM merges this head once they pass — ` +
 				'or push a fix, which gets its own review.',
 		});
 	} catch (err) {
@@ -471,7 +479,7 @@ async function handToOperator(
 		const delivery = await scm.deliveryProvider(project, 'reviewer');
 		await delivery.postComment({
 			prNumber: Number(prNumber),
-			body: operatorNoticeBody(headSha, failedChecks, rerun),
+			body: operatorNoticeBody(headSha, failedChecks, account),
 			deliveryId: deliveryIdentity([
 				'approved-head-needs-operator',
 				project.repo,
@@ -485,6 +493,67 @@ async function handToOperator(
 			error: describeError(err),
 		});
 	}
+}
+
+/**
+ * Where each failed attempt of the failing checks ran — a provider read that never
+ * blocks the notice: a throw, like a provider that reports no runner, answers
+ * `null` and the notice goes out without it.
+ */
+async function describeAttemptRunners(
+	input: RecoverAdjudicatedApprovedHeadInput,
+): Promise<string | null> {
+	const { project, scm, prNumber, headSha, failedChecks } = input;
+	try {
+		const attempts = await scm.describeFailedCheckAttempts(project, headSha);
+		return summarizeAttemptRunners(attempts, failedChecks);
+	} catch (err) {
+		// The contract never throws; this keeps a provider that does from blocking the notice.
+		logger.warn('approved head: could not read the runners of the failed attempts', {
+			prNumber,
+			headSha,
+			error: describeError(err),
+		});
+		return null;
+	}
+}
+
+/**
+ * The operator notice's account of the runner each failed attempt ran on (issue
+ * #1468), so an operator can tell a broken runner from a broken check: every
+ * attempt of the checks in `failedChecks` (all of them when it names none), grouped
+ * by check, oldest attempt first, and — when more than one attempt ran and every
+ * one ran on the same runner — that said plainly. `null` when no attempt names a
+ * runner, which is how a provider that reports none drops the account altogether.
+ */
+export function summarizeAttemptRunners(
+	attempts: readonly CheckAttemptRunner[],
+	failedChecks: readonly string[],
+): string | null {
+	const named =
+		failedChecks.length > 0
+			? attempts.filter((attempt) => failedChecks.includes(attempt.check))
+			: [...attempts];
+	if (!named.some((attempt) => attempt.runner !== null)) return null;
+
+	const checkOrder =
+		failedChecks.length > 0 ? failedChecks : [...new Set(named.map((attempt) => attempt.check))];
+	const ordered = [...named].sort(
+		(a, b) => checkOrder.indexOf(a.check) - checkOrder.indexOf(b.check) || a.attempt - b.attempt,
+	);
+	const list = ordered
+		.map(
+			({ check, attempt, runner }) =>
+				`\`${check}\` — attempt ${attempt}: ${runner === null ? 'runner not reported' : `\`${runner}\``}`,
+		)
+		.join('; ');
+	const runners = new Set(ordered.map((attempt) => attempt.runner));
+	const [onlyRunner] = runners;
+	const allOnOne =
+		ordered.length > 1 && runners.size === 1 && onlyRunner
+			? ` All ${ordered.length} attempts ran on one runner, \`${onlyRunner}\`.`
+			: '';
+	return `The failed attempts ran on: ${list}.${allOnOne}`;
 }
 
 function operatorNoticeBody(headSha: string, failedChecks: string[], rerun: string): string {

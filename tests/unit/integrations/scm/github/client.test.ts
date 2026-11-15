@@ -12,6 +12,7 @@ const getAuthenticated = vi.fn();
 const listWorkflowRunsForRepo = vi.fn();
 const listJobsForWorkflowRun = vi.fn();
 const reRunWorkflowFailedJobs = vi.fn();
+const listJobsForWorkflowRunAttempt = vi.fn();
 const pullsGet = vi.fn();
 const pullsMerge = vi.fn();
 const listPullRequestsAssociatedWithCommit = vi.fn();
@@ -31,7 +32,12 @@ vi.mock('@octokit/rest', () => ({
 	Octokit: class {
 		auth: unknown;
 		users = { getAuthenticated };
-		actions = { listWorkflowRunsForRepo, listJobsForWorkflowRun, reRunWorkflowFailedJobs };
+		actions = {
+			listWorkflowRunsForRepo,
+			listJobsForWorkflowRun,
+			listJobsForWorkflowRunAttempt,
+			reRunWorkflowFailedJobs,
+		};
 		pulls = {
 			get: pullsGet,
 			merge: pullsMerge,
@@ -69,7 +75,9 @@ import {
 	getScopedClient,
 	isBaseContainedInHead,
 	isContainedInBranch,
+	listFailedWorkflowJobAttempts,
 	listPullRequestsForCommit,
+	MAX_WORKFLOW_ATTEMPT_READS,
 	mergePullRequestDirect,
 	readGitHubPullRequestContext,
 	readGitHubPullRequestReview,
@@ -321,6 +329,102 @@ describe('github client', () => {
 			await expect(
 				withGitHubToken('tok', () => rerunFailedWorkflowRuns('jkwiecien', 'swarm', 'cafe')),
 			).rejects.toThrow('Resource not accessible by personal access token');
+		});
+	});
+
+	describe('listFailedWorkflowJobAttempts', () => {
+		it("walks every attempt of each failed latest run, keeping its failed jobs' runners", async () => {
+			// Workflow 100's latest run (1) failed on its third attempt; workflow 200's is green.
+			paginate.mockImplementation(
+				async (endpoint: unknown, params: { attempt_number?: number }) => {
+					if (endpoint === listWorkflowRunsForRepo) {
+						return [
+							{
+								id: 1,
+								workflow_id: 100,
+								name: 'CI',
+								status: 'completed',
+								conclusion: 'failure',
+								run_attempt: 3,
+							},
+							{
+								id: 2,
+								workflow_id: 200,
+								name: 'Lint',
+								status: 'completed',
+								conclusion: 'success',
+								run_attempt: 1,
+							},
+						];
+					}
+					const runnerByAttempt: Record<number, string> = {
+						1: 'm5_pro_sm_1',
+						2: '',
+						3: 'm5_pro_sm_2',
+					};
+					const attempt = params.attempt_number ?? 0;
+					return [
+						{ name: 'Verify', conclusion: 'failure', runner_name: runnerByAttempt[attempt] },
+						{ name: 'Build', conclusion: 'success', runner_name: 'm5_pro_sm_1' },
+						...(attempt === 3
+							? [{ name: 'E2E', conclusion: 'cancelled', runner_name: null }]
+							: [{ name: 'E2E', conclusion: 'skipped', runner_name: null }]),
+					];
+				},
+			);
+
+			const attempts = await withGitHubToken('tok', () =>
+				listFailedWorkflowJobAttempts('jkwiecien', 'swarm', 'cafe'),
+			);
+
+			expect(attempts).toEqual([
+				{ check: 'Verify', attempt: 1, runner: 'm5_pro_sm_1' },
+				{ check: 'Verify', attempt: 2, runner: null },
+				{ check: 'Verify', attempt: 3, runner: 'm5_pro_sm_2' },
+				{ check: 'E2E', attempt: 3, runner: null },
+			]);
+			const attemptReads = paginate.mock.calls.filter(
+				([endpoint]) => endpoint === listJobsForWorkflowRunAttempt,
+			);
+			expect(attemptReads.map(([, params]) => params)).toEqual(
+				[1, 2, 3].map((attempt_number) => ({
+					owner: 'jkwiecien',
+					repo: 'swarm',
+					run_id: 1,
+					attempt_number,
+					per_page: 100,
+				})),
+			);
+		});
+
+		it('caps how many attempts it reads', async () => {
+			paginate.mockImplementation(async (endpoint: unknown) =>
+				endpoint === listWorkflowRunsForRepo
+					? [
+							{
+								id: 1,
+								workflow_id: 100,
+								name: 'CI',
+								status: 'completed',
+								conclusion: 'failure',
+								run_attempt: MAX_WORKFLOW_ATTEMPT_READS + 5,
+							},
+						]
+					: [{ name: 'Verify', conclusion: 'failure', runner_name: 'r1' }],
+			);
+
+			const attempts = await withGitHubToken('tok', () =>
+				listFailedWorkflowJobAttempts('jkwiecien', 'swarm', 'cafe'),
+			);
+
+			expect(attempts).toHaveLength(MAX_WORKFLOW_ATTEMPT_READS);
+		});
+
+		it('propagates a failed read', async () => {
+			paginate.mockRejectedValue(new Error('HTTP 502'));
+			await expect(
+				withGitHubToken('tok', () => listFailedWorkflowJobAttempts('jkwiecien', 'swarm', 'cafe')),
+			).rejects.toThrow('HTTP 502');
 		});
 	});
 

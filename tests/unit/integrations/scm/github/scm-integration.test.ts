@@ -30,6 +30,7 @@ vi.mock('@/integrations/scm/github/client.js', () => ({
 	getCommitProvenance: vi.fn(),
 	isBaseContainedInHead: vi.fn(),
 	isContainedInBranch: vi.fn(),
+	listFailedWorkflowJobAttempts: vi.fn(),
 	mergePullRequestDirect: vi.fn(),
 	readGitHubPullRequestContext: vi.fn(),
 	readGitHubPullRequestReview: vi.fn(),
@@ -48,6 +49,7 @@ import {
 	getPullRequestReviews,
 	isBaseContainedInHead,
 	isContainedInBranch,
+	listFailedWorkflowJobAttempts,
 	mergePullRequestDirect,
 	readGitHubPullRequestContext,
 	readGitHubPullRequestReview,
@@ -296,6 +298,43 @@ describe('GitHubSCMIntegration', () => {
 				message: 'no implementer token',
 			});
 			expect(rerunFailedWorkflowRuns).not.toHaveBeenCalled();
+		});
+	});
+
+	describe('describeFailedCheckAttempts', () => {
+		beforeEach(() => {
+			vi.mocked(listFailedWorkflowJobAttempts).mockReset();
+		});
+
+		it('reads as the reviewer by default and returns the attempts', async () => {
+			vi.mocked(getPersonaToken).mockResolvedValue('tok-rev');
+			const attempts = [{ check: 'Verify', attempt: 1, runner: 'm5_pro_sm_1' }];
+			vi.mocked(listFailedWorkflowJobAttempts).mockResolvedValue(attempts);
+
+			await expect(scm.describeFailedCheckAttempts(project, 'cafe')).resolves.toEqual(attempts);
+			expect(getPersonaToken).toHaveBeenCalledWith(project, 'reviewer');
+			expect(listFailedWorkflowJobAttempts).toHaveBeenCalledWith(
+				'SmartTechBrewery',
+				'swarm',
+				'cafe',
+			);
+		});
+
+		it.each([
+			[
+				'a failed read',
+				() => {
+					vi.mocked(getPersonaToken).mockResolvedValue('tok-rev');
+					vi.mocked(listFailedWorkflowJobAttempts).mockRejectedValue(new Error('HTTP 502'));
+				},
+			],
+			[
+				'an unresolvable token',
+				() => vi.mocked(getPersonaToken).mockRejectedValue(new Error('no reviewer token')),
+			],
+		])('answers [] instead of throwing on %s', async (_name, arrange) => {
+			arrange();
+			await expect(scm.describeFailedCheckAttempts(project, 'cafe')).resolves.toEqual([]);
 		});
 	});
 

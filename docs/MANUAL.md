@@ -1808,7 +1808,7 @@ attempt for a run when all of these hold:
   (issue #1453). Restarting it is that person's call;
 - the run is not a deliberate hand-off SWARM wrote to a person — *Approved head
   needs the operator* (an approved pull request whose checks stayed red after its
-  one re-run) or *CI fix abandoned* (the Respond-to-CI attempt cap). Each of these
+  re-runs) or *CI fix abandoned* (the Respond-to-CI attempt cap). Each of these
   records its own failure diagnosis (`approved-head-needs-operator`,
   `ci-fix-attempts-exhausted`), and no leg of the sweep ever attempts it: it
   already says what a person must do (issue #1462);
@@ -1882,8 +1882,11 @@ a pull request when all of these hold:
   the operator"), none of SWARM's automatic check re-runs on it is still inside
   its two-minute settle window, and no further approved-head re-run is still to
   come. An approved head whose red SWARM's CI agent judged unrelated is re-run up
-  to 3 times, at about 0, +15 and +45 minutes, before that operator notice; it
-  counts as acted on until its next re-run is a couple of minutes overdue;
+  to 3 times, at about 0, +15 and +45 minutes, before that operator notice,
+  which names the runner each failed attempt ran on — and says so plainly when
+  every attempt ran on one — where the provider reports it (GitHub does; the
+  other providers omit it); it counts as acted on until its next re-run is a
+  couple of minutes overdue;
 - the head is not an approval waiting for a person to merge it on a repository
   without `autoMerge`. Approved heads with `autoMerge` on, and heads not yet
   approved, both count.
