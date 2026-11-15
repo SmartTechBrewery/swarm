@@ -100,6 +100,7 @@ export function RunsTable({
 									reviewMergeOutcome={run.reviewMergeOutcome}
 									reviewCapSpent={run.reviewCapSpent}
 									reviewCapStop={run.reviewCapStop}
+									resolveProblemOutcome={run.resolveProblemOutcome}
 									className="shrink-0"
 								/>
 							</div>
@@ -243,6 +244,7 @@ export function RunsTable({
 										reviewMergeOutcome={run.reviewMergeOutcome}
 										reviewCapSpent={run.reviewCapSpent}
 										reviewCapStop={run.reviewCapStop}
+										resolveProblemOutcome={run.resolveProblemOutcome}
 									/>
 								</td>
 								<td className="px-2 py-3 text-sm text-zinc-400">

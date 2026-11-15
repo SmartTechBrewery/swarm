@@ -309,8 +309,14 @@ export type WipOperatorReason = z.infer<typeof wipOperatorReasonSchema>;
 export const wipPipelineReasonSchema = z.enum(['waiting-for-checks']);
 export type WipPipelineReason = z.infer<typeof wipPipelineReasonSchema>;
 
-/** Mirrors `WipResolveProblemStateSchema` (`src/queue/wip-usage.ts`, issue #1428). */
-export const wipResolveProblemStateSchema = z.enum(['queued', 'running', 'resolved', 'unresolved']);
+/** Mirrors `WipResolveProblemStateSchema` (`src/queue/wip-usage.ts`, issues #1428, #1462). */
+export const wipResolveProblemStateSchema = z.enum([
+	'queued',
+	'running',
+	'resolved',
+	'handed-off',
+	'unresolved',
+]);
 export type WipResolveProblemState = z.infer<typeof wipResolveProblemStateSchema>;
 
 /**
@@ -609,6 +615,14 @@ export interface RunRow {
 	 * and run-detail callout (issue #242).
 	 */
 	reviewAutomationOutcome: string | null;
+	/**
+	 * The successful outcome a completed Resolve problem run's report named (issue
+	 * #1462) — `resolved`, `already-resolved` or `handed-off` (the agent diagnosed the
+	 * situation and a person must act). Null for every other phase, every failed
+	 * attempt and pre-existing rows. `handed-off` drives the "Handed off" badge and
+	 * the "A person needs to act" run-detail callout.
+	 */
+	resolveProblemOutcome?: string | null;
 	/**
 	 * Provider-neutral merge-automation outcome for a completed Review run's
 	 * `approve` verdict (issue #278): one of `merged`/`not-ready`/

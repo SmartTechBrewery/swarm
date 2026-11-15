@@ -19,6 +19,7 @@ import type { RunRow } from '@/db/repositories/runsRepository.js';
 import {
 	mintResolveProblemAccess,
 	operatorMcpUrl,
+	RESOLVE_PROBLEM_HANDED_OFF_PREFIX,
 	RESOLVE_PROBLEM_TOKEN_GRACE_MS,
 	type ReadRedHeadAtClaim,
 	resolveProblemAnchorCancelled,
@@ -465,7 +466,7 @@ describe('verifyResolveProblemOutcome', () => {
 	it('succeeds on a resolved report backed by a bug report the run filed', async () => {
 		await expect(
 			verifyResolveProblemOutcome({ runId: 'run-resolve', report: REPORT, agent: AGENT }, filed),
-		).resolves.toEqual({});
+		).resolves.toEqual({ outcome: 'resolved' });
 		expect(filed).toHaveBeenCalledWith('run-resolve');
 	});
 
@@ -483,9 +484,62 @@ describe('verifyResolveProblemOutcome', () => {
 			},
 			filed,
 		);
-		expect(settle.headline).toBe(
-			'Resolve problem found nothing left to resolve — the failed run was already fixed: PR #2219 was merged outside SWARM at head abc123. Tried: no recovery action.',
+		expect(settle).toEqual({
+			outcome: 'already-resolved',
+			headline:
+				'Resolve problem found nothing left to resolve — the failed run was already fixed: PR #2219 was merged outside SWARM at head abc123. Tried: no recovery action.',
+		});
+	});
+
+	it('settles a handed-off report as a success whose headline says what a person must do (issue #1462)', async () => {
+		const settle = await verifyResolveProblemOutcome(
+			{
+				runId: 'run-resolve',
+				report: {
+					...REPORT,
+					outcome: 'handed-off',
+					actions: [],
+					summary: 'Force re-review PR #7: the review-verdict cap stopped it on purpose.',
+				},
+				agent: AGENT,
+			},
+			filed,
 		);
+		expect(settle).toEqual({
+			outcome: 'handed-off',
+			headline:
+				'Resolve problem handed the failed run to a person — Force re-review PR #7: the review-verdict cap stopped it on purpose. Tried: no recovery action.',
+		});
+		expect(settle.headline?.startsWith(RESOLVE_PROBLEM_HANDED_OFF_PREFIX)).toBe(true);
+	});
+
+	it('names the subject of a handed-off ticket attempt (issue #1462)', async () => {
+		const settle = await verifyResolveProblemOutcome(
+			{
+				runId: 'run-resolve',
+				report: { ...REPORT, outcome: 'handed-off', summary: 'Move the card to Ready.' },
+				agent: AGENT,
+				subject: 'ticket',
+			},
+			filed,
+		);
+		expect(settle.headline).toContain(
+			'handed the stuck ticket to a person — Move the card to Ready.',
+		);
+	});
+
+	it('fails a handed-off report that filed no bug report (issue #1462)', async () => {
+		const error = await failureOf(
+			verifyResolveProblemOutcome(
+				{
+					runId: 'run-resolve',
+					report: { ...REPORT, outcome: 'handed-off', summary: 'Re-run the failed job.' },
+					agent: AGENT,
+				},
+				none,
+			),
+		);
+		expect(error.message).toContain('filed no bug report');
 	});
 
 	it('names a stuck ticket in an already-resolved headline (issue #1441)', async () => {
@@ -747,8 +801,23 @@ describe('verifyResolveProblemOutcome — red-head attempts (issue #1459)', () =
 		);
 	});
 
+	it('fails a handed-off attempt recorded on any other report than the class one (issue #1462)', async () => {
+		const error = await verify('handed-off', 'Some other problem').catch((err: unknown) => err);
+		expect(error).toBeInstanceOf(AgentRunError);
+		expect((error as AgentRunError).message).toContain(
+			`must land on the report titled "${RED_HEAD_BUG_REPORT_TITLE}"`,
+		);
+	});
+
 	it('accepts the class report, and keeps the usual outcome handling', async () => {
-		await expect(verify('resolved', RED_HEAD_BUG_REPORT_TITLE)).resolves.toEqual({});
+		await expect(verify('resolved', RED_HEAD_BUG_REPORT_TITLE)).resolves.toEqual({
+			outcome: 'resolved',
+		});
+		const handedOff = await verify('handed-off', RED_HEAD_BUG_REPORT_TITLE);
+		expect(handedOff.outcome).toBe('handed-off');
+		expect(handedOff.headline).toContain(
+			`${RESOLVE_PROBLEM_HANDED_OFF_PREFIX} red pull-request head to a person — `,
+		);
 		const settle = await verify('already-resolved', RED_HEAD_BUG_REPORT_TITLE);
 		expect(settle.headline).toContain('the red pull-request head was already fixed');
 		const error = await verify('unresolved', RED_HEAD_BUG_REPORT_TITLE).catch(

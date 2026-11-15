@@ -58,11 +58,12 @@ export function wipPipelineReasonLabel(reason: WipPipelineReason): string {
  */
 export const WIP_ACTION_RUN_LABEL = 'Open review run to Force re-review';
 
-/** What a Resolve problem attempt on a waiting holder concluded (issue #1428). */
+/** What a Resolve problem attempt on a waiting holder concluded (issues #1428, #1462). */
 const RESOLVE_PROBLEM_STATE_LABELS: Record<WipResolveProblemState, string> = {
 	queued: 'Resolve problem: attempt queued',
 	running: 'Resolve problem: attempt running',
 	resolved: 'Resolve problem: resolved it',
+	'handed-off': 'Resolve problem: diagnosed it — a person must act',
 	unresolved: 'Resolve problem: could not resolve it',
 };
 

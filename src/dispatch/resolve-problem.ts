@@ -35,7 +35,7 @@ import {
 	RED_HEAD_BUG_REPORT_TITLE,
 	type ResolveProblemRedHead,
 } from '../pipeline/prompts/resolve-problem.js';
-import type { ResolveProblemReport } from '../pipeline/resolve-problem.js';
+import type { ResolveProblemOutcome, ResolveProblemReport } from '../pipeline/resolve-problem.js';
 import type { ResolveProblemJob } from '../queue/jobs.js';
 import { priorityFor } from '../queue/producer.js';
 import type { WipTicket } from '../queue/wip-usage.js';
@@ -560,23 +560,39 @@ function describeActions(report: ResolveProblemReport): string {
 		.join('; ')}.`;
 }
 
+/**
+ * The opening phrase of a `handed-off` attempt's headline (issue #1462): the agent
+ * diagnosed the situation and a person must act. The rest of the headline names the
+ * subject and carries the agent's own summary of what that person should do.
+ */
+export const RESOLVE_PROBLEM_HANDED_OFF_PREFIX = 'Resolve problem handed the';
+
 /** What a Resolve problem attempt that succeeded settles with. */
 export interface ResolveProblemSettle {
 	/**
-	 * The completed run's headline, when it has one to record: set only for an
-	 * `already-resolved` report (issue #1441), saying why there was nothing to resolve.
+	 * Which successful outcome the report named — recorded on the completed run as
+	 * `runs.resolve_problem_outcome` (issue #1462), so a hand-off to a person reads
+	 * apart from a resolution.
+	 */
+	outcome: ResolveProblemOutcome;
+	/**
+	 * The completed run's headline, when it has one to record: set for an
+	 * `already-resolved` report (issue #1441), saying why there was nothing to
+	 * resolve, and for a `handed-off` one (issue #1462), saying what a person must do.
 	 */
 	headline?: string;
 }
 
 /**
  * Decide a finished Resolve problem run from the report its agent handed back. It
- * succeeds only when the report says `resolved` or `already-resolved` (issue #1441)
- * **and** the run filed a bug-report occurrence (`filed_by_run_id` = this run) —
- * checked here by a database read, never taken from the report's own claim, and for
- * every outcome alike. An `already-resolved` success returns the headline the
- * completed run records: the agent's own explanation of why the failure no longer
- * blocks anything. Anything else throws a terminal `AgentRunError` (`kind: 'error'`,
+ * succeeds only when the report says `resolved`, `already-resolved` (issue #1441) or
+ * `handed-off` (issue #1462) **and** the run filed a bug-report occurrence
+ * (`filed_by_run_id` = this run) — checked here by a database read, never taken from
+ * the report's own claim, and for every outcome alike. An `already-resolved` success
+ * returns the headline the completed run records: the agent's own explanation of why
+ * the failure no longer blocks anything. A `handed-off` one returns a headline
+ * opening with {@link RESOLVE_PROBLEM_HANDED_OFF_PREFIX} and carrying what the person
+ * should do. Anything else throws a terminal `AgentRunError` (`kind: 'error'`,
  * so it is not retried) whose message is what the run and the board item show: the
  * summary and the actions tried, so an escalation reads as one.
  */
@@ -627,10 +643,23 @@ export async function verifyResolveProblemOutcome(
 			`Resolve problem could not resolve the ${subject}: ${verified.summary} ${describeActions(verified)}`,
 		);
 	}
-	if (verified.outcome === 'already-resolved') {
-		return {
-			headline: `Resolve problem found nothing left to resolve — the ${subject} was already fixed: ${verified.summary} ${describeActions(verified)}`,
-		};
+	return settleSucceeded(verified, subject);
+}
+
+/** The settle of a report that passed every check and named a successful outcome. */
+function settleSucceeded(report: ResolveProblemReport, subject: string): ResolveProblemSettle {
+	switch (report.outcome) {
+		case 'already-resolved':
+			return {
+				outcome: 'already-resolved',
+				headline: `Resolve problem found nothing left to resolve — the ${subject} was already fixed: ${report.summary} ${describeActions(report)}`,
+			};
+		case 'handed-off':
+			return {
+				outcome: 'handed-off',
+				headline: `${RESOLVE_PROBLEM_HANDED_OFF_PREFIX} ${subject} to a person — ${report.summary} ${describeActions(report)}`,
+			};
+		default:
+			return { outcome: 'resolved' };
 	}
-	return {};
 }

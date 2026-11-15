@@ -16,6 +16,7 @@ import {
 import type { AgentUsage } from '../../harness/usage.js';
 import type { Checkpoint } from '../../pipeline/checkpoint.js';
 import type { ProposedScope } from '../../pipeline/planning.js';
+import type { ResolveProblemOutcome } from '../../pipeline/resolve-problem.js';
 import type { CancellationOrigin } from '../../queue/cancellation.js';
 import type { SwarmJob } from '../../queue/jobs.js';
 import type { ReviewAbsorbed } from '../../scm/delivery.js';
@@ -208,6 +209,17 @@ export const runs = pgTable(
 		 * shows a declaration the fresh pass has not (yet) restated.
 		 */
 		reviewAbsorbed: jsonb('review_absorbed').$type<ReviewAbsorbed[]>(),
+		/**
+		 * Which successful outcome a completed Resolve problem run's report named
+		 * (issue #1462) — `resolved`, `already-resolved` or `handed-off` (the agent
+		 * diagnosed the situation and a person must act). The run stays `completed`
+		 * either way; this column is what tells a hand-off to a person apart from a
+		 * resolution. Nullable: every other phase, every failed attempt and every
+		 * pre-existing row leaves it null. Cleared on a retry
+		 * ({@link resetRunToRunning}), so a re-running attempt never shows a previous
+		 * attempt's outcome.
+		 */
+		resolveProblemOutcome: text('resolve_problem_outcome').$type<ResolveProblemOutcome>(),
 		/**
 		 * Provider-neutral merge-automation outcome for this Review run's approval
 		 * (`src/scm/merge.ts`; written by the durable merge dispatch,

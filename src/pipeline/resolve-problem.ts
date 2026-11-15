@@ -74,10 +74,14 @@ export const MCP_UNREACHABLE_PREFIX = 'SWARM operator MCP unreachable';
  * The hand-off the agent writes: what it concluded, and every real write it made.
  * `already-resolved` (issue #1441) says there was nothing left to resolve — the
  * failure was already fixed outside SWARM, e.g. its pull request was merged or
- * closed by hand — and settles the run `completed`, like `resolved`.
+ * closed by hand — and settles the run `completed`, like `resolved`. `handed-off`
+ * (issue #1462) says the agent diagnosed the cause and only a person can act — a
+ * safety stop SWARM placed on purpose, a check re-run, a fix push, a merge — and
+ * also settles `completed`, its headline saying what that person should do.
+ * `unresolved` is left for a situation the agent could not diagnose, and fails.
  */
 export const ResolveProblemReportSchema = z.object({
-	outcome: z.enum(['resolved', 'already-resolved', 'unresolved']),
+	outcome: z.enum(['resolved', 'already-resolved', 'handed-off', 'unresolved']),
 	bugReportId: z.string().min(1),
 	actions: z.array(
 		z.object({
@@ -88,6 +92,12 @@ export const ResolveProblemReportSchema = z.object({
 	),
 	summary: z.string().trim().min(1),
 });
+
+/**
+ * The report outcomes a Resolve problem run settles `completed` with — recorded on
+ * the run as `runs.resolve_problem_outcome` (issue #1462). `unresolved` fails.
+ */
+export type ResolveProblemOutcome = Exclude<ResolveProblemReport['outcome'], 'unresolved'>;
 export type ResolveProblemReport = z.infer<typeof ResolveProblemReportSchema>;
 
 /** The SWARM operator MCP endpoint and the run-bound token the assignment carried. */

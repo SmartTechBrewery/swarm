@@ -1014,6 +1014,59 @@ describe('RunDetailHeader for a Resolve problem run with nothing left to resolve
 	});
 });
 
+describe('RunDetailHeader for a Resolve problem run handed to a person (issue #1462)', () => {
+	function renderHeader(run: RunRow) {
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		return render(
+			<QueryClientProvider client={queryClient}>
+				<RunDetailHeader run={run} />
+			</QueryClientProvider>,
+		);
+	}
+
+	const HEADLINE =
+		'Resolve problem handed the failed run to a person — Force re-review PR #7: the review-verdict cap stopped it on purpose. Tried: no recovery action.';
+
+	it('shows the headline as an amber "A person needs to act" callout and a "Handed off" badge', () => {
+		renderHeader(
+			makeReviewRun({
+				phase: 'resolve-problem',
+				status: 'completed',
+				reviewVerdict: null,
+				reviewOrdinal: null,
+				reviewAutomationOutcome: null,
+				resolveProblemOutcome: 'handed-off',
+				error: HEADLINE,
+			}),
+		);
+
+		const heading = screen.getByRole('heading', { name: 'A person needs to act' });
+		expect(heading.classList.contains('text-amber-200')).toBe(true);
+		expect(screen.getByText(HEADLINE)).toBeDefined();
+		expect(screen.getByText('Handed off')).toBeDefined();
+		expect(screen.queryByRole('heading', { name: 'Nothing left to resolve' })).toBeNull();
+		expect(screen.queryByRole('heading', { name: /run failure error/i })).toBeNull();
+	});
+
+	it('keeps "Nothing left to resolve" for an already-resolved headline', () => {
+		renderHeader(
+			makeReviewRun({
+				phase: 'resolve-problem',
+				status: 'completed',
+				reviewVerdict: null,
+				reviewOrdinal: null,
+				reviewAutomationOutcome: null,
+				resolveProblemOutcome: 'already-resolved',
+				error: 'Resolve problem found nothing left to resolve — PR #2219 was merged.',
+			}),
+		);
+
+		expect(screen.getByRole('heading', { name: 'Nothing left to resolve' })).toBeDefined();
+		expect(screen.queryByRole('heading', { name: 'A person needs to act' })).toBeNull();
+		expect(screen.queryByText('Handed off')).toBeNull();
+	});
+});
+
 describe('RunDetailHeader for a checkpointed run (issue #504)', () => {
 	function renderHeader(run: RunRow = makeCheckpointedRun()) {
 		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

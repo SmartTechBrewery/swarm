@@ -10920,13 +10920,43 @@ describe('processJob', () => {
 			expect(revokeRunBoundAgentTokens).toHaveBeenCalledWith('run-1');
 		});
 
-		it('records no headline on a resolved attempt', async () => {
+		// Issue #1462: diagnosed, and only a person can act — completed, not failed.
+		it('completes a handed-off attempt with what the person should do as the run headline', async () => {
+			phaseImpl = async () => ({
+				agent: agentResult(),
+				resolveProblem: {
+					...REPORT,
+					outcome: 'handed-off',
+					actions: [],
+					summary: 'Force re-review PR #7: the review-verdict cap stopped it on purpose.',
+				},
+			});
+
+			const outcome = await processJob(RESOLVE_JOB, registryReturning(null));
+
+			expect(outcome).toMatchObject({ status: 'phase-succeeded', phase: 'resolve-problem' });
+			expect(completeRun).toHaveBeenCalledWith(
+				'run-1',
+				expect.objectContaining({
+					status: 'completed',
+					error:
+						'Resolve problem handed the failed run to a person — Force re-review PR #7: the review-verdict cap stopped it on purpose. Tried: no recovery action.',
+					resolveProblemOutcome: 'handed-off',
+				}),
+			);
+			expect(completeDispatch).toHaveBeenCalledWith('dispatch-1', 'phase-succeeded');
+			expect(addComment).not.toHaveBeenCalled();
+			expect(revokeRunBoundAgentTokens).toHaveBeenCalledWith('run-1');
+		});
+
+		it('records no headline on a resolved attempt, only its outcome', async () => {
 			await processJob(RESOLVE_JOB, registryReturning(null));
 
 			const settle = completeRun.mock.calls.find(
 				([, input]) => (input as { status?: string }).status === 'completed',
 			);
 			expect(settle?.[1]).not.toHaveProperty('error');
+			expect(settle?.[1]).toMatchObject({ resolveProblemOutcome: 'resolved' });
 		});
 
 		it('fails an attempt that filed no bug report', async () => {

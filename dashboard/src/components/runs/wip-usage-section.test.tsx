@@ -205,6 +205,9 @@ describe('WipUsageSection', () => {
 	it('shows the Resolve problem attempt on a waiting holder, per state', () => {
 		const message =
 			'Resolve problem could not resolve the stuck ticket: the branch is gone. Tried: no recovery action.';
+		// Issue #1462: diagnosed, and a person must act — told apart from both.
+		const handedOff =
+			'Resolve problem handed the stuck ticket to a person — Move the card to Ready. Tried: no recovery action.';
 		renderSection(
 			<WipUsageSection
 				entries={[
@@ -249,14 +252,27 @@ describe('WipUsageSection', () => {
 									at: '2026-11-12T08:00:00Z',
 								},
 							}),
+							makeTicket({
+								taskId: '105',
+								state: 'waiting-on-operator',
+								operatorReason: 'failed',
+								resolveProblem: {
+									runId: 'attempt-handed-off',
+									state: 'handed-off',
+									message: handedOff,
+									at: '2026-11-12T08:00:00Z',
+								},
+							}),
 						],
 					}),
 				]}
 			/>,
 		);
 
-		const [queued, running, resolved, unresolved] = screen.getAllByTestId('wip-resolve-problem');
-		if (!queued || !running || !resolved || !unresolved) throw new Error('unreachable');
+		const [queued, running, resolved, unresolved, handedOffLine] =
+			screen.getAllByTestId('wip-resolve-problem');
+		if (!queued || !running || !resolved || !unresolved || !handedOffLine)
+			throw new Error('unreachable');
 		expect(within(queued).getByText('Resolve problem: attempt queued')).toBeDefined();
 		expect(within(queued).queryByRole('link')).toBeNull();
 		expect(within(running).getByText('Resolve problem: attempt running')).toBeDefined();
@@ -269,6 +285,13 @@ describe('WipUsageSection', () => {
 		expect(
 			within(unresolved).getByRole('link', { name: 'Open attempt run' }).getAttribute('href'),
 		).toBe('/runs/attempt-unresolved');
+		expect(
+			within(handedOffLine).getByText('Resolve problem: diagnosed it — a person must act'),
+		).toBeDefined();
+		expect(within(handedOffLine).getByText(handedOff).getAttribute('title')).toBe(handedOff);
+		expect(
+			within(handedOffLine).getByRole('link', { name: 'Open attempt run' }).getAttribute('href'),
+		).toBe('/runs/attempt-handed-off');
 	});
 
 	it('shows no Resolve problem line without an attempt', () => {
