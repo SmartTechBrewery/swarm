@@ -3319,7 +3319,12 @@ describe('processMergeAutomationDispatch: an adjudicated red approved head (issu
 	}
 
 	function adjudicated(
-		outcome: 'rerun-requested' | 'rerun-settling' | 'rerun-waiting' | 'needs-operator',
+		outcome:
+			| 'rerun-requested'
+			| 'rerun-settling'
+			| 'rerun-waiting'
+			| 'needs-operator'
+			| 'shared-failure',
 	) {
 		return {
 			hasCiNoFixRecovery: vi.fn(async () => true),
@@ -3373,6 +3378,7 @@ describe('processMergeAutomationDispatch: an adjudicated red approved head (issu
 		'needs-operator',
 		'rerun-settling',
 		'rerun-waiting',
+		'shared-failure',
 	] as const)('settles %s without a second comment — the operator notice is the comment', async (result) => {
 		const commentOnPullRequest = commentSpy();
 
@@ -3390,6 +3396,23 @@ describe('processMergeAutomationDispatch: an adjudicated red approved head (issu
 		);
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
 		expect(outcome.result).toBe('not-eligible');
+	});
+
+	it('records that a shared check failure was reported once, not re-run here (issue #1464)', async () => {
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest: commentSpy(),
+			...adjudicated('shared-failure'),
+		});
+
+		expect(updateReviewMergeOutcome).toHaveBeenCalledExactlyOnceWith(
+			'run-1',
+			expect.objectContaining({
+				status: 'not-eligible',
+				message: expect.stringContaining('fail on several pull requests at once'),
+			}),
+		);
 	});
 
 	it('records that a head waiting for its next spaced re-run is re-run again (issue #1463)', async () => {

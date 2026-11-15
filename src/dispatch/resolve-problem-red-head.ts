@@ -20,8 +20,9 @@
  * "Approved head needs the operator" hand-off run, a Respond-to-CI give-up and a
  * user termination; no review-cap stop; no automatic check re-run on the head still
  * inside its settle window, nor a spaced approved-head re-run still to come (issue
- * #1463); and no recorded operator hand-off for the head
- * ({@link redHeadHandled}). Approved and not-yet-approved heads both count — except
+ * #1463); no recorded operator hand-off for the head; and no standing shared check
+ * failure covering it — the same check failing on several approved pull requests,
+ * reported once (issue #1464) ({@link redHeadHandled}). Approved and not-yet-approved heads both count — except
  * an approved one on a repository without `autoMerge`, which waits for a person to
  * merge it.
  *
@@ -53,6 +54,7 @@ import {
 	findUpdatedHeadReviewRun,
 	type TaskActivityRow,
 } from '../db/repositories/runsRepository.js';
+import { findStandingEpisodeCheckForHead } from '../db/repositories/sharedCheckFailuresRepository.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
 import { repoSlugsMatch } from '../scm/repo-slug.js';
 import type { SCMProvider } from '../scm/types.js';
@@ -68,6 +70,7 @@ import {
 	type ItemLivenessPolicy,
 	type ItemLivenessUnit,
 } from './item-liveness.js';
+import { SHARED_CHECK_EPISODE_MAX_AGE_MS } from './shared-check-failure.js';
 
 /**
  * How long a pull request must have been quiet before its red head is attempted —
@@ -192,10 +195,11 @@ export async function probeRedHead(
 	return { state: 'not-red', headSha: pr.headSha, checks: decision.action };
 }
 
-/** The two database reads {@link redHeadHandled} makes, injectable for tests. */
+/** The database reads {@link redHeadHandled} makes, injectable for tests. */
 export interface RedHeadHandledReads {
 	getApprovedHeadSlot: typeof getApprovedHeadSlot;
 	findUpdatedHeadReviewRun: typeof findUpdatedHeadReviewRun;
+	findStandingEpisodeCheckForHead: typeof findStandingEpisodeCheckForHead;
 }
 
 // Wrapped rather than referenced, so a suite that mocks either repository module
@@ -203,6 +207,8 @@ export interface RedHeadHandledReads {
 const defaultHandledReads: RedHeadHandledReads = {
 	getApprovedHeadSlot: (key) => getApprovedHeadSlot(key),
 	findUpdatedHeadReviewRun: (key) => findUpdatedHeadReviewRun(key),
+	findStandingEpisodeCheckForHead: (key, openedAfter) =>
+		findStandingEpisodeCheckForHead(key, openedAfter),
 };
 
 /**
@@ -211,9 +217,10 @@ const defaultHandledReads: RedHeadHandledReads = {
  * SWARM's automatic check re-runs on it (the approved head's, issue #1128, or the
  * updated head's, issue #1433) is still inside {@link RERUN_SETTLE_MS}; the approved
  * head's next spaced re-run is still to come (issue #1463 — the policy's own
- * {@link approvedHeadRerunInFlight}, so the sweep and the policy agree); or the
+ * {@link approvedHeadRerunInFlight}, so the sweep and the policy agree); the
  * head is approved on a repository without `autoMerge`, so it waits for a person
- * to merge it.
+ * to merge it; or a standing shared check failure covers it (issue #1464), whose
+ * one report already speaks for it.
  */
 export async function redHeadHandled(
 	key: ReviewVerdictKey,
@@ -234,6 +241,13 @@ export async function redHeadHandled(
 		const next =
 			dueAt && dueAt.getTime() > now.getTime() ? `; the next is due at ${dueAt.toISOString()}` : '';
 		return `SWARM has re-run ${spent} of ${MAX_APPROVED_HEAD_RERUNS} of approved head ${key.headSha}'s checks${next}`;
+	}
+	const sharedCheck = await reads.findStandingEpisodeCheckForHead(
+		key,
+		new Date(now.getTime() - SHARED_CHECK_EPISODE_MAX_AGE_MS),
+	);
+	if (sharedCheck) {
+		return `Check ${sharedCheck} is failing on several pull requests, and SWARM reported it once as a shared problem`;
 	}
 	const settling = (at: Date | null | undefined): boolean =>
 		!!at && now.getTime() - at.getTime() < RERUN_SETTLE_MS;

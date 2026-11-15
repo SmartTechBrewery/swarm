@@ -47,6 +47,14 @@ vi.mock('@/identity/pull-request-operator.js', async (importOriginal) => ({
 		runAsPullRequestOperator(project, prNumber, fn),
 }));
 
+// The shared-check-failure detection (issue #1464) — its own suite covers it; here
+// it answers which failing checks a standing episode covers. By default none: a
+// pull request failing on its own keeps the per-head policy.
+const noteAdjudicatedCheckFailures = vi.fn(async (_input: unknown) => new Set<string>());
+vi.mock('@/dispatch/shared-check-failure.js', () => ({
+	noteAdjudicatedCheckFailures: (input: unknown) => noteAdjudicatedCheckFailures(input),
+}));
+
 vi.mock('@/lib/logger.js', () => ({
 	logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
@@ -91,6 +99,7 @@ const rerunFailedChecks = vi.fn(
 const describeFailedCheckAttempts = vi.fn(
 	async (_p: ProjectConfig, _ref: string, _persona?: string): Promise<CheckAttemptRunner[]> => [],
 );
+const getPullRequest = vi.fn();
 const postComment = vi.fn(async (_input: unknown) => 1);
 const deliveryProvider = vi.fn(
 	async (_p: ProjectConfig, _persona: string) =>
@@ -118,7 +127,8 @@ function input(
 			rerunFailedChecks,
 			deliveryProvider,
 			describeFailedCheckAttempts,
-		} as RecoverAdjudicatedApprovedHeadInput['scm'],
+			getPullRequest,
+		} as unknown as RecoverAdjudicatedApprovedHeadInput['scm'],
 		prNumber: '42',
 		headSha: 'abc123',
 		failedChecks: ['ci'],
@@ -143,6 +153,8 @@ beforeEach(() => {
 	postComment.mockClear();
 	deliveryProvider.mockClear();
 	runAsPullRequestOperator.mockClear();
+	noteAdjudicatedCheckFailures.mockReset();
+	noteAdjudicatedCheckFailures.mockResolvedValue(new Set());
 });
 
 afterEach(() => {
@@ -200,6 +212,51 @@ describe('recoverAdjudicatedApprovedHead', () => {
 		expect(claimApprovedHeadChecksRerun).not.toHaveBeenCalled();
 		expect(rerunFailedChecks).not.toHaveBeenCalled();
 		expect(createFailedRun).not.toHaveBeenCalled();
+	});
+
+	describe('a check failing on several pull requests (issue #1464)', () => {
+		it('stands down when every failing check is shared: no re-run, claim, notice or comment', async () => {
+			noteAdjudicatedCheckFailures.mockResolvedValue(new Set(['lint', 'test']));
+			for (const given of [slot(0), slot(1, 20 * MINUTE), slot(3, 60 * MINUTE)]) {
+				getApprovedHeadSlot.mockResolvedValue(given);
+				expect(
+					await recoverAdjudicatedApprovedHead(input({ failedChecks: ['lint', 'test'] })),
+				).toEqual({ outcome: 'shared-failure' });
+			}
+			expect(noteAdjudicatedCheckFailures).toHaveBeenCalledWith(
+				expect.objectContaining({
+					prNumber: '42',
+					headSha: 'abc123',
+					failedChecks: ['lint', 'test'],
+				}),
+			);
+			expect(claimApprovedHeadChecksRerun).not.toHaveBeenCalled();
+			expect(rerunFailedChecks).not.toHaveBeenCalled();
+			expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
+			expect(createFailedRun).not.toHaveBeenCalled();
+			expect(postComment).not.toHaveBeenCalled();
+		});
+
+		it('keeps the per-head policy while one failing check is not shared', async () => {
+			noteAdjudicatedCheckFailures.mockResolvedValue(new Set(['lint']));
+			expect(
+				await recoverAdjudicatedApprovedHead(input({ failedChecks: ['lint', 'test'] })),
+			).toEqual({ outcome: 'rerun-requested' });
+			expect(rerunFailedChecks).toHaveBeenCalledTimes(1);
+		});
+
+		it('fails open to the per-head policy when the detection throws', async () => {
+			noteAdjudicatedCheckFailures.mockRejectedValue(new Error('db down'));
+			expect(await recoverAdjudicatedApprovedHead(input())).toEqual({
+				outcome: 'rerun-requested',
+			});
+		});
+
+		it('is not consulted for a head already handed to the operator', async () => {
+			getApprovedHeadSlot.mockResolvedValue(slot(3, 60 * MINUTE, new Date(NOW)));
+			expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('needs-operator');
+			expect(noteAdjudicatedCheckFailures).not.toHaveBeenCalled();
+		});
 	});
 
 	it('spends the first re-run at once, as the pull request’s operator, and releases the PR+SHA claim', async () => {

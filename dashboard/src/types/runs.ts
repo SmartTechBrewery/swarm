@@ -73,6 +73,7 @@ export const failureDiagnosisSchema = z.object({
 		'review-provider-unreachable',
 		'approved-head-needs-operator',
 		'ci-fix-attempts-exhausted',
+		'shared-check-failure',
 	]),
 	title: z.string(),
 	message: z.string(),

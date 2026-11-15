@@ -28,6 +28,7 @@ export default defineConfig({
 		'./src/db/schema/workerScmCredentials.ts',
 		'./src/db/schema/workerUpdateRollouts.ts',
 		'./src/db/schema/checkoutDiscards.ts',
+		'./src/db/schema/sharedCheckFailures.ts',
 	],
 	out: './src/db/migrations',
 	dialect: 'postgresql',

@@ -1,0 +1,319 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const logger = vi.hoisted(() => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }));
+vi.mock('@/lib/logger.js', () => ({ logger }));
+
+import type { ProjectConfig } from '@/config/schema.js';
+import type {
+	CheckFailureObservation,
+	SharedCheckFailureEpisode,
+} from '@/db/repositories/sharedCheckFailuresRepository.js';
+import {
+	MAX_SHARED_CHECK_PROBES,
+	type NoteAdjudicatedCheckFailuresInput,
+	noteAdjudicatedCheckFailures,
+	SHARED_CHECK_EPISODE_MAX_AGE_MS,
+	SHARED_CHECK_WINDOW_MS,
+	type SharedCheckFailureDeps,
+	sharedCheckCandidates,
+	summarizeSharedRunners,
+} from '@/dispatch/shared-check-failure.js';
+import type { CheckAttemptRunner, PullRequestDetails } from '@/scm/types.js';
+import { createMockProjectConfig } from '../../helpers/factories.js';
+
+const PROJECT = createMockProjectConfig({ autoMerge: true });
+const NOW = new Date('2026-11-15T12:00:00.000Z');
+const HOUR = 60 * 60 * 1000;
+
+function observation(
+	prNumber: string,
+	headSha: string,
+	agoMs = 0,
+	checkName = 'Verify',
+): CheckFailureObservation {
+	return { checkName, prNumber, headSha, observedAt: new Date(NOW.getTime() - agoMs) };
+}
+
+function pullRequest(overrides: Partial<PullRequestDetails> = {}): PullRequestDetails {
+	return {
+		number: 1,
+		headBranch: 'b',
+		headSha: 'h',
+		baseBranch: 'main',
+		baseSha: 'base',
+		mergeable: true,
+		authorLogin: null,
+		state: 'open',
+		...overrides,
+	} as PullRequestDetails;
+}
+
+describe('sharedCheckCandidates', () => {
+	const current = { prNumber: '10', headSha: 'h10' };
+
+	it('finds nothing for a pull request failing on its own', () => {
+		expect(sharedCheckCandidates([observation('10', 'h10')], current, ['Verify']).size).toBe(0);
+	});
+
+	it('names the other pull request failing the same check', () => {
+		const found = sharedCheckCandidates(
+			[observation('10', 'h10'), observation('11', 'h11')],
+			current,
+			['Verify'],
+		);
+		expect(found.get('Verify')).toEqual([{ prNumber: '11', headSha: 'h11' }]);
+	});
+
+	it('counts two heads of the same pull request once — and never as a second one', () => {
+		expect(
+			sharedCheckCandidates([observation('10', 'old'), observation('10', 'h10')], current, [
+				'Verify',
+			]).size,
+		).toBe(0);
+		const found = sharedCheckCandidates(
+			[observation('11', 'old', HOUR), observation('11', 'new')],
+			current,
+			['Verify'],
+		);
+		expect(found.get('Verify')).toEqual([{ prNumber: '11', headSha: 'new' }]);
+	});
+
+	it('does not mix checks', () => {
+		expect(
+			sharedCheckCandidates([observation('11', 'h11', 0, 'lint')], current, ['Verify']).size,
+		).toBe(0);
+	});
+});
+
+describe('noteAdjudicatedCheckFailures', () => {
+	const EPISODE: SharedCheckFailureEpisode = {
+		id: 'episode-1',
+		checkName: 'Verify',
+		openedAt: NOW,
+		reportedAt: null,
+	};
+	let deps: {
+		[K in keyof SharedCheckFailureDeps]: ReturnType<typeof vi.fn> & SharedCheckFailureDeps[K];
+	};
+	const getPullRequest = vi.fn(async (_p: ProjectConfig, n: number) =>
+		pullRequest({ number: n, headSha: `h${n}` }),
+	);
+	const describeFailedCheckAttempts = vi.fn(
+		async (_p: ProjectConfig, _ref: string): Promise<CheckAttemptRunner[]> => [],
+	);
+
+	function input(
+		overrides: Partial<NoteAdjudicatedCheckFailuresInput> = {},
+	): NoteAdjudicatedCheckFailuresInput {
+		return {
+			project: PROJECT,
+			scm: { getPullRequest, describeFailedCheckAttempts },
+			prNumber: '10',
+			headSha: 'h10',
+			failedChecks: ['Verify'],
+			...overrides,
+		};
+	}
+
+	beforeEach(() => {
+		vi.useFakeTimers({ toFake: ['Date'] });
+		vi.setSystemTime(NOW);
+		logger.info.mockClear();
+		logger.error.mockClear();
+		getPullRequest.mockClear();
+		describeFailedCheckAttempts.mockReset();
+		describeFailedCheckAttempts.mockResolvedValue([]);
+		deps = {
+			recordCheckFailureObservations: vi.fn(async () => {}),
+			listRecentCheckFailureObservations: vi.fn(async () => [
+				observation('10', 'h10'),
+				observation('11', 'h11'),
+			]),
+			findStandingEpisodes: vi.fn(async () => []),
+			openEpisode: vi.fn(async () => ({ episode: EPISODE, created: true })),
+			claimEpisodeReport: vi.fn(async () => true),
+			createFailedRun: vi.fn(async () => 'run-report'),
+		} as unknown as typeof deps;
+	});
+
+	it('records the sighting and stays per-head for a pull request failing on its own', async () => {
+		deps.listRecentCheckFailureObservations.mockResolvedValue([observation('10', 'h10')]);
+		const shared = await noteAdjudicatedCheckFailures(input(), deps);
+		expect(shared.size).toBe(0);
+		expect(deps.recordCheckFailureObservations).toHaveBeenCalledWith(
+			{ projectId: PROJECT.id, repository: PROJECT.repo, prNumber: '10', headSha: 'h10' },
+			['Verify'],
+		);
+		expect(deps.listRecentCheckFailureObservations).toHaveBeenCalledWith(
+			PROJECT.id,
+			PROJECT.repo,
+			['Verify'],
+			new Date(NOW.getTime() - SHARED_CHECK_WINDOW_MS),
+		);
+		expect(getPullRequest).not.toHaveBeenCalled();
+		expect(deps.openEpisode).not.toHaveBeenCalled();
+		expect(deps.createFailedRun).not.toHaveBeenCalled();
+	});
+
+	it('opens one episode and reports it once, naming the check and every pull request', async () => {
+		const shared = await noteAdjudicatedCheckFailures(
+			input({ jobPayload: { type: 'scm' } as never }),
+			deps,
+		);
+		expect([...shared]).toEqual(['Verify']);
+		expect(getPullRequest).toHaveBeenCalledWith(PROJECT, 11);
+		expect(deps.openEpisode).toHaveBeenCalledWith(
+			PROJECT.id,
+			PROJECT.repo,
+			'Verify',
+			new Date(NOW.getTime() - SHARED_CHECK_EPISODE_MAX_AGE_MS),
+		);
+		expect(deps.createFailedRun).toHaveBeenCalledTimes(1);
+		const run = deps.createFailedRun.mock.calls[0][0] as {
+			taskId: string;
+			phase: string;
+			prNumber: string;
+			error: string;
+			jobPayload: unknown;
+			failureDiagnosis: { kind: string; message: string };
+		};
+		expect(run).toMatchObject({ taskId: '10-ci', phase: 'respond-to-ci', prNumber: '10' });
+		expect(run.jobPayload).toEqual({ type: 'scm' });
+		expect(run.failureDiagnosis.kind).toBe('shared-check-failure');
+		expect(run.failureDiagnosis.message).toContain('#10, #11');
+		expect(run.error).toContain('check Verify fails on 2 approved pull requests');
+		expect(run.error).toContain('#10 (h10), #11 (h11)');
+		expect(run.error).not.toContain('ran on');
+		expect(logger.error).toHaveBeenCalledWith(
+			'shared check failure: one check fails on several approved pull requests',
+			expect.objectContaining({
+				check: 'Verify',
+				pullRequests: [
+					{ prNumber: '10', headSha: 'h10' },
+					{ prNumber: '11', headSha: 'h11' },
+				],
+			}),
+		);
+	});
+
+	it('names the runners where the provider reports them', async () => {
+		describeFailedCheckAttempts.mockImplementation(async (_p, ref) => [
+			{ check: 'Verify', attempt: 1, runner: 'm5_pro_sm_1' },
+			{ check: 'lint', attempt: 1, runner: 'other' },
+			...(ref === 'h11' ? [{ check: 'Verify', attempt: 2, runner: 'm5_pro_sm_1' }] : []),
+		]);
+		await noteAdjudicatedCheckFailures(input(), deps);
+		const run = deps.createFailedRun.mock.calls[0][0] as { error: string };
+		expect(run.error).toContain(
+			'The failed attempts ran on: #10: attempt 1 `m5_pro_sm_1`; #11: attempt 1 `m5_pro_sm_1`, attempt 2 `m5_pro_sm_1`.',
+		);
+		expect(run.error).toContain('All 3 failed attempts ran on one runner, `m5_pro_sm_1`.');
+	});
+
+	it('still reports when a runner read throws', async () => {
+		describeFailedCheckAttempts.mockRejectedValue(new Error('provider down'));
+		await noteAdjudicatedCheckFailures(input(), deps);
+		expect(deps.createFailedRun).toHaveBeenCalledTimes(1);
+	});
+
+	it.each([
+		['closed', pullRequest({ state: 'closed', headSha: 'h11' })],
+		['moved to a new head', pullRequest({ headSha: 'newer' })],
+	])('does not count another pull request that is %s', async (_name, pr) => {
+		getPullRequest.mockResolvedValueOnce(pr);
+		expect((await noteAdjudicatedCheckFailures(input(), deps)).size).toBe(0);
+		expect(deps.openEpisode).not.toHaveBeenCalled();
+	});
+
+	it('does not count another pull request it cannot read (fail closed)', async () => {
+		getPullRequest.mockRejectedValueOnce(new Error('502'));
+		expect((await noteAdjudicatedCheckFailures(input(), deps)).size).toBe(0);
+		expect(deps.openEpisode).not.toHaveBeenCalled();
+	});
+
+	it('reads at most the probe cap of other pull requests', async () => {
+		deps.listRecentCheckFailureObservations.mockResolvedValue(
+			Array.from({ length: MAX_SHARED_CHECK_PROBES + 5 }, (_, i) =>
+				observation(String(100 + i), `h${100 + i}`, i),
+			),
+		);
+		await noteAdjudicatedCheckFailures(input(), deps);
+		expect(getPullRequest).toHaveBeenCalledTimes(MAX_SHARED_CHECK_PROBES);
+	});
+
+	it('writes nothing for the caller that loses the report claim', async () => {
+		deps.claimEpisodeReport.mockResolvedValueOnce(true).mockResolvedValue(false);
+		const first = await noteAdjudicatedCheckFailures(input(), deps);
+		const second = await noteAdjudicatedCheckFailures(
+			input({ prNumber: '11', headSha: 'h11' }),
+			deps,
+		);
+		expect([...first]).toEqual(['Verify']);
+		expect([...second]).toEqual(['Verify']);
+		expect(deps.createFailedRun).toHaveBeenCalledTimes(1);
+	});
+
+	it('joins a standing episode without probing or reporting again', async () => {
+		deps.findStandingEpisodes.mockResolvedValue([EPISODE]);
+		const shared = await noteAdjudicatedCheckFailures(
+			input({ prNumber: '12', headSha: 'h12' }),
+			deps,
+		);
+		expect([...shared]).toEqual(['Verify']);
+		expect(deps.findStandingEpisodes).toHaveBeenCalledWith(
+			PROJECT.id,
+			PROJECT.repo,
+			['Verify'],
+			new Date(NOW.getTime() - SHARED_CHECK_EPISODE_MAX_AGE_MS),
+		);
+		expect(deps.listRecentCheckFailureObservations).not.toHaveBeenCalled();
+		expect(getPullRequest).not.toHaveBeenCalled();
+		expect(deps.openEpisode).not.toHaveBeenCalled();
+		expect(deps.createFailedRun).not.toHaveBeenCalled();
+	});
+
+	it('answers only the checks that are shared', async () => {
+		deps.listRecentCheckFailureObservations.mockResolvedValue([
+			observation('10', 'h10'),
+			observation('11', 'h11'),
+			observation('10', 'h10', 0, 'lint'),
+		]);
+		const shared = await noteAdjudicatedCheckFailures(
+			input({ failedChecks: ['Verify', 'lint'] }),
+			deps,
+		);
+		expect([...shared]).toEqual(['Verify']);
+	});
+
+	it('does nothing for a head that names no failing check', async () => {
+		expect((await noteAdjudicatedCheckFailures(input({ failedChecks: [] }), deps)).size).toBe(0);
+		expect(deps.recordCheckFailureObservations).not.toHaveBeenCalled();
+	});
+});
+
+describe('summarizeSharedRunners', () => {
+	it('is null when no attempt names a runner', () => {
+		expect(
+			summarizeSharedRunners([
+				{
+					head: { prNumber: '10', headSha: 'h10' },
+					attempts: [{ check: 'Verify', attempt: 1, runner: null }],
+				},
+			]),
+		).toBeNull();
+	});
+
+	it('does not claim one runner when the attempts ran on several', () => {
+		const summary = summarizeSharedRunners([
+			{
+				head: { prNumber: '10', headSha: 'h10' },
+				attempts: [{ check: 'Verify', attempt: 1, runner: 'a' }],
+			},
+			{
+				head: { prNumber: '11', headSha: 'h11' },
+				attempts: [{ check: 'Verify', attempt: 1, runner: 'b' }],
+			},
+		]);
+		expect(summary).toBe('The failed attempts ran on: #10: attempt 1 `a`; #11: attempt 1 `b`.');
+	});
+});

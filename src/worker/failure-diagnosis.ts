@@ -20,6 +20,7 @@ export const FailureDiagnosisKindSchema = z.enum([
 	'review-provider-unreachable',
 	'approved-head-needs-operator',
 	'ci-fix-attempts-exhausted',
+	'shared-check-failure',
 ]);
 
 export type FailureDiagnosisKind = z.infer<typeof FailureDiagnosisKindSchema>;
@@ -52,13 +53,16 @@ export type KnownFailureCondition = Exclude<
  * situation to a person (issue #1462): the approved head whose checks stayed red
  * after its one re-run (`handToOperator`, `src/dispatch/approved-head-checks-rerun.ts`)
  * and the Respond-to-CI fix-attempt cap (`recordAbandonedCiFix`,
- * `src/triggers/handlers/review.ts`). Such a run is `failed` only so it is
+ * `src/triggers/handlers/review.ts`), and the one report of a check failing on
+ * several approved pull requests at once (issue #1464,
+ * `src/dispatch/shared-check-failure.ts`). Such a run is `failed` only so it is
  * visible; Resolve problem never attempts it, and every one of its sweep legs
  * reads this set rather than the run's error text.
  */
 export const OPERATOR_HANDOFF_DIAGNOSIS_KINDS = [
 	'approved-head-needs-operator',
 	'ci-fix-attempts-exhausted',
+	'shared-check-failure',
 ] as const satisfies readonly FailureDiagnosisKind[];
 
 export type OperatorHandoffDiagnosisKind = (typeof OPERATOR_HANDOFF_DIAGNOSIS_KINDS)[number];
@@ -245,6 +249,12 @@ export type OperatorHandoffDiagnosisInput =
 			prNumber: string;
 			attempt: number;
 			maxAttempts: number;
+	  }
+	| {
+			kind: 'shared-check-failure';
+			check: string;
+			/** Every affected pull request, the one the run is anchored on included. */
+			prNumbers: string[];
 	  };
 
 /**
@@ -260,6 +270,15 @@ export function operatorHandoffDiagnosis(input: OperatorHandoffDiagnosisInput): 
 			'Approved head needs the operator',
 			`PR #${input.prNumber} at ${input.headSha} is approved, but its checks are still red (${checks}) after SWARM's one re-run. SWARM's CI agent judged the failure unrelated to this pull request, so SWARM handed it to a person and will not act on this head again.`,
 			'Re-run the checks — SWARM merges this head once they pass — or push a fix, which gets its own review.',
+		);
+	}
+	if (input.kind === 'shared-check-failure') {
+		const prs = input.prNumbers.map((pr) => `#${pr}`).join(', ');
+		return diagnosis(
+			input.kind,
+			'One check is failing on several pull requests',
+			`Check ${input.check} fails on several approved pull requests at once (${prs}), and SWARM's CI agent judged it unrelated to each of them. SWARM reported it once here and stopped re-running it and notifying on each pull request.`,
+			"Fix or de-flake the check on the base branch, or re-run a pull request's checks by hand — SWARM merges an approved head once its checks pass.",
 		);
 	}
 	return diagnosis(

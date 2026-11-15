@@ -25,6 +25,7 @@ import {
 	RESOLVE_PROBLEM_DELAY_MS,
 	RESOLVE_PROBLEM_LOOKBACK_MS,
 } from '@/dispatch/resolve-problem-trigger.js';
+import { SHARED_CHECK_EPISODE_MAX_AGE_MS } from '@/dispatch/shared-check-failure.js';
 import type { AggregateCheckStatus, PullRequestDetails } from '@/scm/types.js';
 import { operatorHandoffDiagnosis } from '@/worker/failure-diagnosis.js';
 import { createMockProjectRecord } from '../../helpers/factories.js';
@@ -265,9 +266,11 @@ describe('redHeadHandled (issue #1459)', () => {
 	const reads = (
 		slot: Awaited<ReturnType<RedHeadHandledReads['getApprovedHeadSlot']>>,
 		updated?: Awaited<ReturnType<RedHeadHandledReads['findUpdatedHeadReviewRun']>>,
+		sharedCheck?: string,
 	): RedHeadHandledReads => ({
 		getApprovedHeadSlot: vi.fn(async () => slot),
 		findUpdatedHeadReviewRun: vi.fn(async () => updated),
+		findStandingEpisodeCheckForHead: vi.fn(async () => sharedCheck),
 	});
 
 	it('is nothing for the incident’s head: no approval at it, no re-run, no hand-off', async () => {
@@ -341,6 +344,24 @@ describe('redHeadHandled (issue #1459)', () => {
 		});
 		await expect(redHeadHandled(key, false, now, approved)).resolves.toMatch(/person to merge/);
 		await expect(redHeadHandled(key, true, now, approved)).resolves.toBeUndefined();
+	});
+
+	it('is a head a standing shared check failure covers, read within the episode age (issue #1464)', async () => {
+		const approved = {
+			checksRerunAt: null,
+			checksRerunAttempts: 0,
+			operatorNotifiedAt: null,
+		};
+		const shared = reads(approved, undefined, 'integration');
+		await expect(redHeadHandled(key, true, now, shared)).resolves.toMatch(
+			/Check integration is failing on several pull requests/,
+		);
+		expect(shared.findStandingEpisodeCheckForHead).toHaveBeenCalledWith(
+			key,
+			new Date(now.getTime() - SHARED_CHECK_EPISODE_MAX_AGE_MS),
+		);
+		// A head no standing episode covers is unchanged.
+		await expect(redHeadHandled(key, true, now, reads(approved))).resolves.toBeUndefined();
 	});
 });
 
