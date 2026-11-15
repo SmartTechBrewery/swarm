@@ -260,10 +260,25 @@ describe('operator hand-off diagnoses (issue #1462)', () => {
 		expect(diagnosis.recovery).toContain('Fix the build by hand');
 	});
 
-	it('marks only the two hand-off kinds as hand-offs', () => {
+	it('names the shared check and every affected pull request (issue #1464)', () => {
+		const diagnosis = operatorHandoffDiagnosis({
+			kind: 'shared-check-failure',
+			check: 'Verify',
+			prNumbers: ['10', '11'],
+		});
+
+		expect(diagnosis.kind).toBe('shared-check-failure');
+		expect(diagnosis.title).toBe('One check is failing on several pull requests');
+		expect(diagnosis.message).toContain('Check Verify');
+		expect(diagnosis.message).toContain('#10, #11');
+		expect(diagnosis.recovery).toContain('Fix or de-flake the check on the base branch');
+	});
+
+	it('marks only the three hand-off kinds as hand-offs', () => {
 		expect([...OPERATOR_HANDOFF_DIAGNOSIS_KINDS]).toEqual([
 			'approved-head-needs-operator',
 			'ci-fix-attempts-exhausted',
+			'shared-check-failure',
 		]);
 		for (const kind of OPERATOR_HANDOFF_DIAGNOSIS_KINDS) {
 			expect(isOperatorHandoffDiagnosis(kind)).toBe(true);

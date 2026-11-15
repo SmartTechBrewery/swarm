@@ -54,7 +54,11 @@
  *  - no Respond-to-CI re-dispatch on an adjudicated approved head — the
  *    `pr-review` trigger resolves such a head's red to this policy before it
  *    takes any dispatch claim or fix attempt;
- *  - one green re-arm per (approving run, head) — phase 1's own dedup key.
+ *  - one green re-arm per (approving run, head) — phase 1's own dedup key;
+ *  - no re-run or notice for a check failing on several pull requests at once
+ *    (issue #1464, `./shared-check-failure.ts`): while that check's episode
+ *    stands, the head answers `shared-failure` and the one shared report speaks
+ *    for it. A pull request failing on its own keeps the per-head policy.
  *
  * Lives under `src/dispatch/` for the reason `./base-branch-health.ts` and
  * `./ci-no-fix-recovery.ts` do: it is not scheduled by a phase (ai/RULES.md §2).
@@ -85,6 +89,7 @@ import {
 	releaseReviewDispatch,
 } from '../triggers/review-dispatch-dedup.js';
 import { operatorHandoffDiagnosis } from '../worker/failure-diagnosis.js';
+import { noteAdjudicatedCheckFailures } from './shared-check-failure.js';
 
 /**
  * How long after the re-run was requested a red read is still taken to be the
@@ -188,6 +193,9 @@ export function approvedHeadRerunInFlight(
  *  - `rerun-waiting` — a re-run failed again, and the next one is not due yet;
  *  - `needs-operator` — the last re-run failed again, or one could not be made;
  *    the once-only notice has been written (or already was);
+ *  - `shared-failure` — every failing check fails on several approved pull
+ *    requests at once and that shared failure is reported once (issue #1464):
+ *    no re-run, no per-head notice or comment, nothing to re-read;
  *  - `not-applicable` — merge automation is off for the repository, or the head
  *    has no submitted approval, so the policy does not apply.
  */
@@ -196,6 +204,7 @@ export type AdjudicatedApprovedHeadOutcome =
 	| 'rerun-settling'
 	| 'rerun-waiting'
 	| 'needs-operator'
+	| 'shared-failure'
 	| 'not-applicable';
 
 /** {@link recoverAdjudicatedApprovedHead}'s answer: what it did, and when to look again. */
@@ -213,9 +222,14 @@ export interface RecoverAdjudicatedApprovedHeadInput {
 	project: ProjectConfig;
 	/**
 	 * The two writes the policy makes through the provider — the re-run, and the
-	 * notice — and the one read the notice adds: where each failed attempt ran.
+	 * notice — and the two reads it adds: where each failed attempt ran, and
+	 * whether another pull request failing the same check is still open (issue
+	 * #1464).
 	 */
-	scm: Pick<SCMProvider, 'rerunFailedChecks' | 'deliveryProvider' | 'describeFailedCheckAttempts'>;
+	scm: Pick<
+		SCMProvider,
+		'rerunFailedChecks' | 'deliveryProvider' | 'describeFailedCheckAttempts' | 'getPullRequest'
+	>;
 	prNumber: string;
 	/** The approved head whose red was adjudicated. */
 	headSha: string;
@@ -231,6 +245,7 @@ export interface RecoverAdjudicatedApprovedHeadInput {
 
 const NOT_APPLICABLE: AdjudicatedApprovedHeadDecision = { outcome: 'not-applicable' };
 const NEEDS_OPERATOR: AdjudicatedApprovedHeadDecision = { outcome: 'needs-operator' };
+const SHARED_FAILURE: AdjudicatedApprovedHeadDecision = { outcome: 'shared-failure' };
 const SETTLING: AdjudicatedApprovedHeadDecision = {
 	outcome: 'rerun-settling',
 	recheckAfterMs: RERUN_SETTLE_RECHECK_DELAY_MS,
@@ -273,6 +288,7 @@ export async function recoverAdjudicatedApprovedHead(
 	if (!slot) return NOT_APPLICABLE;
 	// Already handed off: every later red finds the notice written and writes nothing.
 	if (slot.operatorNotifiedAt) return NEEDS_OPERATOR;
+	if (await isSharedFailure(input)) return SHARED_FAILURE;
 
 	const attempts = slot.checksRerunAttempts;
 	const now = Date.now();
@@ -329,6 +345,35 @@ export async function recoverAdjudicatedApprovedHead(
 		return SETTLING;
 	}
 	return requestRerun(input, key, attempts + 1);
+}
+
+/**
+ * Whether every failing check on this head fails on several approved pull
+ * requests at once (issue #1464) — recorded, detected and reported once by
+ * `noteAdjudicatedCheckFailures`. Fails open: an error leaves the head on the
+ * per-head policy, so a database fault can never silence it.
+ */
+async function isSharedFailure(input: RecoverAdjudicatedApprovedHeadInput): Promise<boolean> {
+	const { prNumber, headSha, failedChecks } = input;
+	if (failedChecks.length === 0) return false;
+	let shared: Set<string>;
+	try {
+		shared = await noteAdjudicatedCheckFailures(input);
+	} catch (err) {
+		logger.error('approved head: could not check for a shared check failure — per-head policy', {
+			prNumber,
+			headSha,
+			error: describeError(err),
+		});
+		return false;
+	}
+	if (!failedChecks.every((check) => shared.has(check))) return false;
+	logger.info('approved head: its failing checks fail on several pull requests — standing down', {
+		prNumber,
+		headSha,
+		failedChecks,
+	});
+	return true;
 }
 
 /** The hand-off's account of the re-runs when every one of them failed. */

@@ -11,6 +11,10 @@ export { projectMembers } from './projectMembers.js';
 export { projects } from './projects.js';
 export { reviewVerdicts } from './reviewVerdicts.js';
 export { runAttempts, runLogs, runOutputEvents, runs } from './runs.js';
+export {
+	sharedCheckFailureEpisodes,
+	sharedCheckFailureObservations,
+} from './sharedCheckFailures.js';
 export { stalledDismissals } from './stalledDismissals.js';
 export { userIdentities } from './userIdentities.js';
 export { userPasswordTokens } from './userPasswordTokens.js';

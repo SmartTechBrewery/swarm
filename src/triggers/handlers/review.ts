@@ -1024,10 +1024,15 @@ async function isAdjudicatedApprovedHead(
 }
 
 /** What the approved-head re-run policy did, for the reason a retried run records (issue #1248). */
-const ADJUDICATED_RED_OUTCOMES: Record<'rerun-requested' | 'needs-operator', string> = {
+const ADJUDICATED_RED_OUTCOMES: Record<
+	'rerun-requested' | 'needs-operator' | 'shared-failure',
+	string
+> = {
 	'rerun-requested': 'it re-ran them, and that re-run decides what happens next',
 	'needs-operator':
 		'its re-runs already failed again or one could not be made, so the pull request needs an operator',
+	'shared-failure':
+		'the same checks fail on several pull requests at once, so SWARM reported that once and is not re-running them here',
 };
 
 /**
@@ -1039,7 +1044,10 @@ const ADJUDICATED_RED_OUTCOMES: Record<'rerun-requested' | 'needs-operator', str
  * head is decided off the re-run's verdict rather than a lagging read of the
  * state before it; a head whose next re-run is not due yet (`rerun-waiting`,
  * issue #1463) is re-read when it falls due, which is what spends it. Both waits
- * use {@link scheduleRerunSettleRecheck} with the delay the policy returned.
+ * use {@link scheduleRerunSettleRecheck} with the delay the policy returned. A
+ * head whose failing checks fail on several pull requests at once
+ * (`shared-failure`, issue #1464) is re-read by nothing: the one shared report
+ * speaks for it.
  *
  * Returns `false` only when the policy answered `not-applicable` — it did
  * nothing — so the ordinary-red caller can fall open to its pre-#1128 routing,

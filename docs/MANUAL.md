@@ -1809,9 +1809,10 @@ attempt for a run when all of these hold:
   (issue #1453). Restarting it is that person's call;
 - the run is not a deliberate hand-off SWARM wrote to a person — *Approved head
   needs the operator* (an approved pull request whose checks stayed red after its
-  re-runs) or *CI fix abandoned* (the Respond-to-CI attempt cap). Each of these
-  records its own failure diagnosis (`approved-head-needs-operator`,
-  `ci-fix-attempts-exhausted`), and no leg of the sweep ever attempts it: it
+  re-runs), *CI fix abandoned* (the Respond-to-CI attempt cap) or *One check is
+  failing on several pull requests* (a shared check failure, issue #1464). Each
+  of these records its own failure diagnosis (`approved-head-needs-operator`,
+  `ci-fix-attempts-exhausted`, `shared-check-failure`), and no leg of the sweep ever attempts it: it
   already says what a person must do (issue #1462);
 - the run is not itself a Resolve problem run, and it has no attempt yet.
 
@@ -1888,6 +1889,18 @@ a pull request when all of these hold:
   every attempt ran on one — where the provider reports it (GitHub does; the
   other providers omit it); it counts as acted on until its next re-run is a
   couple of minutes overdue;
+- the head is not covered by a **shared check failure** (issue #1464): the same
+  check, judged unrelated by SWARM's CI agent, failing on two or more open
+  approved pull requests of the repository within 24 hours. SWARM reports that
+  once — one failed run titled *One check is failing on several pull requests*,
+  naming the check, every affected pull request and head, and where the
+  provider reports them the runners the failed attempts ran on — and, for 24
+  hours from then, stops re-running those pull requests' checks, writes no
+  per-pull-request notice or comment, and makes no Resolve problem attempt on
+  them. Fix or de-flake the check on the base branch, or re-run a pull
+  request's checks by hand: a green re-run merges as usual. A pull request
+  failing on its own keeps the per-head re-runs above. (Resuming the affected
+  pull requests automatically when the base branch advances is not built yet.)
 - the head is not an approval waiting for a person to merge it on a repository
   without `autoMerge`. Approved heads with `autoMerge` on, and heads not yet
   approved, both count.

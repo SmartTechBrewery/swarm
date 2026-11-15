@@ -2137,6 +2137,8 @@ const ADJUDICATED_RED_MESSAGES: Record<
 		"the failing checks stayed red after SWARM's re-run; SWARM re-runs them again shortly and merges this head once they pass",
 	'needs-operator':
 		"SWARM's CI agent judged the failure unrelated to this pull request, and the failing checks stayed red after SWARM's re-runs (or could not be re-run); the pull request needs the operator — see the notice on the pull request",
+	'shared-failure':
+		'the failing checks fail on several pull requests at once; SWARM reported that once and is not re-running them here',
 };
 
 /**
@@ -2159,9 +2161,10 @@ const ADJUDICATED_RED_MESSAGES: Record<
  * approved-head re-run policy acts instead, and the refusal says what it did.
  * A requested re-run is commented on in its own words; a re-run still settling,
  * one waiting for its spaced successor (issue #1463 — the `pr-review` trigger,
- * which the failed re-run's own `checks` event reaches, owns that re-read) and a
- * head handed to the operator are not, because the operator notice *is* the
- * comment. Every form still settles terminally — the green re-arm (issue
+ * which the failed re-run's own `checks` event reaches, owns that re-read), a
+ * head handed to the operator and a head whose failing checks fail on several
+ * pull requests at once (issue #1464, `shared-failure`) are not, because the
+ * operator notice — or the one shared report — *is* the comment. Every form still settles terminally — the green re-arm (issue
  * #1128, {@link rearmMergeAutomationForGreenHead}) is what merges the head once
  * its re-run passes.
  */

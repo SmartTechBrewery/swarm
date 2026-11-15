@@ -2990,6 +2990,24 @@ describe('review trigger — a red on an adjudicated approved head (issue #1128)
 		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
 	});
 
+	// Issue #1464: the failing check fails on several pull requests at once and was
+	// reported once. Nothing is pending, so nothing is re-read, and the red never
+	// reaches Respond-to-CI.
+	it('drops the event, re-reading nothing, when the failing check is shared', async () => {
+		adjudicatedAndApproved();
+		recoverAdjudicatedApprovedHead.mockResolvedValue({ outcome: 'shared-failure' });
+		const noteDecline = vi.fn();
+
+		expect(await handler.handle(autoCtx({ noteDecline }))).toBeNull();
+		expect(scheduleCoalescedJob).not.toHaveBeenCalled();
+		expect(claimReviewDispatch).not.toHaveBeenCalled();
+		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+		expect(createFailedRun).not.toHaveBeenCalled();
+		expect(noteDecline).toHaveBeenCalledWith(
+			expect.objectContaining({ reason: expect.stringContaining('fail on several pull requests') }),
+		);
+	});
+
 	// The policy's own precondition, checked before any read: without merge
 	// automation nothing would re-run or merge the head, so the red keeps its
 	// pre-#1128 routing rather than being dropped.
