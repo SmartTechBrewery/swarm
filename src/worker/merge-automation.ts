@@ -172,6 +172,7 @@ import {
 import { settleAbsorbedChildren } from '../dispatch/absorbed-child-settle.js';
 import {
 	type AdjudicatedApprovedHeadOutcome,
+	MAX_APPROVED_HEAD_RERUNS,
 	recoverAdjudicatedApprovedHead,
 } from '../dispatch/approved-head-checks-rerun.js';
 import { supersedeApprovalsParkedAtHead } from '../dispatch/base-push-supersession.js';
@@ -2104,13 +2105,14 @@ async function adjudicateRedApprovedHead(
 		);
 		if (!adjudicated) return 'not-applicable';
 		const recover = capabilities.recoverAdjudicatedApprovedHead ?? recoverAdjudicatedApprovedHead;
-		return await recover({
+		const decision = await recover({
 			project,
 			scm: requireProjectSCMProvider(project),
 			prNumber: job.prNumber,
 			headSha: job.approvedHeadSha,
 			failedChecks,
 		});
+		return decision.outcome;
 	} catch (err) {
 		logger.error('Merge automation: could not apply the approved-head re-run policy', {
 			runId: job.reviewRunId,
@@ -2131,8 +2133,10 @@ const ADJUDICATED_RED_MESSAGES: Record<
 		"SWARM's CI agent judged the failure unrelated to this pull request, so SWARM re-ran the failing checks; it merges this head once they pass",
 	'rerun-settling':
 		'SWARM re-ran the failing checks moments ago; it merges this head once they pass',
+	'rerun-waiting':
+		"the failing checks stayed red after SWARM's re-run; SWARM re-runs them again shortly and merges this head once they pass",
 	'needs-operator':
-		"SWARM's CI agent judged the failure unrelated to this pull request, and the failing checks stayed red after SWARM's one re-run (or could not be re-run); the pull request needs the operator — see the notice on the pull request",
+		"SWARM's CI agent judged the failure unrelated to this pull request, and the failing checks stayed red after SWARM's re-runs (or could not be re-run); the pull request needs the operator — see the notice on the pull request",
 };
 
 /**
@@ -2153,9 +2157,11 @@ const ADJUDICATED_RED_MESSAGES: Record<
  * Unless that red was already adjudicated `no-fix` (issue #1128,
  * {@link adjudicateRedApprovedHead}): Respond-to-CI already declined it, so the
  * approved-head re-run policy acts instead, and the refusal says what it did.
- * A requested re-run is commented on in its own words; a re-run still settling
- * and a head handed to the operator are not, because the operator notice *is*
- * the comment. Every form still settles terminally — the green re-arm (issue
+ * A requested re-run is commented on in its own words; a re-run still settling,
+ * one waiting for its spaced successor (issue #1463 — the `pr-review` trigger,
+ * which the failed re-run's own `checks` event reaches, owns that re-read) and a
+ * head handed to the operator are not, because the operator notice *is* the
+ * comment. Every form still settles terminally — the green re-arm (issue
  * #1128, {@link rearmMergeAutomationForGreenHead}) is what merges the head once
  * its re-run passes.
  */
@@ -2186,7 +2192,7 @@ async function refuseRedHead(
 				capabilities,
 				mergeRefusalCommentBody(
 					`The review approved head \`${job.approvedHeadSha}\`, but that head fails its checks: ${failed}. SWARM's CI agent judged the failure unrelated to this pull request, so SWARM re-ran the failing checks.`,
-					'Nothing is needed from you yet: once the re-run passes, SWARM merges this head. If the checks fail again, SWARM leaves a separate notice saying the pull request needs you.',
+					`Nothing is needed from you yet: once the re-run passes, SWARM merges this head. If they keep failing, SWARM re-runs them up to ${MAX_APPROVED_HEAD_RERUNS} times, spaced out, before leaving a separate notice saying the pull request needs you.`,
 					RED_HEAD_CONSEQUENCE,
 				),
 			);

@@ -1,15 +1,20 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ApprovedHeadSlot } from '@/db/repositories/reviewVerdictsRepository.js';
 
-// The review-verdict ledger's two once-only stamps and the slot read (issue
-// #1128). Mocked: the conditional updates themselves are the ledger's own
-// integration suite; this one asserts the policy built on their answers.
-const claimApprovedHeadChecksRerun = vi.fn(async (_key: unknown) => true);
+// The review-verdict ledger's counted re-run claim, once-only notice stamp and the
+// slot read (issues #1128, #1463). Mocked: the conditional updates themselves are
+// the ledger's own integration suite; this one asserts the policy built on their
+// answers.
+const claimApprovedHeadChecksRerun = vi.fn(
+	async (_key: unknown, _expected: number, _max: number) => true,
+);
 const getApprovedHeadSlot = vi.fn(
-	async (_key: unknown): Promise<{ checksRerunAt: Date | null } | undefined> => undefined,
+	async (_key: unknown): Promise<ApprovedHeadSlot | undefined> => undefined,
 );
 const claimApprovedHeadOperatorNotice = vi.fn(async (_key: unknown) => true);
 vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
-	claimApprovedHeadChecksRerun: (key: unknown) => claimApprovedHeadChecksRerun(key),
+	claimApprovedHeadChecksRerun: (key: unknown, expected: number, max: number) =>
+		claimApprovedHeadChecksRerun(key, expected, max),
 	getApprovedHeadSlot: (key: unknown) => getApprovedHeadSlot(key),
 	claimApprovedHeadOperatorNotice: (key: unknown) => claimApprovedHeadOperatorNotice(key),
 }));
@@ -48,6 +53,11 @@ vi.mock('@/lib/logger.js', () => ({
 
 import type { ProjectConfig } from '@/config/schema.js';
 import {
+	APPROVED_HEAD_RERUN_GAPS_MS,
+	approvedHeadRerunInFlight,
+	MAX_APPROVED_HEAD_RERUNS,
+	nextApprovedHeadRerunDueAt,
+	RERUN_DUE_RECHECK_MARGIN_MS,
 	RERUN_SETTLE_MS,
 	RERUN_SETTLE_RECHECK_DELAY_MS,
 	type RecoverAdjudicatedApprovedHeadInput,
@@ -82,6 +92,18 @@ const deliveryProvider = vi.fn(
 		({ postComment }) as unknown as ScmDeliveryProvider,
 );
 
+const NOW = new Date('2026-11-15T12:00:00.000Z');
+const MINUTE = 60 * 1000;
+
+/** An approved head's slot with `attempts` re-runs spent, the latest `agoMs` before {@link NOW}. */
+function slot(attempts: number, agoMs?: number, operatorNotifiedAt: Date | null = null) {
+	return {
+		checksRerunAttempts: attempts,
+		checksRerunAt: agoMs === undefined ? null : new Date(NOW.getTime() - agoMs),
+		operatorNotifiedAt,
+	};
+}
+
 function input(
 	overrides: Partial<RecoverAdjudicatedApprovedHeadInput> = {},
 ): RecoverAdjudicatedApprovedHeadInput {
@@ -96,10 +118,12 @@ function input(
 }
 
 beforeEach(() => {
+	vi.useFakeTimers({ toFake: ['Date'] });
+	vi.setSystemTime(NOW);
 	claimApprovedHeadChecksRerun.mockReset();
 	claimApprovedHeadChecksRerun.mockResolvedValue(true);
 	getApprovedHeadSlot.mockReset();
-	getApprovedHeadSlot.mockResolvedValue(undefined);
+	getApprovedHeadSlot.mockResolvedValue(slot(0));
 	claimApprovedHeadOperatorNotice.mockReset();
 	claimApprovedHeadOperatorNotice.mockResolvedValue(true);
 	createFailedRun.mockClear();
@@ -110,26 +134,68 @@ beforeEach(() => {
 	runAsPullRequestOperator.mockClear();
 });
 
+afterEach(() => {
+	vi.useRealTimers();
+});
+
+describe('the re-run schedule', () => {
+	it('re-runs up to three times, the requests landing at about 0, +15 and +45 minutes', () => {
+		expect(MAX_APPROVED_HEAD_RERUNS).toBe(3);
+		expect(APPROVED_HEAD_RERUN_GAPS_MS).toHaveLength(MAX_APPROVED_HEAD_RERUNS);
+		expect(APPROVED_HEAD_RERUN_GAPS_MS).toEqual([0, 15 * MINUTE, 30 * MINUTE]);
+	});
+
+	it.each([
+		['unspent: due at once', slot(0), new Date(0)],
+		['one spent: due 15 min after it', slot(1, 0), new Date(NOW.getTime() + 15 * MINUTE)],
+		['two spent: due 30 min after the second', slot(2, 0), new Date(NOW.getTime() + 30 * MINUTE)],
+		['all spent: none due', slot(3, 0), null],
+		['a spent attempt with no stamp: due at once', slot(1), new Date(0)],
+	])('nextApprovedHeadRerunDueAt — %s', (_name, given, expected) => {
+		expect(nextApprovedHeadRerunDueAt(given)).toEqual(expected);
+	});
+
+	it.each([
+		['nothing spent', slot(0), false],
+		['inside the settle window', slot(1, RERUN_SETTLE_MS - 1_000), true],
+		['the last re-run, still settling', slot(3, RERUN_SETTLE_MS - 1_000), true],
+		['waiting for the next re-run', slot(1, 5 * MINUTE), true],
+		[
+			'past due, within the recheck grace',
+			slot(1, 15 * MINUTE + RERUN_SETTLE_RECHECK_DELAY_MS - 1_000),
+			true,
+		],
+		['past due and past the grace', slot(1, 15 * MINUTE + RERUN_SETTLE_RECHECK_DELAY_MS), false],
+		['every re-run spent and settled', slot(3, RERUN_SETTLE_MS + 1_000), false],
+		['already handed to the operator', slot(1, 5 * MINUTE, new Date(NOW)), false],
+	])('approvedHeadRerunInFlight — %s', (_name, given, expected) => {
+		expect(approvedHeadRerunInFlight(given, NOW)).toBe(expected);
+	});
+});
+
 describe('recoverAdjudicatedApprovedHead', () => {
 	it('does not apply when merge automation is off for the repository', async () => {
 		expect(
 			await recoverAdjudicatedApprovedHead(input({ project: createMockProjectConfig() })),
-		).toBe('not-applicable');
+		).toEqual({ outcome: 'not-applicable' });
+		expect(getApprovedHeadSlot).not.toHaveBeenCalled();
 		expect(claimApprovedHeadChecksRerun).not.toHaveBeenCalled();
 		expect(rerunFailedChecks).not.toHaveBeenCalled();
 	});
 
 	it('does not apply to a head with no submitted approval', async () => {
-		claimApprovedHeadChecksRerun.mockResolvedValue(false);
 		getApprovedHeadSlot.mockResolvedValue(undefined);
-		expect(await recoverAdjudicatedApprovedHead(input())).toBe('not-applicable');
+		expect(await recoverAdjudicatedApprovedHead(input())).toEqual({ outcome: 'not-applicable' });
+		expect(claimApprovedHeadChecksRerun).not.toHaveBeenCalled();
 		expect(rerunFailedChecks).not.toHaveBeenCalled();
 		expect(createFailedRun).not.toHaveBeenCalled();
 	});
 
-	it('spends the one re-run as the pull request’s operator and releases the PR+SHA claim', async () => {
-		expect(await recoverAdjudicatedApprovedHead(input())).toBe('rerun-requested');
-		expect(claimApprovedHeadChecksRerun).toHaveBeenCalledWith(KEY);
+	it('spends the first re-run at once, as the pull request’s operator, and releases the PR+SHA claim', async () => {
+		expect(await recoverAdjudicatedApprovedHead(input())).toEqual({
+			outcome: 'rerun-requested',
+		});
+		expect(claimApprovedHeadChecksRerun).toHaveBeenCalledWith(KEY, 0, MAX_APPROVED_HEAD_RERUNS);
 		expect(runAsPullRequestOperator.mock.calls[0]?.slice(0, 2)).toEqual([PROJECT, '42']);
 		expect(rerunFailedChecks).toHaveBeenCalledWith(PROJECT, 'abc123', 'implementer');
 		// So the re-run's own `checks completed` is decided, not dropped as a duplicate.
@@ -138,13 +204,119 @@ describe('recoverAdjudicatedApprovedHead', () => {
 		expect(postComment).not.toHaveBeenCalled();
 	});
 
+	it('lets a re-run requested moments ago settle rather than reading it as failed', async () => {
+		getApprovedHeadSlot.mockResolvedValue(slot(1, 10_000));
+		expect(await recoverAdjudicatedApprovedHead(input())).toEqual({
+			outcome: 'rerun-settling',
+			recheckAfterMs: RERUN_SETTLE_RECHECK_DELAY_MS,
+		});
+		expect(claimApprovedHeadChecksRerun).not.toHaveBeenCalled();
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+		expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
+	});
+
+	it('waits for the next re-run when one failed before its gap has passed', async () => {
+		getApprovedHeadSlot.mockResolvedValue(slot(1, 5 * MINUTE));
+		expect(await recoverAdjudicatedApprovedHead(input())).toEqual({
+			outcome: 'rerun-waiting',
+			recheckAfterMs: 10 * MINUTE + RERUN_DUE_RECHECK_MARGIN_MS,
+		});
+		expect(claimApprovedHeadChecksRerun).not.toHaveBeenCalled();
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+		expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
+	});
+
+	it('spaces the re-runs by a growing gap', async () => {
+		// Re-run 2 falls due 15 min after re-run 1.
+		getApprovedHeadSlot.mockResolvedValue(slot(1, 15 * MINUTE));
+		expect(await recoverAdjudicatedApprovedHead(input())).toEqual({
+			outcome: 'rerun-requested',
+		});
+		expect(claimApprovedHeadChecksRerun).toHaveBeenLastCalledWith(KEY, 1, MAX_APPROVED_HEAD_RERUNS);
+
+		// Re-run 3 is still waiting 29 min after re-run 2…
+		getApprovedHeadSlot.mockResolvedValue(slot(2, 29 * MINUTE));
+		expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('rerun-waiting');
+		expect(claimApprovedHeadChecksRerun).toHaveBeenCalledTimes(1);
+
+		// …and falls due at 30 min.
+		getApprovedHeadSlot.mockResolvedValue(slot(2, 30 * MINUTE));
+		expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('rerun-requested');
+		expect(claimApprovedHeadChecksRerun).toHaveBeenLastCalledWith(KEY, 2, MAX_APPROVED_HEAD_RERUNS);
+		expect(rerunFailedChecks).toHaveBeenCalledTimes(2);
+		expect(createFailedRun).not.toHaveBeenCalled();
+	});
+
+	it('settles, re-running nothing, when a concurrent caller spent the attempt first', async () => {
+		getApprovedHeadSlot.mockResolvedValue(slot(1, 20 * MINUTE));
+		claimApprovedHeadChecksRerun.mockResolvedValue(false);
+		expect(await recoverAdjudicatedApprovedHead(input())).toEqual({
+			outcome: 'rerun-settling',
+			recheckAfterMs: RERUN_SETTLE_RECHECK_DELAY_MS,
+		});
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+		expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
+	});
+
+	// The `pr-review` trigger's settle recheck waits this long, so even a read the
+	// instant the last re-run was stamped is decided — never `rerun-settling` — next time.
+	it('decides the re-read a settle recheck makes, however early it was scheduled', async () => {
+		getApprovedHeadSlot.mockResolvedValue(slot(3, RERUN_SETTLE_RECHECK_DELAY_MS));
+		expect(RERUN_SETTLE_RECHECK_DELAY_MS).toBeGreaterThan(RERUN_SETTLE_MS);
+		expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('needs-operator');
+	});
+
+	it('hands the head to the operator once its last re-run failed again', async () => {
+		getApprovedHeadSlot.mockResolvedValue(slot(3, RERUN_SETTLE_MS + 1_000));
+		expect(
+			await recoverAdjudicatedApprovedHead(
+				input({ failedChecks: ['lint', 'test'], jobPayload: { type: 'scm' } as never }),
+			),
+		).toEqual({ outcome: 'needs-operator' });
+		// Never a fourth re-run.
+		expect(claimApprovedHeadChecksRerun).not.toHaveBeenCalled();
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+		const run = createFailedRun.mock.calls[0][0] as { error: string; jobPayload?: unknown };
+		expect(run.error).toContain('PR #42 at abc123');
+		expect(run.error).toContain('lint, test');
+		expect(run.error).toContain("SWARM's CI agent judged the failure unrelated");
+		expect(run.error).toContain(
+			'SWARM re-ran the failing checks 3 times over at least 45 minutes, and they failed every time.',
+		);
+		expect(run.jobPayload).toEqual({ type: 'scm' });
+		// The notice speaks as the reviewer, like every comment the router posts (issue #1249).
+		expect(deliveryProvider).toHaveBeenCalledWith(PROJECT, 'reviewer');
+		const comment = postComment.mock.calls[0][0] as { body: string };
+		expect(comment.body).toContain('`lint`, `test`');
+		expect(comment.body).toContain('3 times');
+	});
+
+	it('writes the operator notice once only', async () => {
+		getApprovedHeadSlot.mockResolvedValue(slot(3, 60 * MINUTE));
+		claimApprovedHeadOperatorNotice.mockResolvedValueOnce(true).mockResolvedValue(false);
+		expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('needs-operator');
+		expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('needs-operator');
+		expect(claimApprovedHeadOperatorNotice).toHaveBeenCalledTimes(2);
+		expect(createFailedRun).toHaveBeenCalledTimes(1);
+		expect(postComment).toHaveBeenCalledTimes(1);
+	});
+
+	it('writes nothing on a head already handed to the operator', async () => {
+		getApprovedHeadSlot.mockResolvedValue(slot(1, 5 * MINUTE, new Date(NOW)));
+		expect(await recoverAdjudicatedApprovedHead(input())).toEqual({ outcome: 'needs-operator' });
+		expect(claimApprovedHeadChecksRerun).not.toHaveBeenCalled();
+		expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
+		expect(createFailedRun).not.toHaveBeenCalled();
+		expect(postComment).not.toHaveBeenCalled();
+	});
+
 	it.each([
 		['unsupported', { status: 'unsupported', message: 'no re-run API' }, 'no re-run API'],
 		['provider-error', { status: 'provider-error', message: 'HTTP 502' }, 'HTTP 502'],
 		['nothing-to-rerun', { status: 'nothing-to-rerun' }, 'no failed check it could re-run'],
-	] as const)('hands the head to the operator when the provider answers %s', async (_name, outcome, quoted) => {
+	] as const)('hands the head to the operator at once when the provider answers %s', async (_name, outcome, quoted) => {
 		rerunFailedChecks.mockResolvedValueOnce(outcome as RerunFailedChecksOutcome);
-		expect(await recoverAdjudicatedApprovedHead(input())).toBe('needs-operator');
+		expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('needs-operator');
 		expect(releaseReviewDispatch).not.toHaveBeenCalled();
 		expect(createFailedRun).toHaveBeenCalledWith(
 			expect.objectContaining({
@@ -177,58 +349,13 @@ describe('recoverAdjudicatedApprovedHead', () => {
 		);
 	});
 
-	it('lets a re-run requested moments ago settle rather than reading it as failed', async () => {
-		claimApprovedHeadChecksRerun.mockResolvedValue(false);
-		getApprovedHeadSlot.mockResolvedValue({ checksRerunAt: new Date(Date.now() - 10_000) });
-		expect(await recoverAdjudicatedApprovedHead(input())).toBe('rerun-settling');
-		expect(rerunFailedChecks).not.toHaveBeenCalled();
-		expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
-	});
-
-	// The `pr-review` trigger's settle recheck waits this long, so even a read the
-	// instant the re-run was stamped is decided — never `rerun-settling` — next time.
-	it('decides the re-read a settle recheck makes, however early it was scheduled', async () => {
-		claimApprovedHeadChecksRerun.mockResolvedValue(false);
-		getApprovedHeadSlot.mockResolvedValue({
-			checksRerunAt: new Date(Date.now() - RERUN_SETTLE_RECHECK_DELAY_MS),
-		});
-		expect(RERUN_SETTLE_RECHECK_DELAY_MS).toBeGreaterThan(RERUN_SETTLE_MS);
-		expect(await recoverAdjudicatedApprovedHead(input())).toBe('needs-operator');
-	});
-
-	it('hands the head to the operator once its one re-run failed again', async () => {
-		claimApprovedHeadChecksRerun.mockResolvedValue(false);
-		getApprovedHeadSlot.mockResolvedValue({
-			checksRerunAt: new Date(Date.now() - RERUN_SETTLE_MS - 1_000),
-		});
-		expect(
-			await recoverAdjudicatedApprovedHead(
-				input({ failedChecks: ['lint', 'test'], jobPayload: { type: 'scm' } as never }),
-			),
-		).toBe('needs-operator');
-		// Never a second re-run.
-		expect(rerunFailedChecks).not.toHaveBeenCalled();
-		const run = createFailedRun.mock.calls[0][0] as { error: string; jobPayload?: unknown };
-		expect(run.error).toContain('PR #42 at abc123');
-		expect(run.error).toContain('lint, test');
-		expect(run.error).toContain("SWARM's CI agent judged the failure unrelated");
-		expect(run.error).toContain('failed again');
-		expect(run.jobPayload).toEqual({ type: 'scm' });
-		// The notice speaks as the reviewer, like every comment the router posts (issue #1249).
-		expect(deliveryProvider).toHaveBeenCalledWith(PROJECT, 'reviewer');
-		const comment = postComment.mock.calls[0][0] as { body: string };
-		expect(comment.body).toContain('`lint`, `test`');
-	});
-
-	it('writes the operator notice once only', async () => {
-		claimApprovedHeadChecksRerun.mockResolvedValue(false);
-		getApprovedHeadSlot.mockResolvedValue({ checksRerunAt: new Date(0) });
-		claimApprovedHeadOperatorNotice.mockResolvedValueOnce(true).mockResolvedValue(false);
-		expect(await recoverAdjudicatedApprovedHead(input())).toBe('needs-operator');
-		expect(await recoverAdjudicatedApprovedHead(input())).toBe('needs-operator');
-		expect(claimApprovedHeadOperatorNotice).toHaveBeenCalledTimes(2);
-		expect(createFailedRun).toHaveBeenCalledTimes(1);
-		expect(postComment).toHaveBeenCalledTimes(1);
+	it('hands the head off at once when a later re-run is refused, naming the ones before it', async () => {
+		getApprovedHeadSlot.mockResolvedValue(slot(1, 15 * MINUTE));
+		rerunFailedChecks.mockResolvedValueOnce({ status: 'unsupported', message: 'no re-run API' });
+		expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('needs-operator');
+		expect((createFailedRun.mock.calls[0][0] as { error: string }).error).toContain(
+			'SWARM re-ran the failing checks once and they failed again, then could not re-run them again',
+		);
 	});
 
 	it('hands the head to the operator, re-running nothing, when there is no operator to act as', async () => {
@@ -236,7 +363,7 @@ describe('recoverAdjudicatedApprovedHead', () => {
 			"no operator source-control credential is stored for worker 'alice-laptop' on github";
 		runAsPullRequestOperator.mockRejectedValueOnce(new PullRequestOperatorUnavailableError(reason));
 
-		expect(await recoverAdjudicatedApprovedHead(input())).toBe('needs-operator');
+		expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('needs-operator');
 		expect(rerunFailedChecks).not.toHaveBeenCalled();
 		expect(releaseReviewDispatch).not.toHaveBeenCalled();
 		const run = createFailedRun.mock.calls[0]?.[0] as { error: string };
@@ -245,18 +372,36 @@ describe('recoverAdjudicatedApprovedHead', () => {
 		expect(postComment).toHaveBeenCalledOnce();
 	});
 
+	it('hands the head off at once when there is no operator for a later re-run', async () => {
+		getApprovedHeadSlot.mockResolvedValue(slot(2, 30 * MINUTE));
+		runAsPullRequestOperator.mockRejectedValueOnce(
+			new PullRequestOperatorUnavailableError('no operator'),
+		);
+		expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('needs-operator');
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+		expect((createFailedRun.mock.calls[0]?.[0] as { error: string }).error).toContain(
+			'SWARM re-ran the failing checks 2 times and they failed again, then could not re-run them again: no operator.',
+		);
+	});
+
 	it('names the operator whose credential the provider refused', async () => {
 		rerunFailedChecks.mockResolvedValueOnce({ status: 'provider-error', message: 'HTTP 401' });
 
-		expect(await recoverAdjudicatedApprovedHead(input())).toBe('needs-operator');
+		expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('needs-operator');
 		expect((createFailedRun.mock.calls[0]?.[0] as { error: string }).error).toContain(
 			"HTTP 401 (acting as the operator credential stored for worker 'alice-laptop')",
 		);
 	});
 
-	it('never throws: a ledger error leaves the head to its caller', async () => {
+	it('never throws: a ledger read error leaves the head to its caller', async () => {
+		getApprovedHeadSlot.mockRejectedValue(new Error('db down'));
+		expect(await recoverAdjudicatedApprovedHead(input())).toEqual({ outcome: 'not-applicable' });
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+	});
+
+	it('never throws: a ledger claim error leaves the head to its caller', async () => {
 		claimApprovedHeadChecksRerun.mockRejectedValue(new Error('db down'));
-		expect(await recoverAdjudicatedApprovedHead(input())).toBe('not-applicable');
+		expect(await recoverAdjudicatedApprovedHead(input())).toEqual({ outcome: 'not-applicable' });
 		expect(rerunFailedChecks).not.toHaveBeenCalled();
 	});
 
@@ -264,6 +409,6 @@ describe('recoverAdjudicatedApprovedHead', () => {
 		rerunFailedChecks.mockResolvedValueOnce({ status: 'unsupported', message: 'nope' });
 		createFailedRun.mockRejectedValueOnce(new Error('db down'));
 		postComment.mockRejectedValueOnce(new Error('HTTP 502'));
-		expect(await recoverAdjudicatedApprovedHead(input())).toBe('needs-operator');
+		expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('needs-operator');
 	});
 });

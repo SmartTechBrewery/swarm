@@ -77,7 +77,7 @@
  * licensing exactly one reservation past *either* bound.
  */
 
-import { and, asc, desc, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
 import { getDb } from '../client.js';
 import { dispatches } from '../schema/dispatches.js';
 import { reviewVerdicts } from '../schema/reviewVerdicts.js';
@@ -521,26 +521,44 @@ function submittedApprovalOf(key: ReviewVerdictKey) {
 }
 
 /**
- * Claim this approved head's one automatic re-run of its failed checks (issue
- * #1128, `src/dispatch/approved-head-checks-rerun.ts`). Conditional on a
- * `submitted` `approve` slot with no {@link reviewVerdicts.checksRerunAt} stamp
- * yet, so of every event that reaches an adjudicated red approved head exactly
- * one wins and re-runs; a second caller, a head that was not approved and a key
- * no slot exists for all answer `false`.
+ * Spend one of this approved head's automatic re-runs of its failed checks
+ * (issues #1128, #1463, `src/dispatch/approved-head-checks-rerun.ts`): a
+ * compare-and-swap on {@link reviewVerdicts.checksRerunAttempts}. Conditional on a
+ * `submitted` `approve` slot whose count is still `expectedAttempts` — the count
+ * the caller read — and below `maxAttempts`, so of every caller that read the same
+ * count exactly one wins, bumps it and stamps {@link reviewVerdicts.checksRerunAt};
+ * no head is ever re-run past `maxAttempts`. A loser, a stale count, a spent
+ * budget, a head that was not approved and a key no slot exists for all answer
+ * `false`. The limit is a parameter so the policy stays its one owner.
  */
-export async function claimApprovedHeadChecksRerun(key: ReviewVerdictKey): Promise<boolean> {
+export async function claimApprovedHeadChecksRerun(
+	key: ReviewVerdictKey,
+	expectedAttempts: number,
+	maxAttempts: number,
+): Promise<boolean> {
 	const rows = await getDb()
 		.update(reviewVerdicts)
-		.set({ checksRerunAt: new Date() })
-		.where(and(submittedApprovalOf(key), isNull(reviewVerdicts.checksRerunAt)))
+		.set({
+			checksRerunAttempts: sql`${reviewVerdicts.checksRerunAttempts} + 1`,
+			checksRerunAt: new Date(),
+		})
+		.where(
+			and(
+				submittedApprovalOf(key),
+				eq(reviewVerdicts.checksRerunAttempts, expectedAttempts),
+				lt(reviewVerdicts.checksRerunAttempts, maxAttempts),
+			),
+		)
 		.returning({ id: reviewVerdicts.id });
 	return rows.length > 0;
 }
 
 /** This head's submitted approval, projected for the approved-head re-run policy (issue #1128). */
 export interface ApprovedHeadSlot {
-	/** When SWARM re-ran this head's failed checks, or `null` while that re-run is unspent. */
+	/** When SWARM last requested a re-run of this head's failed checks, or `null` while none was. */
 	checksRerunAt: Date | null;
+	/** How many automatic re-runs SWARM has spent on this head (issue #1463). */
+	checksRerunAttempts: number;
 	/**
 	 * When SWARM handed this head to the operator ("Approved head needs the
 	 * operator"), or `null` while it has not — read by Resolve problem's red-head leg
@@ -556,6 +574,7 @@ export async function getApprovedHeadSlot(
 	const rows = await getDb()
 		.select({
 			checksRerunAt: reviewVerdicts.checksRerunAt,
+			checksRerunAttempts: reviewVerdicts.checksRerunAttempts,
 			operatorNotifiedAt: reviewVerdicts.operatorNotifiedAt,
 		})
 		.from(reviewVerdicts)
@@ -566,9 +585,8 @@ export async function getApprovedHeadSlot(
 
 /**
  * Claim the once-only operator notice for this approved head (issue #1128) —
- * the {@link claimApprovedHeadChecksRerun} twin over
- * {@link reviewVerdicts.operatorNotifiedAt}, so every red event after the
- * re-run failed finds the notice already written.
+ * a conditional update over {@link reviewVerdicts.operatorNotifiedAt}, so every
+ * red event after the last re-run failed finds the notice already written.
  */
 export async function claimApprovedHeadOperatorNotice(key: ReviewVerdictKey): Promise<boolean> {
 	const rows = await getDb()

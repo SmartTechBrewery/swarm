@@ -701,6 +701,13 @@
       "when": 1794466617846,
       "tag": "0099_review_merge_checks_rerun",
       "breakpoints": true
+    },
+    {
+      "idx": 100,
+      "version": "7",
+      "when": 1794760483423,
+      "tag": "0100_review_verdict_checks_rerun_attempts",
+      "breakpoints": true
     }
   ]
 }
