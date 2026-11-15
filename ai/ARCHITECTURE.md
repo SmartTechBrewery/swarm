@@ -470,7 +470,7 @@ Every other skip a retry can reach is reported too (issue #1248). Before it, a r
 
 **Nothing in SWARM watched the base branch until this landed.** A merge that broke `main` was only ever noticed *indirectly*, through some unrelated pull request whose CI then failed on the merge of its own head with the broken base — so the failure presented as belonging to a diff that had nothing to do with it, and a human had to infer the real cause from the wrong symptom. `src/dispatch/base-branch-health.ts` makes the base's own state a first-class observation instead.
 
-**It changes no lifecycle.** Nothing is dispatched, no phase runs, and no merge decision, trigger disposition, or review verdict is affected — which is what makes it safe on its own, ahead of the two halves that *act* on the answer (per-pull-request attribution, issue #873; prevention, issue #874 — both landed since, the latter inside the merge lifecycle, see "Durable dispatch state machine" below). It is scheduled at the composition root beside the reconciler and the unreviewed-PR sweep (`startControlPlaneDispatch`, `src/router/dispatcher.ts`), on its own `unref()`'d interval cleared in `close()`, and it lives under `src/dispatch/` for the reason `unreviewed-pr-recovery.ts` does: it is router-scheduled work, not work a phase creates.
+**It changes no lifecycle of its own.** Nothing is dispatched, no phase runs, and no merge decision, trigger disposition, or review verdict is affected by the health answer itself — which is what makes it safe on its own, ahead of the two halves that *act* on the answer (per-pull-request attribution, issue #873; prevention, issue #874 — both landed since, the latter inside the merge lifecycle, see "Durable dispatch state machine" below). It is scheduled at the composition root beside the reconciler and the unreviewed-PR sweep (`startControlPlaneDispatch`, `src/router/dispatcher.ts`), on its own `unref()`'d interval cleared in `close()`, and it lives under `src/dispatch/` for the reason `unreviewed-pr-recovery.ts` does: it is router-scheduled work, not work a phase creates. Since issue #1471 each pass, once it has read a head, also hands that head and whether it is red to the shared check failure's resume (`resumeSharedCheckFailures`, "A check failing on several approved pull requests" below) — which is the one place a pass can lead to a dispatch, and costs one database read and no provider read while nothing stands.
 
 **Cadence: 5 minutes, coded, not configurable** (`BASE_BRANCH_HEALTH_SWEEP_INTERVAL_MS`, on `DISPATCH_CONSUMER_CONCURRENCY`'s precedent — detection latency is not an operator dial). Shorter than the unreviewed-PR sweep's 15 on both halves of the same trade-off: a healthy pass here is **two provider reads per repository** against that sweep's list read plus one read per candidate, and a base left red silently costs every open pull request a full round of CI. It is deliberately **not** the reconciler's five minutes, which is tunable via `SWARM_STALE_RUN_SWEEP_INTERVAL_MS` — the values coincide and neither should ever be changed because the other was.
 
@@ -1100,7 +1100,23 @@ generation covers and not superseded) stopped with `not-eligible` or
 and never off the #841 bypass, whose head still reads red. That dispatch re-reads
 the checks like any other, so a red or pending head is still never merged, and a
 worker-side branch update (#1117) hands back to it by the run's active dispatch
-rather than by the `merge:<reviewRunId>` key. **A red approved head SWARM's own
+rather than by the `merge:<reviewRunId>` key. **A red approved head stopped by a
+shared check failure is resumed once when the base advances** (issue #1471):
+`resumeMergeAutomationAfterBaseAdvance` creates one merge dispatch per
+`(episode, approving run)`, deduped `merge-resume:<episodeId>:<reviewRunId>`, on
+the re-arm's own gates (`autoMerge`, `findApprovedReviewRunForRearm` with
+`MERGE_REARM_OUTCOMES`, no active dispatch on the run), carrying
+`resumeAfterBaseAdvance: true`. Only that flag, and only while no base update is
+spent, changes the red-head branch: instead of `refuseRedHead` the attempt goes
+into `reactToStaleBase`, so `updatePullRequestBranch` — or the #1117 worker
+catch-up — answers whether the head is behind. Staleness is asked of the update
+rather than of `mergePullRequest`, which would *merge* a head that is not behind,
+red or not. `updated` is the ordinary #874 advance (the review-slot pre-claim, the
+#1445 supersession, the wait for that head's CI: green merges with no fresh
+Review, red takes `refuseRedHead`'s updated-head branch and Respond-to-CI after the
+#1433 re-run, a conflict goes to Resolve-conflicts); `up-to-date`, from either the
+provider or the worker, is the #1124 refusal it would have had anyway; a transient
+update failure retries on the shared budget. **A red approved head SWARM's own
 CI agent already adjudicated is re-run instead of being left to
 Respond-to-CI** (issue #1128 phase 3): when the red head is the approved head
 itself (no base update spent) and a `no-fix` recovery dispatch is recorded for it
@@ -1164,8 +1180,33 @@ new outcome `shared-failure`: no re-run, no claim, no per-head notice. The
 persists `not-eligible` with its own message and no comment; Resolve problem's
 red-head leg skips the head (`redHeadHandled` → `findStandingEpisodeCheckForHead`).
 A head with any unshared failing check, a pull request failing on its own, and a
-detection that throws (fail open) keep the per-head policy. Resuming the affected
-pull requests when the base branch advances is phase 2.
+detection that throws (fail open) keep the per-head policy.
+
+**When the base advances, the episode is resolved and its pull requests are tried
+once more** (issue #1471, phase 2 of 2). An episode records the base head it
+opened against (`shared_check_failure_episodes.base_head_sha`, migration `0103`),
+stamped best-effort right after the opening caller's `openEpisode` through
+`getBranchHead` as the reviewer; a failed read leaves it `null`. The
+base-branch-health sweep hands every pass's base head to
+`resumeSharedCheckFailures` (`src/dispatch/shared-check-failure.ts`), which reads
+the repository's standing episodes (`listStandingEpisodesForRepository`, one
+database read and no provider read when there are none) and, per episode: stamps
+a `null` base head with this one and resumes nothing; does nothing while the base
+head is the stamped one; leaves the episode standing when the base moved on but
+reads red (base-blocked attribution, #873, owns a red base); and otherwise
+resolves it `base-advanced` through `resolveEpisode`, conditional on
+`resolved_at IS NULL`, so exactly one caller wins and only the winner resumes.
+The affected heads are each pull request's latest sighting of the check since
+`SHARED_CHECK_WINDOW_MS` before the episode opened (`listEpisodeAffectedHeads` —
+the sightings that opened it predate it); each is resumed only when one
+`getPullRequest` read finds it still open on that head and its approval slot has
+no `operator_notified_at` (a head already handed to the operator stays the
+operator's). The resume is `resumeMergeAutomationAfterBaseAdvance`
+(`src/worker/merge-automation.ts`), injected by the sweep because merge automation
+already imports this module through the re-run policy. Every episode and every
+head is handled in its own try/catch, and the sweep guards the call as well, so
+the pass and its red-base report never fail on it. Resolving the episode is also
+what lets a new red on that check be judged per head again.
 
 **A provider that cannot update a branch has a SWARM worker do it (issue #1117,
 merge queue 3/3).** Bitbucket Cloud, gitlab.com and Azure DevOps Services answer

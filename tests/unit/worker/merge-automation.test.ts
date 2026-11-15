@@ -203,11 +203,13 @@ import {
 	mergeCatchUpDedupKey,
 	mergeDispatchDedupKey,
 	mergeRearmDedupKey,
+	mergeResumeDedupKey,
 	mergeRetryDelayMs,
 	processMergeAutomationDispatch,
 	rearmMergeAutomationForGreenHead,
 	requestConflictResolution,
 	requestMergeAutomation,
+	resumeMergeAutomationAfterBaseAdvance,
 	UPDATED_HEAD_CHECKS_GRACE_MS,
 } from '@/worker/merge-automation.js';
 
@@ -3581,5 +3583,236 @@ describe('processMergeAutomationDispatch: whose account merges (issue #1249)', (
 		expect(updatePullRequestBranch).not.toHaveBeenCalled();
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-no-operator');
 		expect(outcome.result).toBe(MERGE_NO_OPERATOR);
+	});
+});
+
+describe('resumeMergeAutomationAfterBaseAdvance (issue #1471)', () => {
+	const autoMerging = { ...project, autoMerge: true };
+	const input = { project: autoMerging, prNumber: '17', headSha: 'deadbeef', episodeId: 'ep-1' };
+
+	beforeEach(() => {
+		findApprovedReviewRunForRearm.mockResolvedValue({ id: 'run-1', taskId: '17' });
+	});
+
+	it('keys the resume on the episode and the approving run', () => {
+		expect(mergeResumeDedupKey('ep-1', 'run-1')).toBe('merge-resume:ep-1:run-1');
+		expect(mergeResumeDedupKey('ep-2', 'run-1')).not.toBe(mergeResumeDedupKey('ep-1', 'run-1'));
+	});
+
+	it('resumes one merge dispatch for the stopped approval, flagged to bring a stale red head up to date', async () => {
+		await expect(resumeMergeAutomationAfterBaseAdvance(input)).resolves.toBe('resumed');
+
+		expect(findApprovedReviewRunForRearm).toHaveBeenCalledExactlyOnceWith(
+			{ projectId: project.id, repository: project.repo, prNumber: '17', headSha: 'deadbeef' },
+			MERGE_REARM_OUTCOMES,
+		);
+		expect(getActiveDispatchByRunId).toHaveBeenCalledExactlyOnceWith('run-1');
+		expect(createAndPublishDispatch).toHaveBeenCalledExactlyOnceWith({
+			projectId: project.id,
+			jobPayload: { ...job, resumeAfterBaseAdvance: true },
+			dedupKey: 'merge-resume:ep-1:run-1',
+			source: 'synthetic',
+			runId: 'run-1',
+			taskId: '17',
+			phase: 'merge-automation',
+		});
+	});
+
+	it('does nothing while merge automation is off for the repository', async () => {
+		await expect(
+			resumeMergeAutomationAfterBaseAdvance({
+				...input,
+				project: { ...project, autoMerge: false },
+			}),
+		).resolves.toBe('auto-merge-off');
+		expect(findApprovedReviewRunForRearm).not.toHaveBeenCalled();
+		expect(createAndPublishDispatch).not.toHaveBeenCalled();
+	});
+
+	it('does nothing without a stopped approval of this head', async () => {
+		findApprovedReviewRunForRearm.mockResolvedValue(undefined);
+		await expect(resumeMergeAutomationAfterBaseAdvance(input)).resolves.toBe('no-stopped-approval');
+		expect(createAndPublishDispatch).not.toHaveBeenCalled();
+	});
+
+	it('does nothing while the approving run still has a dispatch due', async () => {
+		getActiveDispatchByRunId.mockResolvedValue(mockDispatchRow({ state: 'retry-scheduled' }));
+		await expect(resumeMergeAutomationAfterBaseAdvance(input)).resolves.toBe('dispatch-active');
+		expect(createAndPublishDispatch).not.toHaveBeenCalled();
+	});
+
+	it('mints no duplicate for an episode that already resumed this run', async () => {
+		createAndPublishDispatch.mockResolvedValue({ dispatch: mockDispatchRow(), created: false });
+		await expect(resumeMergeAutomationAfterBaseAdvance(input)).resolves.toBe('already-resumed');
+	});
+
+	it('is best-effort: a creation failure is swallowed, never thrown', async () => {
+		createAndPublishDispatch.mockRejectedValue(new Error('db down'));
+		await expect(resumeMergeAutomationAfterBaseAdvance(input)).resolves.toBe('failed');
+	});
+});
+
+describe('processMergeAutomationDispatch: resumed after the base advanced (issue #1471)', () => {
+	const resumed: MergeAutomationJob = { ...job, resumeAfterBaseAdvance: true };
+	const commentSpy = () =>
+		vi.fn(async (_p: unknown, _n: number, _body: string, _persona?: string) => 1);
+
+	it('brings a red stale approved head up to date instead of refusing it', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+		const updatePullRequestBranch = updateReturning({ status: 'updated', headSha: 'merged-base' });
+		const commentOnPullRequest = commentSpy();
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), resumed, project, {
+			mergePullRequest,
+			updatePullRequestBranch,
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest,
+		});
+
+		// The red head is never offered to the merge capability.
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(updatePullRequestBranch).toHaveBeenCalledExactlyOnceWith(project, 17, 'deadbeef');
+		expect(commentOnPullRequest).not.toHaveBeenCalled();
+		expect(completeDispatch).not.toHaveBeenCalled();
+		const retry = lastRetryInput();
+		expect(retry.jobPayload).toEqual(
+			onTurn({
+				...resumed,
+				approvedHeadSha: 'merged-base',
+				baseUpdates: 1,
+				headAdvancedAt: expect.any(String),
+			}),
+		);
+		expect(retry.attempt).toBe(0);
+		expect(claimReviewDispatch).toHaveBeenCalledOnce();
+		expect(outcome.result).toBe('retry-scheduled');
+	});
+
+	it('merges the updated head once its own checks are green', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+		const updatePullRequestBranch = updateReturning({ status: 'updated', headSha: 'never' });
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			{ ...resumed, approvedHeadSha: 'merged-base', baseUpdates: 1 },
+			project,
+			{ mergePullRequest, updatePullRequestBranch },
+		);
+
+		expect(updatePullRequestBranch).not.toHaveBeenCalled();
+		expect(mergePullRequest).toHaveBeenCalledExactlyOnceWith(project, 17, 'merged-base');
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merged');
+		expect(outcome.result).toBe('merged');
+	});
+
+	it('refuses a red updated head through the existing updated-head handling', async () => {
+		const updatePullRequestBranch = updateReturning({ status: 'updated', headSha: 'never' });
+		const commentOnPullRequest = commentSpy();
+
+		const outcome = await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			{ ...resumed, approvedHeadSha: 'merged-base', baseUpdates: 1 },
+			project,
+			{
+				mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+				updatePullRequestBranch,
+				getAggregateCheckStatus: checksConcluding('failure'),
+				commentOnPullRequest,
+			},
+		);
+
+		expect(updatePullRequestBranch).not.toHaveBeenCalled();
+		const body = commentOnPullRequest.mock.calls[0]?.[2] as string;
+		expect(body).toContain('brought this pull request');
+		expect(body).toContain('Respond-to-CI');
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	it('refuses a red head that is not behind its base, as ever', async () => {
+		const mergePullRequest = mergeReturning({ status: 'merged', message: 'merged' });
+		const commentOnPullRequest = commentSpy();
+
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), resumed, project, {
+			mergePullRequest,
+			updatePullRequestBranch: updateReturning({ status: 'up-to-date' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest,
+		});
+
+		expect(mergePullRequest).not.toHaveBeenCalled();
+		expect(updateReviewMergeOutcome).toHaveBeenCalledExactlyOnceWith('run-1', {
+			status: 'not-eligible',
+			message: expect.stringMatching(/approved head fails its checks/),
+			attempt: 0,
+			approvedHeadSha: 'deadbeef',
+		});
+		expect(commentOnPullRequest).toHaveBeenCalledOnce();
+		expect(scheduleDispatchRetry).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(outcome.result).toBe('not-eligible');
+	});
+
+	it('retries on the shared budget when the update fails transiently', async () => {
+		const outcome = await processMergeAutomationDispatch(mockDispatchRow(), resumed, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			updatePullRequestBranch: updateReturning({ status: 'provider-error', message: '502' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest: commentSpy(),
+		});
+
+		expect(completeDispatch).not.toHaveBeenCalled();
+		expect(lastRetryInput().attempt).toBe(1);
+		expect(outcome.result).toBe('retry-scheduled');
+	});
+
+	it('asks a SWARM worker where the provider cannot update, and refuses once it finds the head current', async () => {
+		const UNSUPPORTED: UpdatePullRequestBranchOutcome = {
+			status: 'unsupported',
+			message: 'no update API',
+		};
+		const requestMergeCatchUp = vi.fn(async (_input: unknown) => {});
+		const capabilities = {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			updatePullRequestBranch: updateReturning(UNSUPPORTED),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest: commentSpy(),
+			requestMergeCatchUp,
+		};
+
+		const parked = await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			resumed,
+			project,
+			capabilities,
+		);
+		expect(requestMergeCatchUp).toHaveBeenCalledOnce();
+		expect(parked.result).toBe('retry-scheduled');
+		expect(completeDispatch).not.toHaveBeenCalled();
+
+		const refused = await processMergeAutomationDispatch(
+			mockDispatchRow(),
+			{ ...resumed, workerCatchUp: { requestedFor: 'deadbeef', result: { status: 'up-to-date' } } },
+			project,
+			capabilities,
+		);
+		expect(requestMergeCatchUp).toHaveBeenCalledOnce();
+		expect(capabilities.mergePullRequest).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
+		expect(refused.result).toBe('not-eligible');
+	});
+
+	it('still refuses a red head without the flag, without asking for an update (issue #1124)', async () => {
+		const updatePullRequestBranch = updateReturning({ status: 'updated', headSha: 'never' });
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning(STALE_BASE),
+			updatePullRequestBranch,
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest: commentSpy(),
+		});
+
+		expect(updatePullRequestBranch).not.toHaveBeenCalled();
+		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
 	});
 });

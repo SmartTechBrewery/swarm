@@ -222,13 +222,17 @@ export interface RecoverAdjudicatedApprovedHeadInput {
 	project: ProjectConfig;
 	/**
 	 * The two writes the policy makes through the provider — the re-run, and the
-	 * notice — and the two reads it adds: where each failed attempt ran, and
-	 * whether another pull request failing the same check is still open (issue
-	 * #1464).
+	 * notice — and the reads it adds: where each failed attempt ran, whether
+	 * another pull request failing the same check is still open (issue #1464), and
+	 * the base head a shared check failure opens against (issue #1471).
 	 */
 	scm: Pick<
 		SCMProvider,
-		'rerunFailedChecks' | 'deliveryProvider' | 'describeFailedCheckAttempts' | 'getPullRequest'
+		| 'rerunFailedChecks'
+		| 'deliveryProvider'
+		| 'describeFailedCheckAttempts'
+		| 'getPullRequest'
+		| 'getBranchHead'
 	>;
 	prNumber: string;
 	/** The approved head whose red was adjudicated. */

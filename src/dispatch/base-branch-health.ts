@@ -10,12 +10,16 @@
  * it, and a human has to infer the real cause from an unrelated symptom. This
  * sweep makes the base's own state a first-class observation instead.
  *
- * **It changes no lifecycle.** Nothing is dispatched, no phase runs, no merge
+ * **It changes no lifecycle of its own.** Nothing is dispatched, no phase runs, no merge
  * decision, trigger disposition, or review verdict is affected. On the healthy
  * path a pass costs exactly two provider reads per repository. That is what makes
  * it safe to ship on its own, ahead of the two halves that *act* on the answer:
  * per-pull-request attribution of a red CI to the base (issue #873) and
- * preventing a red base in the first place (issue #874).
+ * preventing a red base in the first place (issue #874). The one exception is
+ * borrowed: each pass hands the base head it read to the shared check failure's
+ * resume (issue #1471, `resumeSharedCheckFailures`), which resolves an episode
+ * the base has moved past and resumes the merges it stopped — a pass with no
+ * standing episode costs it one database read and no provider read.
  *
  * **The report, when the base is red.** Two things, both deliberate:
  *
@@ -52,6 +56,8 @@ import { deliveryIdentity } from '../scm/delivery.js';
 import { SWARM_GENERATED_FOOTER } from '../scm/swarm-origin.js';
 import type { AggregateCheckStatus, SCMProvider } from '../scm/types.js';
 import { decideAggregateCheckOutcome } from '../triggers/handlers/aggregate-check-decision.js';
+import { resumeMergeAutomationAfterBaseAdvance } from '../worker/merge-automation.js';
+import { resumeSharedCheckFailures } from './shared-check-failure.js';
 
 /**
  * How often the sweep runs.
@@ -281,6 +287,24 @@ async function sweepRepository(project: ProjectConfig): Promise<void> {
 			reason: health.reason,
 		});
 		return;
+	}
+	// A shared check failure standing in this repository is resolved, and the
+	// pull requests it stopped are tried once more, once the base has moved past
+	// the head it opened against and is not red (issue #1471). Guarded anyway:
+	// it must never cost this pass its red-base report.
+	try {
+		await resumeSharedCheckFailures({
+			project,
+			scm: provider,
+			baseHeadSha: health.headSha,
+			baseRed: health.status === 'red',
+			resumeMerge: (head) => resumeMergeAutomationAfterBaseAdvance(head),
+		});
+	} catch (err) {
+		logger.warn('base branch health: the shared check failure resume failed — continuing', {
+			...context,
+			error: describeError(err),
+		});
 	}
 	if (health.status !== 'red') {
 		logger.debug('base branch health: base branch is not reporting a completed failure', {

@@ -1899,8 +1899,17 @@ a pull request when all of these hold:
   per-pull-request notice or comment, and makes no Resolve problem attempt on
   them. Fix or de-flake the check on the base branch, or re-run a pull
   request's checks by hand: a green re-run merges as usual. A pull request
-  failing on its own keeps the per-head re-runs above. (Resuming the affected
-  pull requests automatically when the base branch advances is not built yet.)
+  failing on its own keeps the per-head re-runs above. When the base branch
+  moves on and is not red (a fix merged, or anything else landed), SWARM's
+  five-minute base-branch check closes the shared failure and tries each
+  affected approved pull request once more (issue #1471) — those still open on
+  the head it saw failing and not already handed to you: it brings the head up
+  to date with the base and waits for that head's own checks, with no fresh
+  review. Green merges; red is handled like any updated head that fails (one
+  re-run, then Respond-to-CI where enabled); a conflict goes to
+  Resolve-conflicts. A head that already contains the base is refused as
+  before. Only on repositories with `autoMerge`. A later red on that check is
+  judged per pull request again.
 - the head is not an approval waiting for a person to merge it on a repository
   without `autoMerge`. Approved heads with `autoMerge` on, and heads not yet
   approved, both count.

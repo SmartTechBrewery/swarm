@@ -23,9 +23,8 @@
  *   {@link MAX_SHARED_CHECK_PROBES}. A provider error fails closed: that pull
  *   request does not count. Openness is never assumed.
  * - **Episode.** One standing row per `(project, repository, check)`; it stands
- *   while unresolved and younger than {@link SHARED_CHECK_EPISODE_MAX_AGE_MS} —
- *   the bound that lets phase 1 ship alone, since nothing resolves an episode yet
- *   (resuming the affected pull requests when the base advances is phase 2).
+ *   while unresolved and younger than {@link SHARED_CHECK_EPISODE_MAX_AGE_MS}.
+ *   It records the base branch's head it opened against, best-effort.
  * - **Once-only report.** Whoever wins the episode's `reported_at` claim writes
  *   one structured error log and one durable `failed` Respond-to-CI run with the
  *   `shared-check-failure` diagnosis, which Resolve problem never attempts. No
@@ -35,19 +34,36 @@
  *   provider reports it (`describeFailedCheckAttempts`, issue #1468). Episodes are
  *   not split by runner: the contract offers no stable runner identity to key on.
  *
+ * - **Base advanced (issue #1471, phase 2).** The base-branch-health sweep
+ *   (`./base-branch-health.ts`) hands every pass's base head to
+ *   {@link resumeSharedCheckFailures}. Once the base has moved past the head an
+ *   episode opened against and is not red, the episode is resolved
+ *   `base-advanced` — exactly once, by a conditional update — so new reds on that
+ *   check are judged per head again, and each affected approved pull request
+ *   still open on the head it was sighted on, and not already handed to the
+ *   operator, is tried once more: its merge is resumed with a flag that brings a
+ *   stale red head up to date instead of refusing it, and the updated head's own
+ *   CI decides.
+ *
  * Lives under `src/dispatch/` beside the policy it serves.
  */
 
 import type { ProjectConfig } from '../config/schema.js';
+import { getApprovedHeadSlot } from '../db/repositories/reviewVerdictsRepository.js';
 import { createFailedRun } from '../db/repositories/runsRepository.js';
 import {
 	type CheckFailureHeadKey,
 	type CheckFailureObservation,
 	claimEpisodeReport,
 	findStandingEpisodes,
+	listEpisodeAffectedHeads,
 	listRecentCheckFailureObservations,
+	listStandingEpisodesForRepository,
 	openEpisode,
 	recordCheckFailureObservations,
+	resolveEpisode,
+	type StandingSharedCheckFailureEpisode,
+	stampEpisodeBaseHead,
 } from '../db/repositories/sharedCheckFailuresRepository.js';
 import { describeError } from '../lib/errors.js';
 import { logger } from '../lib/logger.js';
@@ -116,6 +132,7 @@ export interface SharedCheckFailureDeps {
 	findStandingEpisodes: typeof findStandingEpisodes;
 	openEpisode: typeof openEpisode;
 	claimEpisodeReport: typeof claimEpisodeReport;
+	stampEpisodeBaseHead: typeof stampEpisodeBaseHead;
 	createFailedRun: typeof createFailedRun;
 }
 
@@ -130,13 +147,14 @@ const defaultDeps: SharedCheckFailureDeps = {
 	openEpisode: (projectId, repository, check, expiredAtOrBefore) =>
 		openEpisode(projectId, repository, check, expiredAtOrBefore),
 	claimEpisodeReport: (episodeId) => claimEpisodeReport(episodeId),
+	stampEpisodeBaseHead: (episodeId, baseHeadSha) => stampEpisodeBaseHead(episodeId, baseHeadSha),
 	createFailedRun: (input) => createFailedRun(input),
 };
 
 export interface NoteAdjudicatedCheckFailuresInput {
 	/** Scoped to the pull request's repository. */
 	project: ProjectConfig;
-	scm: Pick<SCMProvider, 'getPullRequest' | 'describeFailedCheckAttempts'>;
+	scm: Pick<SCMProvider, 'getPullRequest' | 'describeFailedCheckAttempts' | 'getBranchHead'>;
 	prNumber: string;
 	/** The approved head whose red was adjudicated. */
 	headSha: string;
@@ -193,7 +211,13 @@ export async function noteAdjudicatedCheckFailures(
 	for (const [check, others] of sharedCheckCandidates(observations, current, unshared)) {
 		const confirmed = await confirmOpenHeads(input, others.slice(0, MAX_SHARED_CHECK_PROBES));
 		if (confirmed.length + 1 < MIN_SHARED_CHECK_PULL_REQUESTS) continue;
-		const { episode } = await deps.openEpisode(project.id, project.repo, check, openedAfter);
+		const { episode, created } = await deps.openEpisode(
+			project.id,
+			project.repo,
+			check,
+			openedAfter,
+		);
+		if (created) await stampOpeningBaseHead(input, episode.id, deps);
 		shared.add(check);
 		if (!(await deps.claimEpisodeReport(episode.id))) {
 			logger.info('shared check failure: already reported by another caller', {
@@ -206,6 +230,29 @@ export async function noteAdjudicatedCheckFailures(
 		await reportSharedCheckFailure(input, check, [current, ...confirmed], deps);
 	}
 	return shared;
+}
+
+/**
+ * Record the base branch's head a new episode opened against (issue #1471), which
+ * is what a later base-branch-health pass compares the base with. Best-effort:
+ * a failed read or write leaves it `null`, and the next pass stamps it instead.
+ */
+async function stampOpeningBaseHead(
+	input: NoteAdjudicatedCheckFailuresInput,
+	episodeId: string,
+	deps: SharedCheckFailureDeps,
+): Promise<void> {
+	const { project } = input;
+	try {
+		const baseHeadSha = await input.scm.getBranchHead(project, project.baseBranch, 'reviewer');
+		if (baseHeadSha) await deps.stampEpisodeBaseHead(episodeId, baseHeadSha);
+	} catch (err) {
+		logger.warn('shared check failure: could not record the base head the episode opened on', {
+			episodeId,
+			baseBranch: project.baseBranch,
+			error: describeError(err),
+		});
+	}
 }
 
 /**
@@ -342,4 +389,169 @@ export function summarizeSharedRunners(
 			? ` All ${all.length} failed attempts ran on one runner, \`${onlyRunner}\`.`
 			: '';
 	return `The failed attempts ran on: ${accounts}.${allOnOne}`;
+}
+
+/** The reads and writes {@link resumeSharedCheckFailures} makes, injectable for tests. */
+export interface SharedCheckResumeDeps {
+	listStandingEpisodesForRepository: typeof listStandingEpisodesForRepository;
+	stampEpisodeBaseHead: typeof stampEpisodeBaseHead;
+	resolveEpisode: typeof resolveEpisode;
+	listEpisodeAffectedHeads: typeof listEpisodeAffectedHeads;
+	getApprovedHeadSlot: typeof getApprovedHeadSlot;
+}
+
+const defaultResumeDeps: SharedCheckResumeDeps = {
+	listStandingEpisodesForRepository: (projectId, repository, openedAfter) =>
+		listStandingEpisodesForRepository(projectId, repository, openedAfter),
+	stampEpisodeBaseHead: (episodeId, baseHeadSha) => stampEpisodeBaseHead(episodeId, baseHeadSha),
+	resolveEpisode: (episodeId, resolution) => resolveEpisode(episodeId, resolution),
+	listEpisodeAffectedHeads: (projectId, repository, checkName, since) =>
+		listEpisodeAffectedHeads(projectId, repository, checkName, since),
+	getApprovedHeadSlot: (key) => getApprovedHeadSlot(key),
+};
+
+/** One affected head handed to merge automation, as {@link ResumeSharedCheckFailuresInput.resumeMerge} takes it. */
+export interface ResumeAffectedHead extends AffectedHead {
+	episodeId: string;
+	project: ProjectConfig;
+}
+
+export interface ResumeSharedCheckFailuresInput {
+	/** Scoped to the repository whose base branch was just read. */
+	project: ProjectConfig;
+	scm: Pick<SCMProvider, 'getPullRequest'>;
+	/** The base branch's head this pass read. */
+	baseHeadSha: string;
+	/** Whether this pass read the base branch red — a red base resumes nothing. */
+	baseRed: boolean;
+	/**
+	 * Merge automation's resume (`resumeMergeAutomationAfterBaseAdvance`,
+	 * `src/worker/merge-automation.ts`) — injected by the sweep rather than imported,
+	 * since merge automation already depends on this module through the approved-head
+	 * re-run policy. Expected never to throw.
+	 */
+	resumeMerge: (head: ResumeAffectedHead) => Promise<unknown>;
+}
+
+/**
+ * The base-branch-health sweep's half of a shared check failure (issue #1471):
+ * for each standing episode of this repository —
+ *
+ * - no base head recorded yet → record this one, and resume nothing;
+ * - the base head is still the recorded one → nothing;
+ * - the base moved on but is red → nothing: base-blocked attribution (issue #873)
+ *   owns a red base, and the episode keeps standing;
+ * - the base moved on and is not red → resolve the episode `base-advanced`, and
+ *   whoever wins that once-only resolution tries each affected approved pull
+ *   request once more ({@link resumeAffectedHeads}).
+ *
+ * Never throws: each episode is handled on its own and a failure is logged, so
+ * the sweep pass carries on.
+ */
+export async function resumeSharedCheckFailures(
+	input: ResumeSharedCheckFailuresInput,
+	deps: SharedCheckResumeDeps = defaultResumeDeps,
+): Promise<void> {
+	const { project, baseHeadSha } = input;
+	let episodes: StandingSharedCheckFailureEpisode[];
+	try {
+		episodes = await deps.listStandingEpisodesForRepository(
+			project.id,
+			project.repo,
+			new Date(Date.now() - SHARED_CHECK_EPISODE_MAX_AGE_MS),
+		);
+	} catch (err) {
+		logger.warn('shared check failure: could not read the standing episodes', {
+			projectId: project.id,
+			repository: project.repo,
+			error: describeError(err),
+		});
+		return;
+	}
+	for (const episode of episodes) {
+		const context = {
+			projectId: project.id,
+			repository: project.repo,
+			episodeId: episode.id,
+			check: episode.checkName,
+			baseHeadSha,
+		};
+		try {
+			if (episode.baseHeadSha === null) {
+				await deps.stampEpisodeBaseHead(episode.id, baseHeadSha);
+				continue;
+			}
+			if (episode.baseHeadSha === baseHeadSha) continue;
+			if (input.baseRed) {
+				logger.debug('shared check failure: the base moved on but is red — episode stands', {
+					...context,
+					episodeBaseHeadSha: episode.baseHeadSha,
+				});
+				continue;
+			}
+			if (!(await deps.resolveEpisode(episode.id, 'base-advanced'))) continue;
+			logger.info('shared check failure: the base advanced — resolved, resuming affected heads', {
+				...context,
+				episodeBaseHeadSha: episode.baseHeadSha,
+			});
+			await resumeAffectedHeads(input, episode, deps);
+		} catch (err) {
+			logger.warn('shared check failure: could not act on the base advancing', {
+				...context,
+				error: describeError(err),
+			});
+		}
+	}
+}
+
+/**
+ * Try each head a `base-advanced` episode covered once more: only a pull request
+ * still open on the very head it was sighted failing on (one provider read; a
+ * failed read skips it), and only one SWARM has not already handed to the operator
+ * — the #1128 notice is the operator's, not something a base push undoes.
+ */
+async function resumeAffectedHeads(
+	input: ResumeSharedCheckFailuresInput,
+	episode: StandingSharedCheckFailureEpisode,
+	deps: SharedCheckResumeDeps,
+): Promise<void> {
+	const { project } = input;
+	const heads = await deps.listEpisodeAffectedHeads(
+		project.id,
+		project.repo,
+		episode.checkName,
+		new Date(episode.openedAt.getTime() - SHARED_CHECK_WINDOW_MS),
+	);
+	for (const head of heads) {
+		const context = { episodeId: episode.id, prNumber: head.prNumber, headSha: head.headSha };
+		try {
+			const pr = await input.scm.getPullRequest(project, Number(head.prNumber), 'reviewer');
+			if (pr.state !== 'open' || pr.headSha !== head.headSha) {
+				logger.debug('shared check failure: affected pull request moved on — not resuming', {
+					...context,
+					state: pr.state,
+					currentHeadSha: pr.headSha,
+				});
+				continue;
+			}
+			const slot = await deps.getApprovedHeadSlot({
+				projectId: project.id,
+				repository: project.repo,
+				prNumber: head.prNumber,
+				headSha: head.headSha,
+			});
+			if (slot?.operatorNotifiedAt) {
+				logger.debug('shared check failure: head already handed to the operator — not resuming', {
+					...context,
+				});
+				continue;
+			}
+			await input.resumeMerge({ ...head, episodeId: episode.id, project });
+		} catch (err) {
+			logger.warn('shared check failure: could not resume an affected pull request', {
+				...context,
+				error: describeError(err),
+			});
+		}
+	}
 }

@@ -56,7 +56,13 @@ export const sharedCheckFailureObservations = pgTable(
  * The partial unique index keeps at most one unresolved episode per
  * `(project, repository, check)`; an unresolved one past its age is stamped
  * `resolution = 'expired'` before a successor opens. `resolution` is `text`, not
- * an enum, on `bug_reports.status`' precedent — phase 2 adds `base-advanced`.
+ * an enum, on `bug_reports.status`' precedent.
+ *
+ * `base_head_sha` is the base branch's head when the episode opened (issue #1471,
+ * phase 2) — stamped best-effort at opening, or by the next base-branch-health
+ * pass when that read failed. A pass that finds the base moved on from it and not
+ * red resolves the episode `base-advanced` and resumes the affected pull requests
+ * once (`resumeSharedCheckFailures`, `src/dispatch/shared-check-failure.ts`).
  */
 export const sharedCheckFailureEpisodes = pgTable(
 	'shared_check_failure_episodes',
@@ -71,8 +77,10 @@ export const sharedCheckFailureEpisodes = pgTable(
 		/** When the once-only report was claimed; `null` until a caller wins it. */
 		reportedAt: timestamp('reported_at'),
 		resolvedAt: timestamp('resolved_at'),
-		/** Why it was resolved — `expired` today. */
+		/** Why it was resolved — `expired` or `base-advanced`. */
 		resolution: text('resolution'),
+		/** The base branch's head when the episode opened; `null` until a read stamps it. */
+		baseHeadSha: text('base_head_sha'),
 	},
 	(table) => [
 		uniqueIndex('uq_shared_check_failure_episodes_standing')
