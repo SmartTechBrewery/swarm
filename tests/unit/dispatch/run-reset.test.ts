@@ -146,6 +146,7 @@ function makeRun(overrides: Partial<RunRow> = {}): RunRow {
 		reviewOrdinal: null,
 		reviewAutomationOutcome: null,
 		reviewAbsorbed: null,
+		resolveProblemOutcome: null,
 		reviewMergeOutcome: null,
 		reviewMergeMessage: null,
 		reviewMergeAttempt: null,

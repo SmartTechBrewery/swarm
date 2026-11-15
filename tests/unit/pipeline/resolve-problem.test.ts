@@ -163,6 +163,17 @@ describe('runResolveProblem (issue #1395)', () => {
 		expect(report).toEqual(alreadyResolved);
 	});
 
+	it('accepts a handed-off report (issue #1462)', async () => {
+		const handedOff: ResolveProblemReport = {
+			...REPORT,
+			outcome: 'handed-off',
+			actions: [],
+			summary: 'Re-run the failed CI job on PR #7: a flaky runner failed it.',
+		};
+		const { report } = await run({ runAgent: fakeAgent(handedOff) });
+		expect(report).toEqual(handedOff);
+	});
+
 	it('fails on a report that does not match the contract', async () => {
 		await expect(run({ runAgent: fakeAgent('{not json') })).rejects.toThrow(/not valid JSON/);
 		await expect(run({ runAgent: fakeAgent({ ...REPORT, outcome: 'maybe' }) })).rejects.toThrow(

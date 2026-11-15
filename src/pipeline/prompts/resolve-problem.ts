@@ -265,7 +265,7 @@ function recordLine(input: ResolveProblemPromptInput): string {
 function redHeadRemedyLines(input: ResolveProblemPromptInput): string[] {
 	if (!input.redHead) return [];
 	return [
-		'No SWARM tool re-runs a pull request’s checks, and you must not push a fix. If nothing SWARM can do moves the pull request, that is the expected outcome: leave it `unresolved`, and say exactly what a person should do — for example re-run the failed job, or push a fix. Report `already-resolved` instead when the pull request is no longer open, or its head moved on or went green before you acted (re-read it through `pr_live_state` or `pr_status`).',
+		'No SWARM tool re-runs a pull request’s checks, and you must not push a fix. If nothing SWARM can do moves the pull request, that is the expected outcome: report `handed-off`, and say exactly what a person should do — for example re-run the failed job, or push a fix. Report `already-resolved` instead when the pull request is no longer open, or its head moved on or went green before you acted (re-read it through `pr_live_state` or `pr_status`).',
 	];
 }
 
@@ -308,15 +308,15 @@ export function buildResolveProblemPrompt(
 		...livePullRequestLine(input),
 		`Then try remedies one at a time. After each one, check with the read tools whether the pipeline actually moved before you try the next. Never repeat an action on the same target. You may make at most ${maxWriteActions} real (non-dry-run) write calls in this run; SWARM refuses any beyond that.`,
 		`Every write tool takes \`dryRun\` and a mandatory \`reason\`. Call each write with \`dryRun: true\` first and read the preview, then repeat it for real only if the preview shows exactly what you intend. Give every call a specific \`reason\` naming ${reasonSubject} and the cause you found.`,
-		'Hard limits — never cross them, even if a tool would let you: never change code; never edit, push to, approve or merge a pull request; never override a safety stop SWARM placed on purpose — the review-verdict cap, merge-retry-exhausted, a user termination and anything like them. A safety stop is a hand-off to a person: report it, do not undo it. If the only fix is one of these, leave the problem unresolved and say so.',
+		'Hard limits — never cross them, even if a tool would let you: never change code; never edit, push to, approve or merge a pull request; never override a safety stop SWARM placed on purpose — the review-verdict cap, merge-retry-exhausted, a user termination and anything like them. A safety stop is a hand-off to a person: report it, do not undo it. If the only fix is one of these, report `handed-off` and say what the person must do.',
 		...(ticket
 			? [
-					'If no SWARM tool can move the ticket — for example, its board card needs a move only a person can make — leave it unresolved and say exactly what the person should do.',
+					'If no SWARM tool can move the ticket — for example, its board card needs a move only a person can make — report `handed-off` and say exactly what the person should do.',
 				]
 			: []),
 		...redHeadRemedyLines(input),
 		recordLine(input),
-		`Finally write \`${RESOLVE_PROBLEM_REPORT_FILENAME}\` in your working directory as JSON: \`{ "outcome": "resolved" | "already-resolved" | "unresolved", "bugReportId": "<the report you created or added to>", "actions": [{ "tool": "<tool name>", "target": "<what it acted on>", "result": "<what happened>" }], "summary": "<the cause and what you did, for the operator>" }\`. List every real write in \`actions\` (an empty list if you made none). Say \`resolved\` only when you saw the pipeline move again; \`already-resolved\` when the problem was already gone before you fixed anything — its pull request merged or closed outside SWARM, or a newer run already did the work — with the summary saying how you know; otherwise \`unresolved\`, with the summary saying what a person needs to do next.`,
+		`Finally write \`${RESOLVE_PROBLEM_REPORT_FILENAME}\` in your working directory as JSON: \`{ "outcome": "resolved" | "already-resolved" | "handed-off" | "unresolved", "bugReportId": "<the report you created or added to>", "actions": [{ "tool": "<tool name>", "target": "<what it acted on>", "result": "<what happened>" }], "summary": "<the cause and what you did, for the operator>" }\`. List every real write in \`actions\` (an empty list if you made none). Say \`resolved\` only when you saw the pipeline move again; \`already-resolved\` when the problem was already gone before you fixed anything — its pull request merged or closed outside SWARM, or a newer run already did the work — with the summary saying how you know; \`handed-off\` when you identified the cause and the only remedy is a person’s action you must not take — a summary that opens with what the person should do; \`unresolved\` only when you could not diagnose the situation, or when remedies you were allowed to try failed with no clear person’s action to name.`,
 		...subjectSections,
 		...projectInstructionsParagraph(customPrompt),
 	].join('\n\n');

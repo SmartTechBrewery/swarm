@@ -43,7 +43,8 @@ function PullRequestReference({ ticket }: { ticket: WipTicket }) {
 /** One slot holder: what it is, since when it holds the slot, and what it is doing. */
 /**
  * A waiting holder's Resolve problem attempt (issue #1428): what it concluded, the
- * message an unresolved attempt left (truncated, full text on hover), and a link to
+ * message an unresolved or handed-off attempt left (truncated, full text on hover;
+ * for a hand-off, what the person should do — issue #1462), and a link to
  * the attempt run. Neutral-toned — the Waiting on you badge is the one attention
  * cue. Nothing for a holder without an attempt.
  */

@@ -66,6 +66,13 @@ interface RunStatusBadgeProps extends ComponentProps<'span'> {
 	reviewCapSpent?: boolean | null;
 	/** Which bound made the cap-spent approval stop (issue #1080) — selects the tooltip only. */
 	reviewCapStop?: ForceReReviewRunState['reviewCapStop'];
+	/**
+	 * The successful outcome a completed Resolve problem run's report named (issue
+	 * #1462). `handed-off` on a completed `resolve-problem` run reads **Handed off**
+	 * rather than "Completed": the agent diagnosed the situation and a person must
+	 * act. Anything else keeps the lifecycle badge.
+	 */
+	resolveProblemOutcome?: string | null;
 }
 
 interface BadgeConfig {
@@ -263,6 +270,21 @@ const SUPERSEDED_APPROVAL_CONFIG: BadgeConfig = {
 		"Approved, but the pull request's head moved before it merged — this review did not spend a review-cap slot, and SWARM reviews the new head instead.",
 };
 
+/**
+ * A completed Resolve problem run that handed the problem to a person (issue #1462):
+ * it diagnosed the situation, filed its bug report and settled `completed`, but the
+ * remedy is a person's action. Amber — the warning hue `ai/DESIGN_SYSTEM.md` §1 uses
+ * for "needs attention, not broken" — so it reads apart from the green "Completed"
+ * of a resolution and the red "Failed" of an attempt that could not diagnose it; the
+ * label, not the hue, says which amber state it is.
+ */
+const HANDED_OFF_CONFIG: BadgeConfig = {
+	text: 'Handed off',
+	classes: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+	dotClass: 'bg-amber-400',
+	title: 'Resolve problem diagnosed it — a person must act. Open the run for what to do.',
+};
+
 /** Title-case a hyphenated verdict key for a label ('some-verdict' → 'Some verdict'). */
 function humanizeVerdict(verdict: string): string {
 	const spaced = verdict.replace(/-/g, ' ');
@@ -289,6 +311,7 @@ type BadgeInput = Pick<
 	| 'reviewMergeOutcome'
 	| 'reviewCapSpent'
 	| 'reviewCapStop'
+	| 'resolveProblemOutcome'
 > & { timedOut: boolean; cancelled: boolean };
 
 /**
@@ -328,6 +351,13 @@ function resolveBadgeConfig(input: BadgeInput): BadgeConfig {
 	if (status === 'completed' && phase === 'review' && reviewVerdict) {
 		return reviewVerdictConfig({ ...input, phase, reviewVerdict });
 	}
+	if (
+		status === 'completed' &&
+		phase === 'resolve-problem' &&
+		input.resolveProblemOutcome === 'handed-off'
+	) {
+		return HANDED_OFF_CONFIG;
+	}
 	return (
 		STATUS_CONFIGS[status] ?? {
 			text: status,
@@ -348,6 +378,7 @@ export function RunStatusBadge({
 	reviewMergeOutcome,
 	reviewCapSpent,
 	reviewCapStop,
+	resolveProblemOutcome,
 	className = '',
 	...props
 }: RunStatusBadgeProps) {
@@ -362,6 +393,7 @@ export function RunStatusBadge({
 		reviewMergeOutcome,
 		reviewCapSpent,
 		reviewCapStop,
+		resolveProblemOutcome,
 	});
 
 	return (

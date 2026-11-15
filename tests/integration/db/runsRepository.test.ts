@@ -4366,6 +4366,39 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)('runsRepository (integrati
 			expect(rows[0]?.resolvesRunId).toBeNull();
 		});
 
+		// Issue #1462: the WIP fold tells a hand-off from a resolution by this column.
+		it('persists and reads a completed attempt’s Resolve problem outcome', async () => {
+			const anchor = await createRun({ projectId: PROJECT_ID, taskId: '70', phase: 'review' });
+			const attempt = await createRun({
+				projectId: PROJECT_ID,
+				taskId: '70',
+				phase: 'resolve-problem',
+				resolvesRunId: anchor,
+			});
+			await completeRun(attempt, {
+				status: 'completed',
+				error: 'Resolve problem handed the failed run to a person — Force re-review PR #7.',
+				resolveProblemOutcome: 'handed-off',
+			});
+
+			expect((await getRunByIdFromDb(attempt))?.resolveProblemOutcome).toBe('handed-off');
+			const rows = await listResolveProblemAttemptsForHolders({
+				anchorRunIds: [anchor],
+				tickets: [],
+			});
+			expect(rows[0]).toMatchObject({
+				id: attempt,
+				status: 'completed',
+				resolveProblemOutcome: 'handed-off',
+			});
+
+			// A settle that names no outcome leaves the column as it was; a retry clears it.
+			await completeRun(attempt, { status: 'completed' });
+			expect((await getRunByIdFromDb(attempt))?.resolveProblemOutcome).toBe('handed-off');
+			await resetRunToRunning(attempt);
+			expect((await getRunByIdFromDb(attempt))?.resolveProblemOutcome).toBeNull();
+		});
+
 		it('leaves an anchored attempt out of a never-ran holder’s read', async () => {
 			const anchor = await createRun({ projectId: PROJECT_ID, taskId: '60', phase: 'review' });
 			await createRun({

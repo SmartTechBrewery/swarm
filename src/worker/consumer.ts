@@ -104,6 +104,7 @@ import {
 	preservedContinuationKind,
 } from '../dispatch/preserved-worker.js';
 import {
+	type ResolveProblemSettle,
 	type ResolveProblemSkip,
 	resolveProblemTrigger,
 	revokeResolveProblemAccess,
@@ -6918,13 +6919,16 @@ async function processClaimedDispatch(
 		// The phase itself logs the scannable `Phase finished - <label>` line (it
 		// carries the run's result — PR URL, verdict, …); this is just the
 		// orchestration-level echo, kept at debug so success shows one finish line.
-		// A Resolve problem run succeeds only on a `resolved` or `already-resolved`
-		// report backed by a bug report it filed (issues #1395, #1441) — read here,
-		// where the database is. Anything else throws a terminal failure carrying the
-		// summary and the actions tried, which the shared failure path records on the
-		// run and the board item. An `already-resolved` settle carries a headline
-		// saying why there was nothing to resolve, recorded on the completed run.
+		// A Resolve problem run succeeds only on a `resolved`, `already-resolved` or
+		// `handed-off` report backed by a bug report it filed (issues #1395, #1441,
+		// #1462) — read here, where the database is. Anything else throws a terminal
+		// failure carrying the summary and the actions tried, which the shared failure
+		// path records on the run and the board item. An `already-resolved` settle
+		// carries a headline saying why there was nothing to resolve, and a
+		// `handed-off` one a headline saying what a person must do; both are recorded
+		// on the completed run, and the outcome itself as `resolve_problem_outcome`.
 		let completedHeadline: string | undefined;
+		let resolveProblemOutcome: ResolveProblemSettle['outcome'] | undefined;
 		if (trigger.phase === 'resolve-problem') {
 			const settle = await verifyResolveProblemOutcome({
 				runId,
@@ -6933,6 +6937,7 @@ async function processClaimedDispatch(
 				subject: trigger.redHead ? 'red-head' : trigger.ticket ? 'ticket' : 'failed-run',
 			});
 			completedHeadline = settle.headline;
+			resolveProblemOutcome = settle.outcome;
 		}
 		logger.debug('Job phase completed', {
 			projectId: project.id,
@@ -6963,6 +6968,7 @@ async function processClaimedDispatch(
 				producedPrUrl: result.prUrl,
 				planningScope: result.planningScope,
 				...(completedHeadline ? { error: completedHeadline } : {}),
+				resolveProblemOutcome,
 			},
 			result.agent,
 		);

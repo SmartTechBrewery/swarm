@@ -1198,8 +1198,9 @@ back to the pipeline as soon as you force the re-review, and leaves the section 
 the pull request is merged or closed. When [Resolve problem](#the-resolve-problem-phase)
 has made an attempt on a Waiting on you ticket's *current* situation (its latest run,
 or the slot it holds when it never ran), the ticket also says what the attempt
-concluded — queued, running, resolved it, or could not resolve it with the attempt's
-own message — and links the attempt run (issue #1428). An attempt on an earlier run or
+concluded — queued, running, resolved it, diagnosed it and handed it to a person
+(issue #1462), or could not resolve it, the last two with the attempt's own
+message — and links the attempt run (issue #1428). An attempt on an earlier run or
 an earlier slot is a past situation and is not shown. A Review abandoned while
 the head's CI was still running is not one of these (issue #1203): the completed-checks
 event starts Review by itself, so the ticket shows as waiting on the pipeline —
@@ -1858,7 +1859,7 @@ slot, still be Waiting on you for a reason in scope, and have the same latest ru
 and that run must not have been cancelled by an operator. Otherwise the attempt is
 skipped. A run attempt is re-checked the same way: it is skipped once the run is no
 longer `failed`, an operator cancelled it, or it is a deliberate hand-off to a person. If no SWARM tool can move the ticket, the agent
-reports it `unresolved` and says what the person should do.
+reports it `handed-off` and says what the person should do (issue #1462).
 
 **Red pull-request heads (issue #1459).** A third leg catches an **open SWARM
 pull request whose current head has red checks while nothing in SWARM acts on
@@ -1896,9 +1897,9 @@ The attempt is anchored to the pull request's latest run, so the Waiting on you
 leg does not dispatch a second one for the same situation later. When it is
 claimed, the pull request is read again: it must still be open, on the same head,
 red, and not handed off, and its latest run must not be cancelled or being reset.
-The agent is told no SWARM tool re-runs checks, so `unresolved` — with what a
+The agent is told no SWARM tool re-runs checks, so `handed-off` — with what a
 person should do, e.g. re-run the failed job — is the expected outcome when
-nothing can move the pull request. It never overrides a deliberate stop.
+nothing can move the pull request (issue #1462). It never overrides a deliberate stop.
 
 **Counting them.** Every red-head attempt must record its occurrence on the one
 bug report titled **"Open pull request left on a red head with nothing acting on
@@ -1913,7 +1914,8 @@ project's reports.
 
 **Seeing the attempts (issue #1428).** A Waiting on you ticket in the **Tickets in
 progress** section shows the attempt on its current situation: queued, running,
-resolved it, or could not resolve it with its message, and a link to the attempt
+resolved it, "diagnosed it — a person must act" with what the person should do
+(issue #1462), or could not resolve it with its message, and a link to the attempt
 run. The attempt run's page names the stuck ticket it is about — "Resolving stuck
 ticket `<task>` (stalled, slot held since …)" — and, when the ticket has a latest
 run, links that run too ("Resolving run …"). That latest run's own page lists the
@@ -2022,14 +2024,33 @@ tell the operator to re-run, merge or push anything, and reports
 the problem is already gone, such as a newer run that already did the work.
 
 **Escalation.** The attempt succeeds when the agent reports `resolved` — it saw
-the pipeline move again — or `already-resolved`, and SWARM finds the bug-report
+the pipeline move again — `already-resolved` or `handed-off` (below), and SWARM finds the bug-report
 occurrence it filed. The bug report is required for every outcome. An
 `already-resolved` attempt settles **completed**, and its explanation is the run's
 headline: "Resolve problem found nothing left to resolve — the failed run was
 already fixed: …", shown on the run page as a green **Nothing left to resolve**
-callout. Anything else fails the attempt. The failure carries the agent's summary
-and every action it tried, and is posted on the failed run's board card (or its
-pull request), so a person picks it up from there. The failed run's detail page
+callout.
+
+**A hand-off to a person (issue #1462).** When the agent identified the cause and
+the only remedy is an action it must not take — a safety stop SWARM placed on
+purpose, re-running a pull request's checks, pushing a fix, a merge, or a board
+move only a person can make — it reports `handed-off`, with a summary that opens
+with what the person should do. That is a diagnosis, not a failure: the attempt
+settles **completed**, its headline is "Resolve problem handed the failed run (or
+stuck ticket, or red pull-request head) to a person — …" followed by the actions it
+tried, and the outcome is recorded on the run (`runs.resolve_problem_outcome`). It
+still has to file its bug-report occurrence — and, for a red head, on the class
+report — or it fails like any other attempt. The run page shows the headline as an
+amber **A person needs to act** callout, the runs list shows the run's status as
+**Handed off** rather than Completed, and the Tickets in progress section shows it
+as "diagnosed it — a person must act" with the headline. No comment is posted on
+the board card or pull request for a hand-off.
+
+Anything else fails the attempt — an `unresolved` report, which the agent gives
+only when it could not diagnose the situation, or when the remedies it was allowed
+to try failed with no clear action for a person to name. The failure carries the
+agent's summary and every action it tried, and is posted on the failed run's board
+card (or its pull request), so a person picks it up from there. The failed run's detail page
 lists its attempts, and the attempt's page links back to the run it was resolving.
 
 ## Failure diagnosis

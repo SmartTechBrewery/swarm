@@ -2343,6 +2343,30 @@ function NothingLeftToResolveCallout({ note }: { note: string }) {
 	);
 }
 
+/**
+ * The `completed` callout for a Resolve problem run that handed the problem to a
+ * person (issue #1462): the agent diagnosed the situation, filed its bug report, and
+ * concluded that only a person can act — the headline opens with what that person
+ * should do. Not a failure and not a resolution, so it takes the warning banner
+ * (`ai/DESIGN_SYSTEM.md` "Banner — warning") rather than red or green.
+ */
+function HandedToAPersonCallout({ note }: { note: string }) {
+	return (
+		<div
+			data-testid="resolve-problem-handed-off"
+			className="p-4 bg-amber-950/20 border border-amber-900/30 rounded flex items-start gap-3"
+		>
+			<AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
+			<div>
+				<h3 className="text-xs font-semibold text-amber-200">A person needs to act</h3>
+				<p className="text-xs text-amber-200/70 mt-1 font-mono whitespace-pre-wrap">
+					{normalizeRunError(note)}
+				</p>
+			</div>
+		</div>
+	);
+}
+
 interface RunStatusCalloutProps {
 	run: RunRow;
 	/** Forwarded to the recovery controls, which report their reset back to the header. */
@@ -2387,10 +2411,14 @@ function RunStatusCallout({ run, onResetSuccess }: RunStatusCalloutProps) {
 		case 'checkpointed':
 			return <CheckpointedCallout run={run} onResetSuccess={onResetSuccess} />;
 		case 'completed':
-			// Only a Resolve problem run records a headline on success (issue #1441).
-			return run.phase === 'resolve-problem' && run.error ? (
+			// Only a Resolve problem run records a headline on success (issue #1441):
+			// a hand-off to a person (issue #1462), or nothing left to resolve.
+			if (run.phase !== 'resolve-problem' || !run.error) return null;
+			return run.resolveProblemOutcome === 'handed-off' ? (
+				<HandedToAPersonCallout note={run.error} />
+			) : (
 				<NothingLeftToResolveCallout note={run.error} />
-			) : null;
+			);
 		case 'failed':
 			return (
 				<>
@@ -2458,6 +2486,7 @@ export function RunDetailHeader({ run, project }: RunDetailHeaderProps) {
 						reviewMergeOutcome={run.reviewMergeOutcome}
 						reviewCapSpent={run.reviewCapSpent}
 						reviewCapStop={run.reviewCapStop}
+						resolveProblemOutcome={run.resolveProblemOutcome}
 						className="text-sm px-3 py-1"
 					/>
 				</div>
@@ -2736,6 +2765,7 @@ function RunOverview({ run, project }: RunOverviewProps) {
 								reviewMergeOutcome={run.reviewMergeOutcome}
 								reviewCapSpent={run.reviewCapSpent}
 								reviewCapStop={run.reviewCapStop}
+								resolveProblemOutcome={run.resolveProblemOutcome}
 							/>
 						</span>
 					</div>

@@ -71,6 +71,10 @@ describe('buildResolveProblemPrompt (issue #1395)', () => {
 		expect(prompt).toContain('never change code');
 		expect(prompt).toContain('merge a pull request');
 		expect(prompt).toContain('the review-verdict cap, merge-retry-exhausted');
+		// Issue #1462: a fix only a person may make is a hand-off, not a failure.
+		expect(prompt).toContain(
+			'If the only fix is one of these, report `handed-off` and say what the person must do.',
+		);
 	});
 
 	it('requires a bug report filed by this run and the hand-off report', () => {
@@ -82,7 +86,14 @@ describe('buildResolveProblemPrompt (issue #1395)', () => {
 		expect(prompt).toContain('runId: "run-failed"');
 		expect(prompt).toContain('`environmental`');
 		expect(prompt).toContain(RESOLVE_PROBLEM_REPORT_FILENAME);
-		expect(prompt).toContain('"outcome": "resolved" | "already-resolved" | "unresolved"');
+		expect(prompt).toContain(
+			'"outcome": "resolved" | "already-resolved" | "handed-off" | "unresolved"',
+		);
+		// Issue #1462: when to hand off, and that `unresolved` means "could not diagnose".
+		expect(prompt).toContain(
+			'`handed-off` when you identified the cause and the only remedy is a person’s action you must not take',
+		);
+		expect(prompt).toContain('`unresolved` only when you could not diagnose the situation');
 	});
 
 	it("appends the project's custom prompt as a supplement", () => {
@@ -117,6 +128,9 @@ describe('buildResolveProblemPrompt — stuck tickets (issue #1425)', () => {
 		expect(prompt).toContain('runId: "run-failed"');
 		expect(prompt).toContain('filedByRunId: "run-resolve"');
 		expect(prompt).toContain('If no SWARM tool can move the ticket');
+		expect(prompt).toContain(
+			'only a person can make — report `handed-off` and say exactly what the person should do.',
+		);
 	});
 
 	it('files the report on the task and project when the ticket never ran', () => {
@@ -238,6 +252,10 @@ describe('buildResolveProblemPrompt — red pull-request heads (issue #1459)', (
 		const prompt = buildResolveProblemPrompt(RED_HEAD_INPUT);
 		expect(prompt).toContain('No SWARM tool re-runs a pull request’s checks');
 		expect(prompt).toContain('re-run the failed job');
+		expect(prompt).toContain(
+			'If nothing SWARM can do moves the pull request, that is the expected outcome: report `handed-off`',
+		);
+		expect(prompt).not.toContain('leave it `unresolved`');
 		expect(prompt).toContain('never override a safety stop SWARM placed on purpose');
 		expect(prompt).toContain('a user termination');
 		expect(prompt).toContain(
