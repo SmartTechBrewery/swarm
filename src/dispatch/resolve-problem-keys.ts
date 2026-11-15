@@ -29,3 +29,19 @@ export function resolveProblemTicketDedupKey(slot: {
 }): string {
 	return `resolve-problem:slot:${slot.projectId}:${slot.repository}:${slot.taskId}:${Date.parse(slot.slotOpenedAt)}`;
 }
+
+/**
+ * The dedup identity of a red-head attempt (issue #1459): one open pull request's
+ * current head whose checks are red while nothing in SWARM acts on it. Keyed on
+ * the head itself — project, repository, pull request and head SHA — so the same
+ * head never gets a second attempt, concurrent sweep passes create one dispatch,
+ * and a new head is a new situation.
+ */
+export function resolveProblemRedHeadDedupKey(head: {
+	projectId: string;
+	repository: string;
+	prNumber: string;
+	headSha: string;
+}): string {
+	return `resolve-problem:red-head:${head.projectId}:${head.repository}:${head.prNumber}:${head.headSha}`;
+}

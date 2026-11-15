@@ -208,6 +208,25 @@ describe('waitingTicketCandidates (issue #1425)', () => {
 		]);
 	});
 
+	it('skips a holder that already carries an attempt for its current situation (issue #1459)', () => {
+		const entries = [
+			entry([
+				ticket('red-head', {
+					operatorReason: 'stalled',
+					latestRunId: 'run-ci',
+					resolveProblem: { runId: 'attempt', state: 'running', at: LONG_AGO },
+				}),
+				ticket('queued', {
+					operatorReason: 'failed',
+					latestRunId: 'run-f',
+					resolveProblem: { state: 'queued', at: LONG_AGO },
+				}),
+				ticket('fresh', { operatorReason: 'stalled', latestRunId: 'run-s' }),
+			]),
+		];
+		expect(waitingTicketCandidates(entries, NOW).map((c) => c.taskId)).toEqual(['fresh']);
+	});
+
 	it('waits the delay since the holder last moved, and skips a failed holder naming no run', () => {
 		const justNow = new Date(NOW.getTime() - RESOLVE_PROBLEM_DELAY_MS + 1000).toISOString();
 		const entries = [

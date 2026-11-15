@@ -7,13 +7,15 @@
  * repository. It runs in an empty scratch directory with the SWARM operator MCP
  * server attached, under a short-lived credential bound to this run, and its job
  * is to find out why one run failed — or, since issue #1425, why one ticket holding
- * a WIP slot stopped moving — and, within hard limits, get the pipeline moving
+ * a WIP slot stopped moving, or, since issue #1459, why an open pull request sits on
+ * a red head with nothing acting on it — and, within hard limits, get the pipeline moving
  * again. So, unlike every other phase prompt, this one names no checkout,
  * no branch and no pull request to change, and states the guardrails the server
  * itself enforces (dry-run first, a `reason` on every write, a write cap) so the
  * agent plans with them rather than discovering them.
  */
 
+import { BUG_REPORT_STATUSES } from '@/api/bug-reports.js';
 import { pipelinePhaseGuard } from '@/pipeline/agent-scope.js';
 import { projectInstructionsParagraph } from '@/pipeline/prompts/custom-prompt.js';
 import type { FailureDiagnosis } from '@/worker/failure-diagnosis.js';
@@ -48,6 +50,33 @@ export interface ResolveProblemStuckTicket {
 	workItemId?: string;
 }
 
+/**
+ * The title every red-head attempt records its occurrence under (issue #1459), so
+ * each occurrence lands on one bug report and its `occurrenceCount` is the count of
+ * this class of situation. Checked at settle (`verifyResolveProblemOutcome`): an
+ * attempt whose occurrence is on a report with any other title fails.
+ */
+export const RED_HEAD_BUG_REPORT_TITLE =
+	'Open pull request left on a red head with nothing acting on it';
+
+/**
+ * The red pull-request head a red-head attempt is about (issue #1459): an open
+ * pull request whose current head has red checks while nothing in SWARM acts on it
+ * — no live run, no non-terminal dispatch, no check re-run still settling, and no
+ * recorded operator hand-off for that head.
+ */
+export interface ResolveProblemRedHead {
+	/** The pull request's repository (`owner/repo`). */
+	repository: string;
+	prNumber: string;
+	headSha: string;
+	/** The pull request's latest run's task id. */
+	taskId: string;
+	/** The failing (or cancelled) checks' names, as read at claim. */
+	failedChecks: string[];
+	workItemId?: string;
+}
+
 /** The runtime context the Resolve problem prompt is built from. */
 export interface ResolveProblemPromptInput {
 	project: { id: string; repo: string };
@@ -60,6 +89,11 @@ export interface ResolveProblemPromptInput {
 	failedRun?: ResolveProblemFailedRun;
 	/** A ticket attempt (issue #1425): the stuck ticket it is about. */
 	ticket?: ResolveProblemStuckTicket;
+	/**
+	 * A red-head attempt (issue #1459): the red pull-request head it is about.
+	 * `failedRun` is then the pull request's latest run.
+	 */
+	redHead?: ResolveProblemRedHead;
 	/** The real (non-dry-run) write calls the run's credential allows. */
 	maxWriteActions: number;
 }
@@ -120,9 +154,36 @@ function ticketSection(
 	];
 }
 
-/** The "what happened" lines of the prompt: a failed run, or a stuck ticket. */
+/** The failing checks, as one phrase. */
+function failedChecksPhrase(redHead: ResolveProblemRedHead): string {
+	return redHead.failedChecks.length > 0
+		? redHead.failedChecks.map((name) => `\`${name}\``).join(', ')
+		: '(no check named)';
+}
+
+/** What SWARM knows about the red pull-request head, as the agent's starting point. */
+function redHeadSection(
+	redHead: ResolveProblemRedHead,
+	project: ResolveProblemPromptInput['project'],
+): string[] {
+	return [
+		'--- THE RED PULL REQUEST HEAD ---',
+		`Project: ${project.id} (repository ${redHead.repository})`,
+		`Pull request: #${redHead.prNumber} (open)`,
+		`Head: ${redHead.headSha}`,
+		`Failing checks: ${failedChecksPhrase(redHead)}`,
+		`Board card: ${redHead.workItemId ?? '(none recorded)'}`,
+		`Latest task: ${redHead.taskId}`,
+		'Nothing in SWARM acts on this head: no run, no non-terminal dispatch, no check re-run still settling, and no recorded operator hand-off for it.',
+	];
+}
+
+/** The "what happened" lines of the prompt: a failed run, a stuck ticket, or a red head. */
 function subjectLine(input: ResolveProblemPromptInput): string {
-	const { ticket, runId } = input;
+	const { ticket, redHead, runId } = input;
+	if (redHead) {
+		return `An open SWARM pull request sits on a red head with nothing acting on it: pull request #${redHead.prNumber} in ${redHead.repository}, head ${redHead.headSha}, whose checks ${failedChecksPhrase(redHead)} are red (failed or cancelled), while SWARM has no run, no dispatch, no pending check re-run and no operator hand-off for that head. Your job is to find out why nothing followed, record this occurrence, and — only where SWARM's own recovery tools can do it safely — get the pipeline moving again. Your own run id is ${runId}.`;
+	}
 	if (ticket) {
 		const since = ticket.lastActivityAt ?? ticket.slotOpenedAt;
 		return `A ticket holding one of SWARM's WIP slots has stopped moving: task ${ticket.taskId} in ${ticket.repository}, with no run and no dispatch since ${since}. Your job is to find out why, and — only where SWARM's own recovery tools can do it safely — get the pipeline moving again. Your own run id is ${runId}.`;
@@ -131,6 +192,13 @@ function subjectLine(input: ResolveProblemPromptInput): string {
 }
 
 function diagnoseLine(input: ResolveProblemPromptInput): string {
+	if (input.redHead) {
+		const { redHead } = input;
+		const anchor = input.failedRun
+			? ` and \`run_get\` on its latest run (${input.failedRun.id})`
+			: '';
+		return `Diagnose first, through the read tools: \`pr_status\` for pull request #${redHead.prNumber}, \`runs_list\` for its runs, \`dispatch_history\` for what SWARM tried to dispatch for it${anchor}. Name what SWARM last did on this pull request — for example a Respond-to-CI that settled \`no-fix\` on a head merge automation brought up to date with its base — and why nothing followed it.`;
+	}
 	if (input.ticket) {
 		const anchor = input.failedRun ? `\`run_get\` on its latest run (${input.failedRun.id}), ` : '';
 		return `Diagnose first, through the read tools: ${anchor}\`runs_list\` for the task’s runs, \`dispatch_history\` for what SWARM tried to dispatch for it, and \`pipeline_snapshot\` for the project around it. Name the cause before you change anything.`;
@@ -145,6 +213,9 @@ function diagnoseLine(input: ResolveProblemPromptInput): string {
 function subjectPullRequest(
 	input: ResolveProblemPromptInput,
 ): { repository: string; prNumber: string } | undefined {
+	if (input.redHead) {
+		return { repository: input.redHead.repository, prNumber: input.redHead.prNumber };
+	}
 	const prNumber = input.ticket?.prNumber ?? input.failedRun?.prNumber;
 	if (!prNumber) return undefined;
 	return { repository: input.ticket?.repository ?? input.project.repo, prNumber };
@@ -176,6 +247,29 @@ function bugReportSubject(input: ResolveProblemPromptInput): string {
 }
 
 /**
+ * How the attempt records what it found. A red-head attempt (issue #1459) records
+ * every occurrence on the one report titled {@link RED_HEAD_BUG_REPORT_TITLE}, so
+ * its `occurrenceCount` counts this class of situation; every other attempt
+ * searches for a report of the same problem.
+ */
+function recordLine(input: ResolveProblemPromptInput): string {
+	const { redHead, runId } = input;
+	if (redHead) {
+		const anchor = input.failedRun ? `\`runId: "${input.failedRun.id}"\`, ` : '';
+		return `Record this occurrence, whatever the outcome — the operator counts this class of situation by it: call \`bug_reports_list\` with \`query: "${RED_HEAD_BUG_REPORT_TITLE}"\` and \`status: ${JSON.stringify(BUG_REPORT_STATUSES)}\` (every status, so a triaged report is found too). If any report has exactly that title, add an occurrence to the oldest one with \`bug_report_add_occurrence\`; otherwise create one with \`bug_report_create\` whose title is exactly \`${RED_HEAD_BUG_REPORT_TITLE}\`. Either way pass ${anchor}\`repository: "${redHead.repository}"\`, \`prNumber: ${redHead.prNumber}\`, \`filedByRunId: "${runId}"\`, and a \`note\` naming the repository, the pull request, head ${redHead.headSha}, the failing checks, what SWARM last did on it, and why nothing followed. SWARM checks that this run filed an occurrence on a report with exactly that title, and fails the run otherwise.`;
+	}
+	return `Record what you found, whatever the outcome: search \`bug_reports_list\` (with \`query\`) for a report of the same problem. If one exists, add an occurrence to it with \`bug_report_add_occurrence\`; otherwise create one with \`bug_report_create\`. Either way pass ${bugReportSubject(input)} and \`filedByRunId: "${runId}"\` — SWARM checks that this run filed one and fails the run otherwise. Use status \`environmental\` for a cause outside SWARM (the network, a CLI quota, Docker, a machine).`;
+}
+
+/** What the agent is told it can and cannot do about a red head (issue #1459). */
+function redHeadRemedyLines(input: ResolveProblemPromptInput): string[] {
+	if (!input.redHead) return [];
+	return [
+		'No SWARM tool re-runs a pull request’s checks, and you must not push a fix. If nothing SWARM can do moves the pull request, that is the expected outcome: leave it `unresolved`, and say exactly what a person should do — for example re-run the failed job, or push a fix. Report `already-resolved` instead when the pull request is no longer open, or its head moved on or went green before you acted (re-read it through `pr_live_state` or `pr_status`).',
+	];
+}
+
+/**
  * Build the prompt handed to the Resolve problem agent. `customPrompt` is the
  * project's optional `agents.resolveProblem.prompt`, appended after the SWARM
  * instructions as a supplement-only section (empty when unset).
@@ -184,16 +278,27 @@ export function buildResolveProblemPrompt(
 	input: ResolveProblemPromptInput,
 	customPrompt?: string,
 ): string {
-	const { failedRun, ticket, runId, maxWriteActions, project } = input;
-	const subjectSections = ticket
+	const { failedRun, ticket, redHead, maxWriteActions, project } = input;
+	const subjectSections = redHead
 		? [
-				ticketSection(ticket, project).join('\n'),
+				redHeadSection(redHead, project).join('\n'),
 				...(failedRun ? [runSection('--- ITS LATEST RUN ---', failedRun, project).join('\n')] : []),
 			]
-		: failedRun
-			? [runSection('--- THE FAILED RUN ---', failedRun, project).join('\n')]
-			: [];
-	const reasonSubject = ticket ? 'the stuck ticket' : 'the failed run';
+		: ticket
+			? [
+					ticketSection(ticket, project).join('\n'),
+					...(failedRun
+						? [runSection('--- ITS LATEST RUN ---', failedRun, project).join('\n')]
+						: []),
+				]
+			: failedRun
+				? [runSection('--- THE FAILED RUN ---', failedRun, project).join('\n')]
+				: [];
+	const reasonSubject = redHead
+		? 'the red pull-request head'
+		: ticket
+			? 'the stuck ticket'
+			: 'the failed run';
 	return [
 		'You are the operator agent assigned only to SWARM’s Resolve problem phase.',
 		...pipelinePhaseGuard(),
@@ -209,7 +314,8 @@ export function buildResolveProblemPrompt(
 					'If no SWARM tool can move the ticket — for example, its board card needs a move only a person can make — leave it unresolved and say exactly what the person should do.',
 				]
 			: []),
-		`Record what you found, whatever the outcome: search \`bug_reports_list\` (with \`query\`) for a report of the same problem. If one exists, add an occurrence to it with \`bug_report_add_occurrence\`; otherwise create one with \`bug_report_create\`. Either way pass ${bugReportSubject(input)} and \`filedByRunId: "${runId}"\` — SWARM checks that this run filed one and fails the run otherwise. Use status \`environmental\` for a cause outside SWARM (the network, a CLI quota, Docker, a machine).`,
+		...redHeadRemedyLines(input),
+		recordLine(input),
 		`Finally write \`${RESOLVE_PROBLEM_REPORT_FILENAME}\` in your working directory as JSON: \`{ "outcome": "resolved" | "already-resolved" | "unresolved", "bugReportId": "<the report you created or added to>", "actions": [{ "tool": "<tool name>", "target": "<what it acted on>", "result": "<what happened>" }], "summary": "<the cause and what you did, for the operator>" }\`. List every real write in \`actions\` (an empty list if you made none). Say \`resolved\` only when you saw the pipeline move again; \`already-resolved\` when the problem was already gone before you fixed anything — its pull request merged or closed outside SWARM, or a newer run already did the work — with the summary saying how you know; otherwise \`unresolved\`, with the summary saying what a person needs to do next.`,
 		...subjectSections,
 		...projectInstructionsParagraph(customPrompt),

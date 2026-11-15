@@ -158,6 +158,7 @@ export function composeSystemPrompt(
 					runId,
 					...(trigger.failedRun ? { failedRun: trigger.failedRun } : {}),
 					...(trigger.ticket ? { ticket: trigger.ticket } : {}),
+					...(trigger.redHead ? { redHead: trigger.redHead } : {}),
 					maxWriteActions: resolveProblemMaxWriteActions(project.pipeline),
 				},
 				customPrompt,

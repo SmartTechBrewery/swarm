@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
 	buildResolveProblemPrompt,
+	RED_HEAD_BUG_REPORT_TITLE,
 	RESOLVE_PROBLEM_REPORT_FILENAME,
 	type ResolveProblemFailedRun,
 	type ResolveProblemPromptInput,
@@ -175,5 +176,80 @@ describe('buildResolveProblemPrompt — the pull request’s live state (issue #
 		expect(prompt).not.toContain('pr_live_state');
 		// The outcome itself stays available: a newer run may already have done the work.
 		expect(prompt).toContain('`already-resolved` when the problem was already gone');
+	});
+});
+
+describe('buildResolveProblemPrompt — red pull-request heads (issue #1459)', () => {
+	const RED_HEAD_INPUT: ResolveProblemPromptInput = {
+		...INPUT,
+		failedRun: {
+			...FAILED_RUN,
+			id: 'run-ci',
+			phase: 'respond-to-ci',
+			taskId: '2401-ci',
+			prNumber: '2401',
+			error: null,
+		},
+		redHead: {
+			repository: 'SmartTechBrewery/under-control-platform',
+			prNumber: '2401',
+			headSha: '372520d3',
+			taskId: '2401-ci',
+			failedChecks: ['integration'],
+			workItemId: 'card-2386',
+		},
+	};
+
+	it('names the pull request, the head, the failing checks and that nothing acts on it', () => {
+		const prompt = buildResolveProblemPrompt(RED_HEAD_INPUT);
+		expect(prompt).toContain('--- THE RED PULL REQUEST HEAD ---');
+		expect(prompt).toContain(
+			'pull request #2401 in SmartTechBrewery/under-control-platform, head 372520d3',
+		);
+		expect(prompt).toContain('Failing checks: `integration`');
+		expect(prompt).toContain('Board card: card-2386');
+		expect(prompt).toContain('--- ITS LATEST RUN ---');
+		expect(prompt).toContain('Run id: run-ci');
+		expect(prompt).toContain('no run, no non-terminal dispatch, no check re-run still settling');
+		expect(prompt).not.toContain('THE FAILED RUN');
+	});
+
+	it('asks for what SWARM last did and why nothing followed', () => {
+		const prompt = buildResolveProblemPrompt(RED_HEAD_INPUT);
+		expect(prompt).toContain('`pr_status` for pull request #2401');
+		expect(prompt).toContain('settled `no-fix` on a head merge automation brought up to date');
+		expect(prompt).toContain('why nothing followed it');
+	});
+
+	it('records every occurrence on the one class report, adding to the oldest', () => {
+		const prompt = buildResolveProblemPrompt(RED_HEAD_INPUT);
+		expect(prompt).toContain(`\`query: "${RED_HEAD_BUG_REPORT_TITLE}"\``);
+		expect(prompt).toContain('add an occurrence to the oldest one');
+		expect(prompt).toContain(`whose title is exactly \`${RED_HEAD_BUG_REPORT_TITLE}\``);
+		expect(prompt).toContain('`runId: "run-ci"`');
+		expect(prompt).toContain('`prNumber: 2401`');
+		expect(prompt).toContain('`filedByRunId: "run-resolve"`');
+		expect(prompt).not.toContain(
+			'search `bug_reports_list` (with `query`) for a report of the same problem',
+		);
+	});
+
+	it('says no tool re-runs checks, and keeps the hard limits on safety stops', () => {
+		const prompt = buildResolveProblemPrompt(RED_HEAD_INPUT);
+		expect(prompt).toContain('No SWARM tool re-runs a pull request’s checks');
+		expect(prompt).toContain('re-run the failed job');
+		expect(prompt).toContain('never override a safety stop SWARM placed on purpose');
+		expect(prompt).toContain('a user termination');
+		expect(prompt).toContain(
+			'`pr_live_state` (`projectId: "swarm"`, `repository: "SmartTechBrewery/under-control-platform"`, `prNumber: 2401`)',
+		);
+		expect(prompt).toContain('naming the red pull-request head');
+	});
+
+	it('leaves failed-run and ticket attempts without the red-head wording', () => {
+		const prompt = buildResolveProblemPrompt(INPUT);
+		expect(prompt).not.toContain(RED_HEAD_BUG_REPORT_TITLE);
+		expect(prompt).not.toContain('THE RED PULL REQUEST HEAD');
+		expect(prompt).not.toContain('No SWARM tool re-runs');
 	});
 });
