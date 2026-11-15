@@ -329,6 +329,13 @@ describe('recoverAdjudicatedApprovedHead', () => {
 			}),
 		);
 		expect((createFailedRun.mock.calls[0][0] as { error: string }).error).toContain(quoted);
+		// The durable marker Resolve problem reads to leave the hand-off alone (issue #1462).
+		expect(
+			(createFailedRun.mock.calls[0][0] as { failureDiagnosis: { kind: string } }).failureDiagnosis,
+		).toMatchObject({
+			kind: 'approved-head-needs-operator',
+			title: 'Approved head needs the operator',
+		});
 		expect(postComment).toHaveBeenCalledWith(
 			expect.objectContaining({
 				prNumber: 42,

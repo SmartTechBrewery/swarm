@@ -2570,6 +2570,11 @@ describe('review trigger — durable trace when a CI fix is abandoned (issue #83
 		expect(record.error).toContain('4/3');
 		expect(record.error).toContain('test');
 		expect(record.error).toContain('needs a human');
+		// The durable marker Resolve problem reads to leave the hand-off alone (issue #1462).
+		expect(record.failureDiagnosis).toMatchObject({
+			kind: 'ci-fix-attempts-exhausted',
+			title: 'CI fix attempts exhausted',
+		});
 
 		expect(commentOnPullRequest).toHaveBeenCalledTimes(1);
 		expect(commentOnPullRequest.mock.calls[0][2]).toContain(

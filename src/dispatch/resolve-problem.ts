@@ -40,6 +40,7 @@ import type { ResolveProblemJob } from '../queue/jobs.js';
 import { priorityFor } from '../queue/producer.js';
 import type { WipTicket } from '../queue/wip-usage.js';
 import type { TriggerResult } from '../triggers/types.js';
+import { isOperatorHandoffDiagnosis } from '../worker/failure-diagnosis.js';
 import { createAndPublishDispatch } from './dispatcher.js';
 import {
 	resolveProblemDedupKey,
@@ -268,11 +269,33 @@ export function resolveProblemAnchorCancelled(
 }
 
 /**
+ * Why a run SWARM wrote **on purpose** to hand a situation to a person is never
+ * attempted (issue #1462), or `undefined` when it is not one. The marker is the
+ * run's durable `failure_diagnosis.kind` — `approved-head-needs-operator`
+ * (`handToOperator`, `./approved-head-checks-rerun.ts`) or
+ * `ci-fix-attempts-exhausted` (`recordAbandonedCiFix`,
+ * `../triggers/handlers/review.ts`) — never its error text. Like
+ * {@link resolveProblemAnchorCancelled} this never clears: the run already says a
+ * person must act, and an attempt could only end unresolved. Every sweep leg and
+ * the claim-time re-check consult it, and `listUnrecoveredFailedRuns` excludes the
+ * same kinds in SQL.
+ */
+export function resolveProblemAnchorHandedOff(
+	run: Pick<RunRow, 'id' | 'failureDiagnosis'>,
+): string | undefined {
+	const diagnosis = run.failureDiagnosis;
+	return diagnosis && isOperatorHandoffDiagnosis(diagnosis.kind)
+		? `Run ${run.id} is a deliberate hand-off to a person (${diagnosis.title}) — Resolve problem does not attempt it`
+		: undefined;
+}
+
+/**
  * The phase's inputs for a claimed Resolve problem dispatch, or the reason it must
  * not run. A run attempt is read off the failed run: it is skipped when the project
  * has not turned the phase on, the run is gone or belongs elsewhere, it is no longer
  * `failed` (a retry already picked it up), an operator cancelled it
- * ({@link resolveProblemAnchorCancelled}), or it is itself a Resolve problem
+ * ({@link resolveProblemAnchorCancelled}), it is a deliberate hand-off to a person
+ * ({@link resolveProblemAnchorHandedOff}), or it is itself a Resolve problem
  * attempt. A ticket attempt (issue #1425) is re-checked against the WIP classifier:
  * see {@link resolveTicketAttempt}.
  */
@@ -312,6 +335,8 @@ export async function resolveProblemTrigger(
 	}
 	const cancelled = resolveProblemAnchorCancelled(run);
 	if (cancelled) return { skip: cancelled, taskId };
+	const handedOff = resolveProblemAnchorHandedOff(run);
+	if (handedOff) return { skip: handedOff, taskId };
 	return {
 		phase: 'resolve-problem',
 		taskId,
@@ -347,7 +372,10 @@ async function readTicketAnchor(
 	if (anchor.phase === 'resolve-problem') {
 		return { skip: `Run ${anchor.id} is itself a Resolve problem attempt` };
 	}
-	const held = resolveProblemAnchorCancelled(anchor) ?? resolveProblemAnchorBusy(anchor, now);
+	const held =
+		resolveProblemAnchorCancelled(anchor) ??
+		resolveProblemAnchorHandedOff(anchor) ??
+		resolveProblemAnchorBusy(anchor, now);
 	return held ? { skip: held } : anchor;
 }
 

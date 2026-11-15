@@ -30,6 +30,11 @@ import { loadWipUsageEntries } from '../../../src/dispatch/wip-usage-loader.js';
 import type { CancellationOrigin } from '../../../src/queue/cancellation.js';
 import type { ResolveProblemJob, SwarmJob } from '../../../src/queue/jobs.js';
 import { closeQueue } from '../../../src/queue/producer.js';
+import {
+	diagnoseFailure,
+	type FailureDiagnosis,
+	operatorHandoffDiagnosis,
+} from '../../../src/worker/failure-diagnosis.js';
 import { createMockScmWebhookJob } from '../../helpers/factories.js';
 import { truncateAll } from '../helpers/db.js';
 import { seedProject } from '../helpers/seed.js';
@@ -57,6 +62,7 @@ async function settledRun(
 		resolvesRunId?: string;
 		nextRetryAt?: Date;
 		cancellation?: CancellationOrigin;
+		failureDiagnosis?: FailureDiagnosis;
 	} = {},
 ): Promise<string> {
 	const projectId = options.projectId ?? PROJECT_ID;
@@ -78,7 +84,11 @@ async function settledRun(
 	const completedAt = new Date(Date.now() - (options.minutesAgo ?? 15) * MINUTE);
 	await getDb()
 		.update(runs)
-		.set({ completedAt, startedAt: new Date(completedAt.getTime() - MINUTE) })
+		.set({
+			completedAt,
+			startedAt: new Date(completedAt.getTime() - MINUTE),
+			...(options.failureDiagnosis ? { failureDiagnosis: options.failureDiagnosis } : {}),
+		})
 		.where(eq(runs.id, id));
 	return id;
 }
@@ -272,6 +282,36 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			});
 			const failed = await settledRun({ minutesAgo: 30, taskId: '2' });
 			expect(await candidateIds()).toEqual([failed]);
+		});
+
+		it('leaves out a deliberate hand-off to a person, and still returns an ordinary failure (issue #1462)', async () => {
+			await settledRun({
+				taskId: '1',
+				phase: 'respond-to-ci',
+				failureDiagnosis: operatorHandoffDiagnosis({
+					kind: 'approved-head-needs-operator',
+					prNumber: '1',
+					headSha: 'abc123',
+					failedChecks: ['integration'],
+				}),
+			});
+			await settledRun({
+				taskId: '2',
+				phase: 'respond-to-ci',
+				failureDiagnosis: operatorHandoffDiagnosis({
+					kind: 'ci-fix-attempts-exhausted',
+					prNumber: '2',
+					attempt: 4,
+					maxAttempts: 3,
+				}),
+			});
+			const undiagnosed = await settledRun({ minutesAgo: 20, taskId: '3' });
+			const otherKind = await settledRun({
+				minutesAgo: 15,
+				taskId: '4',
+				failureDiagnosis: diagnoseFailure({ knownCondition: 'provider-rate-limit' }),
+			});
+			expect(await candidateIds()).toEqual([undiagnosed, otherKind]);
 		});
 
 		it('reads only the projects it is scoped to', async () => {
