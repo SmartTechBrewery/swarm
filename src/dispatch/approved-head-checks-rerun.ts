@@ -70,6 +70,7 @@ import {
 	buildReviewDispatchKey,
 	releaseReviewDispatch,
 } from '../triggers/review-dispatch-dedup.js';
+import { operatorHandoffDiagnosis } from '../worker/failure-diagnosis.js';
 
 /**
  * How long after the re-run was requested a red read is still taken to be the
@@ -285,6 +286,14 @@ async function handToOperator(
 			phase: 'respond-to-ci',
 			prNumber,
 			...(input.jobPayload ? { jobPayload: input.jobPayload } : {}),
+			// The durable marker that this run is a deliberate hand-off, so Resolve
+			// problem never attempts it (issue #1462).
+			failureDiagnosis: operatorHandoffDiagnosis({
+				kind: 'approved-head-needs-operator',
+				prNumber,
+				headSha,
+				failedChecks,
+			}),
 			error:
 				`Approved head needs the operator: PR #${prNumber} at ${headSha} is approved, but its ` +
 				`checks are red (${checks}). SWARM's CI agent judged the failure unrelated to this ` +
