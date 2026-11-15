@@ -638,6 +638,15 @@ export const MergeAutomationJobSchema = jobBase.extend({
 			result: WorkerBranchUpdateOutcomeSchema.optional(),
 		})
 		.optional(),
+	/**
+	 * Set on the one merge a shared check failure resumes per approving run when
+	 * the base advances past it, before the episode is resolved `base-advanced` (issue #1471, `resumeMergeAutomationAfterBaseAdvance`,
+	 * `src/worker/merge-automation.ts`): a red approved head that is behind its
+	 * base is brought up to date (issue #874) instead of refused (issue #1124), so
+	 * its fresh CI decides. Only while no base update has been spent; a head that
+	 * is not behind is refused as ever. Absent on every other merge dispatch.
+	 */
+	resumeAfterBaseAdvance: z.literal(true).optional(),
 });
 
 /**

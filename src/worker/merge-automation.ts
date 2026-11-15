@@ -70,7 +70,10 @@
  * since issue #1432, on {@link MAX_PENDING_CHECKS_WAIT_MS} of wall clock, and only
  * a green one is offered to the merge capability. A head refused while red, or
  * given up on while pending, is re-armed once when its checks later complete
- * green (issue #1128, {@link rearmMergeAutomationForGreenHead}).
+ * green (issue #1128, {@link rearmMergeAutomationForGreenHead}). A red head a
+ * shared check failure stopped is resumed once when the base advances past it
+ * (issue #1471, {@link resumeMergeAutomationAfterBaseAdvance}): that dispatch
+ * brings the red head up to date when it is behind, and its fresh CI decides.
  *
  * **A refusal the head caused frees the approval's cap slot (issue #1079).**
  * When a terminal `not-eligible` is explained *only* by the pull request's head
@@ -383,6 +386,16 @@ export function mergeRearmDedupKey(reviewRunId: string, headSha: string): string
 	return `merge-rearm:${reviewRunId}:${headSha}`;
 }
 
+/**
+ * The dedup identity of the one merge a shared check failure's `base-advanced`
+ * resolution resumes per approving Review run (issue #1471,
+ * {@link resumeMergeAutomationAfterBaseAdvance}). Keyed on the episode *and* the
+ * run, so a pull request is resumed at most once per episode.
+ */
+export function mergeResumeDedupKey(episodeId: string, reviewRunId: string): string {
+	return `merge-resume:${episodeId}:${reviewRunId}`;
+}
+
 /** The outcome `processJob` returns for a settled merge-automation dispatch. */
 export interface MergeAutomationSettledOutcome {
 	status: 'merge-automation-settled';
@@ -454,8 +467,10 @@ function buildMergeAutomationJob(
 	reviewRunId: string,
 	prNumber: string,
 	headSha: string,
+	options: { resumeAfterBaseAdvance?: true } = {},
 ): MergeAutomationJob {
 	return {
+		...options,
 		type: 'merge-automation',
 		projectId: project.id,
 		reviewRunId,
@@ -542,6 +557,103 @@ export async function rearmMergeAutomationForGreenHead({
 			...context,
 			error: describeError(err),
 		});
+	}
+}
+
+export interface ResumeMergeAutomationAfterBaseAdvanceInput {
+	project: ProjectConfig;
+	prNumber: string;
+	/** The approved head the shared check failure stopped, confirmed still the pull request's head. */
+	headSha: string;
+	/** The shared check failure episode the base advanced past, resolved `base-advanced` once its heads settle. */
+	episodeId: string;
+}
+
+/**
+ * What {@link resumeMergeAutomationAfterBaseAdvance} did. Its caller reads it:
+ * `failed` and `dispatch-active` leave the head unsettled, so the episode keeps
+ * standing and the next sweep pass tries again; every other answer settles it.
+ */
+export type MergeResumeResult =
+	| 'resumed'
+	| 'already-resumed'
+	| 'auto-merge-off'
+	| 'no-stopped-approval'
+	| 'dispatch-active'
+	| 'failed';
+
+/**
+ * Try an approved head once more after the base advanced past a shared check
+ * failure (issue #1471) — called by the base-branch-health sweep for each head a
+ * `base-advanced` episode covered (`resumeSharedCheckFailures`,
+ * `src/dispatch/shared-check-failure.ts`).
+ *
+ * Modelled on {@link rearmMergeAutomationForGreenHead}, with one difference: the
+ * head is still red, and a plain re-arm would only be refused again (issue
+ * #1124). So the dispatch carries `resumeAfterBaseAdvance`, which lets a red head
+ * that is behind its base take the ordinary stale-base update path (issue #874,
+ * #1117) instead — the updated head's own CI then decides, through the existing
+ * merge (green), refusal and Respond-to-CI (red, issue #1430) and
+ * Resolve-conflicts (conflict, issue #1264) branches. A head that is not behind is
+ * refused as ever.
+ *
+ * At most once per (episode, approving run) — {@link mergeResumeDedupKey} — and
+ * only for a run whose merge stopped with a re-armable outcome without being
+ * superseded, with no dispatch still active on it. That dedup key is also what
+ * makes the sweep's retry of an unsettled episode idempotent: a head resumed on an
+ * earlier pass answers `already-resumed`. Best-effort: never throws — a failure
+ * answers `failed`, which the caller treats as retryable.
+ */
+export async function resumeMergeAutomationAfterBaseAdvance({
+	project,
+	prNumber,
+	headSha,
+	episodeId,
+}: ResumeMergeAutomationAfterBaseAdvanceInput): Promise<MergeResumeResult> {
+	if (project.autoMerge !== true) return 'auto-merge-off';
+	const context = { projectId: project.id, prNumber, headSha, episodeId };
+	try {
+		const run = await findApprovedReviewRunForRearm(
+			{ projectId: project.id, repository: project.repo, prNumber, headSha },
+			MERGE_REARM_OUTCOMES,
+		);
+		if (!run) {
+			logger.debug('Merge automation: no stopped approval to resume for this head', context);
+			return 'no-stopped-approval';
+		}
+		const active = await getActiveDispatchByRunId(run.id);
+		if (active) {
+			logger.debug('Merge automation: the approving run still has a dispatch due — not resuming', {
+				...context,
+				runId: run.id,
+				dispatchId: active.id,
+			});
+			return 'dispatch-active';
+		}
+		const { dispatch, created } = await createAndPublishDispatch({
+			projectId: project.id,
+			jobPayload: buildMergeAutomationJob(project, run.id, prNumber, headSha, {
+				resumeAfterBaseAdvance: true,
+			}),
+			dedupKey: mergeResumeDedupKey(episodeId, run.id),
+			source: 'synthetic',
+			runId: run.id,
+			taskId: run.taskId,
+			phase: 'merge-automation',
+		});
+		logger.info(
+			created
+				? 'Merge automation: resumed an approved head after the base advanced past a shared check failure'
+				: 'Merge automation: already resumed for this episode — not duplicating',
+			{ ...context, runId: run.id, dispatchId: dispatch.id },
+		);
+		return created ? 'resumed' : 'already-resumed';
+	} catch (err) {
+		logger.error('Failed to resume merge automation after the base advanced', {
+			...context,
+			error: describeError(err),
+		});
+		return 'failed';
 	}
 }
 
@@ -723,6 +835,16 @@ function scmCapability<K extends ProviderCapability>(
 /** How many base updates this dispatch has already spent (absent on a pre-#874 payload). */
 function baseUpdatesSpent(job: MergeAutomationJob): number {
 	return job.baseUpdates ?? 0;
+}
+
+/**
+ * Whether a red head of this dispatch is brought up to date rather than refused
+ * (issue #1471): only on a merge resumed after the base advanced past a shared
+ * check failure, and only for the approved head itself — a head this dispatch
+ * already updated is red against the current base, which is a real failure.
+ */
+function resumesRedHeadOntoBase(job: MergeAutomationJob): boolean {
+	return job.resumeAfterBaseAdvance === true && baseUpdatesSpent(job) === 0;
 }
 
 /**
@@ -1118,6 +1240,12 @@ type StaleBaseReaction =
 /** A branch update that produced something to act on — every status but `up-to-date`. */
 type ProducedBranchUpdate = Exclude<WorkerBranchUpdateOutcome, { status: 'up-to-date' }>;
 
+/**
+ * How a resumed red head (issue #1471) is settled when the branch update finds it
+ * already up to date with its base — the #1124 refusal it would have had anyway.
+ */
+type UpToDateSettle = () => Promise<MergeAutomationSettledOutcome>;
+
 /** Who brought the head up to date: the provider's own update, or a SWARM worker (issue #1117). */
 type BranchUpdateSource = 'provider' | 'worker';
 
@@ -1146,6 +1274,7 @@ async function reactToStaleBase(
 	staleMessage: string,
 	attempt: number,
 	capabilities: MergeAutomationCapabilities,
+	whenUpToDate?: UpToDateSettle,
 ): Promise<StaleBaseReaction> {
 	const spent = baseUpdatesSpent(job);
 
@@ -1203,6 +1332,9 @@ async function reactToStaleBase(
 	}
 
 	if (update.status === 'up-to-date') {
+		// A resumed red head (issue #1471) asked the update itself whether it is
+		// behind: it is not, so it is refused as any red head is.
+		if (whenUpToDate) return { kind: 'settled', outcome: await whenUpToDate() };
 		// A race: something advanced the branch between the merge attempt that
 		// reported `stale-base` and this call. Nothing to settle — the ordinary
 		// backoff re-reads and merges.
@@ -1216,7 +1348,15 @@ async function reactToStaleBase(
 	}
 
 	if (update.status === 'unsupported') {
-		return requestWorkerBranchUpdate(dispatch, job, project, update.message, attempt, capabilities);
+		return requestWorkerBranchUpdate(
+			dispatch,
+			job,
+			project,
+			update.message,
+			attempt,
+			capabilities,
+			whenUpToDate,
+		);
 	}
 
 	if (update.status === 'provider-error') {
@@ -1541,10 +1681,14 @@ async function requestWorkerBranchUpdate(
 	providerMessage: string,
 	attempt: number,
 	capabilities: MergeAutomationCapabilities,
+	whenUpToDate?: UpToDateSettle,
 ): Promise<StaleBaseReaction> {
 	const requested =
 		job.workerCatchUp?.requestedFor === job.approvedHeadSha ? job.workerCatchUp : undefined;
 	if (requested) {
+		if (whenUpToDate && requested.result?.status === 'up-to-date') {
+			return { kind: 'settled', outcome: await whenUpToDate() };
+		}
 		return {
 			kind: 'retry',
 			outcome: {
@@ -2251,6 +2395,29 @@ async function refuseRedHead(
 }
 
 /**
+ * The head about to be merged reads red: refused ({@link refuseRedHead}) — unless
+ * this dispatch was resumed after the base advanced past a shared check failure
+ * (issue #1471) and has spent no base update, in which case a head behind its base
+ * is brought up to date through the stale-base path and its fresh CI decides. The
+ * update answering `up-to-date` (the provider's, or a SWARM worker's) is the
+ * refusal it would have had anyway.
+ */
+async function reactToRedHead(
+	dispatch: DispatchRow,
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	message: string,
+	redChecks: RedFreshChecks,
+	attempt: number,
+	capabilities: MergeAutomationCapabilities,
+): Promise<StaleBaseReaction> {
+	const refuse = () =>
+		refuseRedHead(dispatch, job, project, message, redChecks, attempt, capabilities);
+	if (!resumesRedHeadOntoBase(job)) return { kind: 'settled', outcome: await refuse() };
+	return reactToStaleBase(dispatch, job, project, message, attempt, capabilities, refuse);
+}
+
+/**
  * Settle a merge that has no operator to act as (issue #1249): record the reason on
  * the Review run, say so on the pull request, and complete the dispatch — terminally,
  * since no retry stores a credential. Nothing was merged or pushed.
@@ -2480,7 +2647,7 @@ export async function processMergeAutomationDispatch(
 	let outcome: MergePullRequestOutcome = attempted.outcome;
 
 	if (redFreshChecks) {
-		return refuseRedHead(
+		const reaction = await reactToRedHead(
 			dispatch,
 			job,
 			project,
@@ -2489,6 +2656,9 @@ export async function processMergeAutomationDispatch(
 			attempt,
 			capabilities,
 		);
+		if (reaction.kind === 'settled') return reaction.outcome;
+		// A resumed head's update failed transiently: the shared bounded budget retries it.
+		outcome = reaction.outcome;
 	}
 
 	if (outcome.status === 'stale-base') {

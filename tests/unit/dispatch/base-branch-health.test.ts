@@ -26,6 +26,16 @@ vi.mock('@/db/repositories/projectsRepository.js', () => ({
 	listAllProjectRecordsFromDb: () => listAllProjectRecordsFromDb(),
 }));
 
+const resumeSharedCheckFailures = vi.fn(async (_input: unknown) => {});
+vi.mock('@/dispatch/shared-check-failure.js', () => ({
+	resumeSharedCheckFailures: (input: unknown) => resumeSharedCheckFailures(input),
+}));
+const resumeMergeAutomationAfterBaseAdvance = vi.fn(async (_head: unknown) => 'resumed');
+vi.mock('@/worker/merge-automation.js', () => ({
+	resumeMergeAutomationAfterBaseAdvance: (head: unknown) =>
+		resumeMergeAutomationAfterBaseAdvance(head),
+}));
+
 import {
 	baseBranchRedDeliveryId,
 	readBaseBranchHealth,
@@ -91,6 +101,8 @@ beforeEach(() => {
 		.mockResolvedValue([{ number: 77, headBranch: 'issue-77', state: 'closed' }]);
 	deliveryProvider.mockClear();
 	postComment.mockClear().mockResolvedValue(1);
+	resumeSharedCheckFailures.mockReset().mockResolvedValue(undefined);
+	resumeMergeAutomationAfterBaseAdvance.mockClear();
 });
 
 describe('baseBranchRedDeliveryId', () => {
@@ -350,6 +362,67 @@ describe('sweepBaseBranchHealth', () => {
 			'base branch health: could not read the base branch this pass',
 			expect.objectContaining({ repository: PROJECT.repo }),
 		);
+	});
+
+	describe('shared check failure resume (issue #1471)', () => {
+		it('hands every pass the base head it read, and whether it is red', async () => {
+			await sweepBaseBranchHealth();
+
+			expect(resumeSharedCheckFailures).toHaveBeenCalledTimes(1);
+			expect(resumeSharedCheckFailures).toHaveBeenCalledWith(
+				expect.objectContaining({
+					project: expect.objectContaining({ repo: PROJECT.repo }),
+					scm: SCM,
+					baseHeadSha: 'base-head-sha',
+					baseRed: false,
+				}),
+			);
+		});
+
+		it('passes merge automation’s resume through for each affected head', async () => {
+			await sweepBaseBranchHealth();
+			const [input] = resumeSharedCheckFailures.mock.calls[0] as [
+				{ resumeMerge: (head: unknown) => Promise<unknown> },
+			];
+			await input.resumeMerge({ prNumber: '5', headSha: 'h5', episodeId: 'e1' });
+
+			expect(resumeMergeAutomationAfterBaseAdvance).toHaveBeenCalledWith({
+				prNumber: '5',
+				headSha: 'h5',
+				episodeId: 'e1',
+			});
+		});
+
+		it('tells it the base is red on a red pass', async () => {
+			getAggregateCheckStatus.mockResolvedValue(RED);
+
+			await sweepBaseBranchHealth();
+
+			expect(resumeSharedCheckFailures).toHaveBeenCalledWith(
+				expect.objectContaining({ baseRed: true }),
+			);
+		});
+
+		it('does not call it when the base branch cannot be read', async () => {
+			getBranchHead.mockRejectedValue(new Error('provider unreachable'));
+
+			await sweepBaseBranchHealth();
+
+			expect(resumeSharedCheckFailures).not.toHaveBeenCalled();
+		});
+
+		it('still reports a red base when the resume fails', async () => {
+			getAggregateCheckStatus.mockResolvedValue(RED);
+			resumeSharedCheckFailures.mockRejectedValue(new Error('db down'));
+
+			await expect(sweepBaseBranchHealth()).resolves.toBeUndefined();
+
+			expect(loggerWarn).toHaveBeenCalledWith(
+				'base branch health: the shared check failure resume failed — continuing',
+				expect.objectContaining({ error: expect.stringContaining('db down') }),
+			);
+			expect(postComment).toHaveBeenCalledTimes(1);
+		});
 	});
 
 	// An unhandled rejection out of the bare `setInterval` callback would take the

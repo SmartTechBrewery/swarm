@@ -7,9 +7,15 @@
  * check)` while unresolved, guarded by the partial unique index; its report is
  * claimed once by a conditional update ({@link claimEpisodeReport}, the
  * `claimApprovedHeadOperatorNotice` pattern), so concurrent callers write it once.
+ *
+ * Phase 2 (issue #1471) adds the base-branch-health sweep's half: the standing
+ * episodes of a repository with the base head each opened against
+ * ({@link listStandingEpisodesForRepository}, {@link stampEpisodeBaseHead}), the
+ * once-only `base-advanced` resolution ({@link resolveEpisode}) and the heads an
+ * episode covered ({@link listEpisodeAffectedHeads}).
  */
 
-import { and, eq, gt, gte, inArray, isNull, lte, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, gte, inArray, isNull, lte, sql } from 'drizzle-orm';
 
 import { getDb } from '../client.js';
 import {
@@ -38,6 +44,15 @@ export interface SharedCheckFailureEpisode {
 	openedAt: Date;
 	reportedAt: Date | null;
 }
+
+/** A standing episode as the base-branch-health sweep reads it (issue #1471). */
+export interface StandingSharedCheckFailureEpisode extends SharedCheckFailureEpisode {
+	/** The base branch's head when the episode opened; `null` until a read stamps it. */
+	baseHeadSha: string | null;
+}
+
+/** Why an episode stopped standing — `expired` (phase 1) or `base-advanced` (issue #1471). */
+export type SharedCheckFailureResolution = 'expired' | 'base-advanced';
 
 const episodeColumns = {
 	id: sharedCheckFailureEpisodes.id,
@@ -204,4 +219,108 @@ export async function findStandingEpisodeCheckForHead(
 		)
 		.limit(1);
 	return row?.checkName;
+}
+
+/**
+ * Every standing episode of one repository (unresolved, opened after
+ * `openedAfter`), with the base head each opened against — read once per
+ * base-branch-health pass (issue #1471).
+ */
+export async function listStandingEpisodesForRepository(
+	projectId: string,
+	repository: string,
+	openedAfter: Date,
+): Promise<StandingSharedCheckFailureEpisode[]> {
+	return await getDb()
+		.select({ ...episodeColumns, baseHeadSha: sharedCheckFailureEpisodes.baseHeadSha })
+		.from(sharedCheckFailureEpisodes)
+		.where(
+			and(
+				eq(sharedCheckFailureEpisodes.projectId, projectId),
+				eq(sharedCheckFailureEpisodes.repository, repository),
+				isNull(sharedCheckFailureEpisodes.resolvedAt),
+				gt(sharedCheckFailureEpisodes.openedAt, openedAfter),
+			),
+		);
+}
+
+/**
+ * Stamp the base head an unresolved episode opened against — only while it has
+ * none, so a later stamp never moves the reference a resume is judged by. `true`
+ * when this call stamped it.
+ */
+export async function stampEpisodeBaseHead(
+	episodeId: string,
+	baseHeadSha: string,
+): Promise<boolean> {
+	const rows = await getDb()
+		.update(sharedCheckFailureEpisodes)
+		.set({ baseHeadSha })
+		.where(
+			and(
+				eq(sharedCheckFailureEpisodes.id, episodeId),
+				isNull(sharedCheckFailureEpisodes.resolvedAt),
+				isNull(sharedCheckFailureEpisodes.baseHeadSha),
+			),
+		)
+		.returning({ id: sharedCheckFailureEpisodes.id });
+	return rows.length > 0;
+}
+
+/**
+ * Resolve an unresolved episode. Conditional on `resolved_at IS NULL`, so of every
+ * caller resolving the same episode exactly one wins — `true` only for that one.
+ * The `base-advanced` resolution (issue #1471) comes *after* the affected heads are
+ * resumed, so it records that they settled; the resume's own once-only guarantee
+ * is its dispatch dedup key, not this update.
+ */
+export async function resolveEpisode(
+	episodeId: string,
+	resolution: SharedCheckFailureResolution,
+): Promise<boolean> {
+	const rows = await getDb()
+		.update(sharedCheckFailureEpisodes)
+		.set({ resolvedAt: new Date(), resolution })
+		.where(
+			and(
+				eq(sharedCheckFailureEpisodes.id, episodeId),
+				isNull(sharedCheckFailureEpisodes.resolvedAt),
+			),
+		)
+		.returning({ id: sharedCheckFailureEpisodes.id });
+	return rows.length > 0;
+}
+
+/**
+ * The approved heads an episode covered: the latest sighting of its check per pull
+ * request at or after `since` — the caller passes the detection window before the
+ * episode opened, since the sightings that opened it predate it. An earlier head of
+ * the same pull request is dropped: only the latest can still be its head.
+ */
+export async function listEpisodeAffectedHeads(
+	projectId: string,
+	repository: string,
+	checkName: string,
+	since: Date,
+): Promise<{ prNumber: string; headSha: string }[]> {
+	const rows = await getDb()
+		.select({
+			prNumber: sharedCheckFailureObservations.prNumber,
+			headSha: sharedCheckFailureObservations.headSha,
+		})
+		.from(sharedCheckFailureObservations)
+		.where(
+			and(
+				eq(sharedCheckFailureObservations.projectId, projectId),
+				eq(sharedCheckFailureObservations.repository, repository),
+				eq(sharedCheckFailureObservations.checkName, checkName),
+				gte(sharedCheckFailureObservations.observedAt, since),
+			),
+		)
+		.orderBy(desc(sharedCheckFailureObservations.observedAt));
+	const latest = new Map<string, { prNumber: string; headSha: string }>();
+	for (const row of rows) {
+		if (!latest.has(row.prNumber)) latest.set(row.prNumber, row);
+	}
+	return [...latest.values()];
 }
