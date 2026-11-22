@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const enqueueJob = vi.fn(async (input: { jobPayload: unknown; dedupKey?: string }) => ({
 	dispatch: { id: 'dispatch-1', jobPayload: input.jobPayload },
@@ -22,6 +22,13 @@ vi.mock('@/triggers/review-dispatch-dedup.js', () => ({
 const findDispatchByDedupKey = vi.fn(async (_key: string): Promise<unknown> => undefined);
 vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 	findDispatchByDedupKey: (key: string) => findDispatchByDedupKey(key),
+}));
+
+// The approved slot's re-route stamp (issue #1474): a re-routed head's second
+// `no-fix` takes its own `reverdict` recovery.
+const getApprovedHeadSlot = vi.fn(async (_key: unknown): Promise<unknown> => undefined);
+vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
+	getApprovedHeadSlot: (key: unknown) => getApprovedHeadSlot(key),
 }));
 
 const requireProjectSCMProvider = vi.fn((_project?: unknown) => ({ type: 'github' as const }));
@@ -90,6 +97,13 @@ describe('ciNoFixRecoveryDeliveryId', () => {
 
 describe('scheduleCiNoFixRecovery', () => {
 	const input = { project: PROJECT, prNumber: '42', prBranch: 'issue-42', headSha: 'abc123' };
+
+	beforeEach(() => {
+		findDispatchByDedupKey.mockReset();
+		findDispatchByDedupKey.mockResolvedValue(undefined);
+		getApprovedHeadSlot.mockReset();
+		getApprovedHeadSlot.mockResolvedValue(undefined);
+	});
 
 	it('enqueues one synthetic checks-completed event carrying the recovery marker', async () => {
 		enqueueJob.mockClear();
@@ -178,6 +192,67 @@ describe('scheduleCiNoFixRecovery', () => {
 		expect((firstCall[0] as { dedupKey: string }).dedupKey).toBe(
 			(secondCall[0] as { dedupKey: string }).dedupKey,
 		);
+	});
+
+	// Issue #1474: a head the approved-head policy sent back to Respond-to-CI may be
+	// judged `no-fix` again; absorbed by the first key, it would stall silently.
+	describe('a second no-fix on a re-routed approved head', () => {
+		const dedupKeyOf = (call: unknown[] | undefined) =>
+			(call?.[0] as { dedupKey: string }).dedupKey;
+		const reverdictKey = `delivery:${ciNoFixRecoveryDeliveryId(PROJECT, '42', 'abc123', 'reverdict')}`;
+
+		it('takes its own reverdict recovery', async () => {
+			enqueueJob.mockClear();
+			findDispatchByDedupKey.mockResolvedValue({ id: 'dispatch-1' });
+			getApprovedHeadSlot.mockResolvedValue({ failureChangeRoutedAt: new Date() });
+
+			await scheduleCiNoFixRecovery(input);
+
+			expect(dedupKeyOf(enqueueJob.mock.calls[0])).toBe(reverdictKey);
+			expect(reverdictKey).not.toBe(
+				`delivery:${ciNoFixRecoveryDeliveryId(PROJECT, '42', 'abc123')}`,
+			);
+			expect(getApprovedHeadSlot).toHaveBeenCalledWith({
+				projectId: PROJECT.id,
+				repository: PROJECT.repo,
+				prNumber: '42',
+				headSha: 'abc123',
+			});
+		});
+
+		it('keeps the first key for a head that was never re-routed, so a repeat dedups', async () => {
+			enqueueJob.mockClear();
+			findDispatchByDedupKey.mockResolvedValue({ id: 'dispatch-1' });
+			getApprovedHeadSlot.mockResolvedValue({ failureChangeRoutedAt: null });
+
+			await scheduleCiNoFixRecovery(input);
+
+			expect(dedupKeyOf(enqueueJob.mock.calls[0])).toBe(
+				`delivery:${ciNoFixRecoveryDeliveryId(PROJECT, '42', 'abc123')}`,
+			);
+		});
+
+		it('keeps the first key for the first verdict, without reading the slot', async () => {
+			enqueueJob.mockClear();
+
+			await scheduleCiNoFixRecovery(input);
+
+			expect(getApprovedHeadSlot).not.toHaveBeenCalled();
+			expect(dedupKeyOf(enqueueJob.mock.calls[0])).toBe(
+				`delivery:${ciNoFixRecoveryDeliveryId(PROJECT, '42', 'abc123')}`,
+			);
+		});
+
+		it('falls back to the first key when the read fails', async () => {
+			enqueueJob.mockClear();
+			findDispatchByDedupKey.mockRejectedValue(new Error('db down'));
+
+			await scheduleCiNoFixRecovery(input);
+
+			expect(dedupKeyOf(enqueueJob.mock.calls[0])).toBe(
+				`delivery:${ciNoFixRecoveryDeliveryId(PROJECT, '42', 'abc123')}`,
+			);
+		});
 	});
 });
 

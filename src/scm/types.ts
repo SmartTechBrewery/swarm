@@ -165,11 +165,19 @@ export type RerunFailedChecksOutcome =
  * check (issue #1468). `check` is the name {@link CheckRunState.name} reports;
  * `attempt` is the provider's own 1-based attempt number; `runner` is `null` when
  * the provider ran the attempt but did not say where.
+ *
+ * `failedStep` is the attempt's failure signature (issue #1474), which lets the
+ * approved-head policy tell a re-run failing the way SWARM's CI agent judged from
+ * one failing somewhere new: the name of the first step that concluded a failure;
+ * `null` when the provider reports steps but none failed (a lost runner, a
+ * cancelled job, a job never placed — no test ran); omitted when the provider does
+ * not report steps at all.
  */
 export interface CheckAttemptRunner {
 	check: string;
 	attempt: number;
 	runner: string | null;
+	failedStep?: string | null;
 }
 
 /**

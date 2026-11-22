@@ -15,6 +15,7 @@ import {
 	abandonReviewVerdict,
 	abandonReviewVerdictOwnedBy,
 	claimApprovedHeadChecksRerun,
+	claimApprovedHeadFailureChangeRoute,
 	claimApprovedHeadOperatorNotice,
 	getApprovedHeadSlot,
 	getPriorSubmittedReview,
@@ -29,6 +30,7 @@ import {
 	markReviewVerdictSuperseded,
 	REVIEW_SUPERSEDED_CAP,
 	REVIEW_VERDICT_CAP,
+	recordApprovedHeadAdjudicatedFailure,
 	reserveReviewVerdict,
 } from '../../../src/db/repositories/reviewVerdictsRepository.js';
 import { reviewVerdicts } from '../../../src/db/schema/reviewVerdicts.js';
@@ -751,7 +753,7 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 		// Issues #1128, #1463: the bounds on an adjudicated red approved head — a
 		// counted number of automatic re-runs and one operator notice, each only on a
 		// submitted approval.
-		describe('approved-head stamps (issues #1128, #1463)', () => {
+		describe('approved-head stamps (issues #1128, #1463, #1474)', () => {
 			const MAX = 3;
 
 			async function submit(headSha: string, verdict: string): Promise<void> {
@@ -763,9 +765,15 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			const claimFirstRerun = (k: ReturnType<typeof key>) =>
 				claimApprovedHeadChecksRerun(k, 0, MAX);
 
+			const JUDGED = [{ check: 'ci', attempt: 1, failedStep: null }];
+			const recordJudged = (k: ReturnType<typeof key>) =>
+				recordApprovedHeadAdjudicatedFailure(k, JUDGED);
+
 			it.each([
 				['claimApprovedHeadChecksRerun', claimFirstRerun],
 				['claimApprovedHeadOperatorNotice', claimApprovedHeadOperatorNotice],
+				['claimApprovedHeadFailureChangeRoute', claimApprovedHeadFailureChangeRoute],
+				['recordApprovedHeadAdjudicatedFailure', recordJudged],
 			] as const)('%s is exactly-once on a submitted approval', async (_name, claim) => {
 				await submit('sha-1', 'approve');
 
@@ -777,6 +785,8 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 			it.each([
 				['claimApprovedHeadChecksRerun', claimFirstRerun],
 				['claimApprovedHeadOperatorNotice', claimApprovedHeadOperatorNotice],
+				['claimApprovedHeadFailureChangeRoute', claimApprovedHeadFailureChangeRoute],
+				['recordApprovedHeadAdjudicatedFailure', recordJudged],
 			] as const)('%s never stamps a slot that is not a submitted approval', async (_name, claim) => {
 				await submit('sha-changes', 'request-changes');
 				expect(await claim(key('sha-changes'))).toBe(false);
@@ -818,6 +828,8 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 					checksRerunAt: null,
 					checksRerunAttempts: 0,
 					operatorNotifiedAt: null,
+					adjudicatedFailure: null,
+					failureChangeRoutedAt: null,
 				});
 
 				await claimFirstRerun(key('sha-1'));
@@ -838,6 +850,22 @@ describe.skipIf(!process.env.SWARM_TEST_DB_AVAILABLE)(
 				await submit('sha-changes', 'request-changes');
 				expect(await getApprovedHeadSlot(key('sha-changes'))).toBeUndefined();
 				expect(await getApprovedHeadSlot(key('never-reserved'))).toBeUndefined();
+			});
+
+			it('keeps the first adjudicated failure: a later write never overwrites it', async () => {
+				await submit('sha-1', 'approve');
+				expect(await recordJudged(key('sha-1'))).toBe(true);
+				expect(
+					await recordApprovedHeadAdjudicatedFailure(key('sha-1'), [
+						{ check: 'ci', attempt: 2, failedStep: 'Run npm run verify' },
+					]),
+				).toBe(false);
+				expect((await getApprovedHeadSlot(key('sha-1')))?.adjudicatedFailure).toEqual(JUDGED);
+
+				await claimApprovedHeadFailureChangeRoute(key('sha-1'));
+				expect((await getApprovedHeadSlot(key('sha-1')))?.failureChangeRoutedAt).toBeInstanceOf(
+					Date,
+				);
 			});
 		});
 	},

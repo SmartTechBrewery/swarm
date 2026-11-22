@@ -80,7 +80,7 @@
 import { and, asc, desc, eq, inArray, isNull, lt, ne, sql } from 'drizzle-orm';
 import { getDb } from '../client.js';
 import { dispatches } from '../schema/dispatches.js';
-import { reviewVerdicts } from '../schema/reviewVerdicts.js';
+import { type AdjudicatedFailureSignature, reviewVerdicts } from '../schema/reviewVerdicts.js';
 import { ACTIVE_DISPATCH_STATES } from './dispatchesRepository.js';
 
 /**
@@ -565,6 +565,18 @@ export interface ApprovedHeadSlot {
 	 * (issue #1459), which leaves a head already handed off alone.
 	 */
 	operatorNotifiedAt: Date | null;
+	/**
+	 * The failure the Respond-to-CI `no-fix` verdict was made on (issue #1474), or
+	 * `null` when none was recorded — the provider reports no failed steps, or the
+	 * head was adjudicated before signatures were kept.
+	 */
+	adjudicatedFailure: AdjudicatedFailureSignature | null;
+	/**
+	 * When SWARM sent this head back to Respond-to-CI because a re-run failed
+	 * differently from {@link adjudicatedFailure} (issue #1474), or `null` while it
+	 * has not.
+	 */
+	failureChangeRoutedAt: Date | null;
 }
 
 /** This head's `submitted` `approve` slot, or `undefined` when the head was not approved. */
@@ -576,11 +588,47 @@ export async function getApprovedHeadSlot(
 			checksRerunAt: reviewVerdicts.checksRerunAt,
 			checksRerunAttempts: reviewVerdicts.checksRerunAttempts,
 			operatorNotifiedAt: reviewVerdicts.operatorNotifiedAt,
+			adjudicatedFailure: reviewVerdicts.adjudicatedFailure,
+			failureChangeRoutedAt: reviewVerdicts.failureChangeRoutedAt,
 		})
 		.from(reviewVerdicts)
 		.where(submittedApprovalOf(key))
 		.limit(1);
 	return rows[0];
+}
+
+/**
+ * Record the failure SWARM's Respond-to-CI agent judged unrelated on this approved
+ * head (issue #1474, {@link reviewVerdicts.adjudicatedFailure}). Write-once: a
+ * conditional update over a still-NULL column, so the first writer wins and a later
+ * call never overwrites the verdict's failure with a re-run's. Answers whether it
+ * wrote; a head that was not approved, or already has one, answers `false`.
+ */
+export async function recordApprovedHeadAdjudicatedFailure(
+	key: ReviewVerdictKey,
+	signature: AdjudicatedFailureSignature,
+): Promise<boolean> {
+	const rows = await getDb()
+		.update(reviewVerdicts)
+		.set({ adjudicatedFailure: signature })
+		.where(and(submittedApprovalOf(key), isNull(reviewVerdicts.adjudicatedFailure)))
+		.returning({ id: reviewVerdicts.id });
+	return rows.length > 0;
+}
+
+/**
+ * Claim the once-only re-route of this approved head back to Respond-to-CI, made
+ * when a re-run failed differently from the adjudicated failure (issue #1474) — a
+ * conditional update over {@link reviewVerdicts.failureChangeRoutedAt}, so of every
+ * caller only one dispatches it.
+ */
+export async function claimApprovedHeadFailureChangeRoute(key: ReviewVerdictKey): Promise<boolean> {
+	const rows = await getDb()
+		.update(reviewVerdicts)
+		.set({ failureChangeRoutedAt: new Date() })
+		.where(and(submittedApprovalOf(key), isNull(reviewVerdicts.failureChangeRoutedAt)))
+		.returning({ id: reviewVerdicts.id });
+	return rows.length > 0;
 }
 
 /**

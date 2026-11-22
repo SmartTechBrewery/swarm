@@ -22,9 +22,19 @@
  *  - if they fail again before the last re-run, the head waits for the next one
  *    (`rerun-waiting`); the `pr-review` trigger re-reads it when it falls due, on
  *    the coalesced recheck that does not draw the CI-wait budget;
+ *  - if a re-run fails **differently** from the failure the `no-fix` verdict was
+ *    made on (issue #1474) — a different, concrete failed step where the provider
+ *    reports steps (GitHub today) — the verdict no longer covers it, and the
+ *    `pr-review` trigger sends the head back to Respond-to-CI once
+ *    (`failure-changed`). The verdict's failure is recorded as each check's latest
+ *    attempt and first failed step when the first re-run is requested, before it
+ *    runs; a re-run failing the same way, or with no failed step at all (a lost
+ *    runner), keeps the re-runs;
  *  - if the last re-run fails too, or the provider cannot re-run them at all,
  *    SWARM hands the head to the operator once, naming the runner each failed
- *    attempt ran on where the provider reports it (issue #1468) — so does a head
+ *    attempt ran on where the provider reports it (issue #1468), and the attempt
+ *    the verdict was made on beside what the latest one failed on (issue #1474)
+ *    — so does a head
  *    with no operator to re-run them as,
  *    since the re-run is a write made for the pull request's author with the stored
  *    credential of the operator whose worker produced it (issue #1249). The
@@ -49,11 +59,18 @@
  *    (`review_verdicts.checks_rerun_at`) has passed;
  *  - one operator notice per head — `review_verdicts.operator_notified_at`, the
  *    same way ({@link claimApprovedHeadOperatorNotice});
- *  - one `no-fix` recovery per head — that module's own dedup key, which is also
- *    how "adjudicated" is answered durably (`hasCiNoFixRecovery`);
- *  - no Respond-to-CI re-dispatch on an adjudicated approved head — the
- *    `pr-review` trigger resolves such a head's red to this policy before it
- *    takes any dispatch claim or fix attempt;
+ *  - at most two `no-fix` recoveries per head — that module's own dedup key, which
+ *    is also how "adjudicated" is answered durably (`hasCiNoFixRecovery`), plus
+ *    one `reverdict` key a head sent back to Respond-to-CI may use once;
+ *  - at most one Respond-to-CI re-dispatch on an adjudicated approved head, and
+ *    only for a re-run that failed differently (issue #1474) —
+ *    `review_verdicts.failure_change_routed_at`, claimed conditionally
+ *    ({@link claimApprovedHeadFailureChangeRoute}); otherwise the `pr-review`
+ *    trigger resolves such a head's red to this policy before it takes any
+ *    dispatch claim or fix attempt, and the re-dispatch itself still spends one of
+ *    the per-PR `MAX_FIX_ATTEMPTS`;
+ *  - one recorded verdict failure per head — `review_verdicts.adjudicated_failure`,
+ *    written once ({@link recordApprovedHeadAdjudicatedFailure});
  *  - one green re-arm per (approving run, head) — phase 1's own dedup key;
  *  - no re-run or notice for a check failing on several pull requests at once
  *    (issue #1464, `./shared-check-failure.ts`): while that check's episode
@@ -68,11 +85,14 @@ import type { ProjectConfig } from '../config/schema.js';
 import {
 	type ApprovedHeadSlot,
 	claimApprovedHeadChecksRerun,
+	claimApprovedHeadFailureChangeRoute,
 	claimApprovedHeadOperatorNotice,
 	getApprovedHeadSlot,
 	type ReviewVerdictKey,
+	recordApprovedHeadAdjudicatedFailure,
 } from '../db/repositories/reviewVerdictsRepository.js';
 import { createFailedRun } from '../db/repositories/runsRepository.js';
+import type { AdjudicatedFailureSignature } from '../db/schema/reviewVerdicts.js';
 import {
 	attributedToOperator,
 	PullRequestOperatorUnavailableError,
@@ -196,6 +216,10 @@ export function approvedHeadRerunInFlight(
  *  - `shared-failure` — every failing check fails on several approved pull
  *    requests at once and that shared failure is reported once (issue #1464):
  *    no re-run, no per-head notice or comment, nothing to re-read;
+ *  - `failure-changed` — a re-run failed in a different step from the failure
+ *    the `no-fix` verdict was made on, and this call claimed the head's one
+ *    re-route (issue #1474): the caller dispatches Respond-to-CI for it. Only
+ *    answered to a caller that set {@link RecoverAdjudicatedApprovedHeadInput.routeChangedFailure};
  *  - `not-applicable` — merge automation is off for the repository, or the head
  *    has no submitted approval, so the policy does not apply.
  */
@@ -205,6 +229,7 @@ export type AdjudicatedApprovedHeadOutcome =
 	| 'rerun-waiting'
 	| 'needs-operator'
 	| 'shared-failure'
+	| 'failure-changed'
 	| 'not-applicable';
 
 /** {@link recoverAdjudicatedApprovedHead}'s answer: what it did, and when to look again. */
@@ -245,6 +270,14 @@ export interface RecoverAdjudicatedApprovedHeadInput {
 	 * run is a record only.
 	 */
 	jobPayload?: SwarmJob;
+	/**
+	 * Set by the one caller that can dispatch Respond-to-CI — the `pr-review`
+	 * trigger's ordinary red (issue #1474): a re-run that failed differently from
+	 * the verdict's failure then answers `failure-changed` instead of spending a
+	 * re-run or the notice. Every other caller leaves it unset, so none can claim
+	 * the head's one re-route without dispatching anything.
+	 */
+	routeChangedFailure?: boolean;
 }
 
 const NOT_APPLICABLE: AdjudicatedApprovedHeadDecision = { outcome: 'not-applicable' };
@@ -309,9 +342,12 @@ export async function recoverAdjudicatedApprovedHead(
 		}
 	}
 
+	const rerouted = await routeChangedFailure(input, key, slot);
+	if (rerouted) return rerouted;
+
 	const dueAt = nextApprovedHeadRerunDueAt(slot);
 	if (!dueAt) {
-		await handToOperator(input, key, exhaustedReruns());
+		await handToOperator(input, key, slot.adjudicatedFailure, exhaustedReruns());
 		return NEEDS_OPERATOR;
 	}
 	if (now < dueAt.getTime()) {
@@ -348,7 +384,93 @@ export async function recoverAdjudicatedApprovedHead(
 		});
 		return SETTLING;
 	}
-	return requestRerun(input, key, attempts + 1);
+	return requestRerun(input, key, slot.adjudicatedFailure, attempts + 1);
+}
+
+/**
+ * Whether this re-run's red is a different failure from the one the `no-fix`
+ * verdict was made on (issue #1474) — and if so, claim the head's one re-route to
+ * Respond-to-CI. Asked only for a caller that set `routeChangedFailure`, about a
+ * red that is a re-run's verdict, on a head with a recorded verdict failure and
+ * no re-route yet. `null` carries on with the re-run policy: none of that holds,
+ * the failure is the same, the provider read failed or gave no signature, or the
+ * claim could not be written. A lost claim settles: the caller that won it
+ * dispatches.
+ */
+async function routeChangedFailure(
+	input: RecoverAdjudicatedApprovedHeadInput,
+	key: ReviewVerdictKey,
+	slot: ApprovedHeadSlot,
+): Promise<AdjudicatedApprovedHeadDecision | null> {
+	const adjudicated = slot.adjudicatedFailure;
+	if (
+		input.routeChangedFailure !== true ||
+		slot.checksRerunAttempts === 0 ||
+		!adjudicated ||
+		slot.failureChangeRoutedAt
+	) {
+		return null;
+	}
+	const { prNumber, headSha } = input;
+	const attempts = await readFailedAttempts(input);
+	const latest = attempts ? failureSignatureOf(attempts, input.failedChecks) : null;
+	if (!latest || !failureMateriallyChanged(adjudicated, latest)) return null;
+	let claimed: boolean;
+	try {
+		claimed = await claimApprovedHeadFailureChangeRoute(key);
+	} catch (err) {
+		logger.error('approved head: could not claim the re-route of a changed failure', {
+			prNumber,
+			headSha,
+			error: describeError(err),
+		});
+		return null;
+	}
+	if (!claimed) {
+		logger.debug('approved head: a changed failure was just re-routed by another caller', {
+			prNumber,
+			headSha,
+		});
+		return SETTLING;
+	}
+	logger.info(
+		"approved head: a re-run failed differently from the CI agent's verdict — re-routing",
+		{
+			prNumber,
+			headSha,
+			adjudicatedFailure: adjudicated,
+			latestFailure: latest,
+		},
+	);
+	return { outcome: 'failure-changed' };
+}
+
+/**
+ * Record the failure the `no-fix` verdict was made on (issue #1474), read before
+ * the first re-run is requested — no re-run has happened yet, so each check's
+ * latest attempt is the one SWARM's CI agent judged. Best-effort: a provider that
+ * reports no steps, a read that fails or a write that fails records nothing, and
+ * the head keeps the re-run-then-notice policy.
+ */
+async function recordAdjudicatedFailure(
+	input: RecoverAdjudicatedApprovedHeadInput,
+	key: ReviewVerdictKey,
+): Promise<AdjudicatedFailureSignature | null> {
+	const { prNumber, headSha } = input;
+	const attempts = await readFailedAttempts(input);
+	const signature = attempts ? failureSignatureOf(attempts, input.failedChecks) : null;
+	if (!signature) return null;
+	try {
+		await recordApprovedHeadAdjudicatedFailure(key, signature);
+	} catch (err) {
+		logger.error("approved head: could not record the CI agent's adjudicated failure", {
+			prNumber,
+			headSha,
+			error: describeError(err),
+		});
+		return null;
+	}
+	return signature;
 }
 
 /**
@@ -409,9 +531,13 @@ function couldNotRerun(attempt: number, reason: string): string {
 async function requestRerun(
 	input: RecoverAdjudicatedApprovedHeadInput,
 	key: ReviewVerdictKey,
+	recorded: AdjudicatedFailureSignature | null,
 	attempt: number,
 ): Promise<AdjudicatedApprovedHeadDecision> {
 	const { project, scm, prNumber, headSha } = input;
+	// Before the first re-run runs: the latest attempts are still the verdict's.
+	const adjudicated =
+		attempt === 1 ? (recorded ?? (await recordAdjudicatedFailure(input, key))) : recorded;
 	let outcome: RerunFailedChecksOutcome;
 	try {
 		// A write made for the pull request's author, so it runs as the operator whose
@@ -424,7 +550,7 @@ async function requestRerun(
 		});
 	} catch (err) {
 		if (err instanceof PullRequestOperatorUnavailableError) {
-			await handToOperator(input, key, couldNotRerun(attempt, err.message));
+			await handToOperator(input, key, adjudicated, couldNotRerun(attempt, err.message));
 			return NEEDS_OPERATOR;
 		}
 		// The contract never throws; this keeps a provider that does from escaping.
@@ -448,7 +574,12 @@ async function requestRerun(
 		return { outcome: 'rerun-requested' };
 	}
 
-	await handToOperator(input, key, couldNotRerun(attempt, describeRerunRefusal(outcome)));
+	await handToOperator(
+		input,
+		key,
+		adjudicated,
+		couldNotRerun(attempt, describeRerunRefusal(outcome)),
+	);
 	return NEEDS_OPERATOR;
 }
 
@@ -469,6 +600,7 @@ function describeRerunRefusal(
 async function handToOperator(
 	input: RecoverAdjudicatedApprovedHeadInput,
 	key: ReviewVerdictKey,
+	adjudicated: AdjudicatedFailureSignature | null,
 	rerun: string,
 ): Promise<void> {
 	const { project, scm, prNumber, headSha, failedChecks } = input;
@@ -486,13 +618,16 @@ async function handToOperator(
 		return;
 	}
 	// Read only once the claim is won, so it is made once per head.
-	const runners = await describeAttemptRunners(input);
+	const attempts = (await readFailedAttempts(input)) ?? [];
+	const verdict = describeVerdictAgainstLatest(adjudicated, attempts, failedChecks);
+	const runners = summarizeAttemptRunners(attempts, failedChecks);
 	logger.warn('approved head: red after its re-runs — handing it to the operator', {
 		...context,
 		rerun,
+		...(verdict ? { verdict } : {}),
 		...(runners ? { runners } : {}),
 	});
-	const account = runners ? `${rerun} ${runners}` : rerun;
+	const account = [rerun, verdict, runners].filter(Boolean).join(' ');
 
 	const checks = failedChecks.length > 0 ? failedChecks.join(', ') : 'none named';
 	try {
@@ -545,26 +680,121 @@ async function handToOperator(
 }
 
 /**
- * Where each failed attempt of the failing checks ran — a provider read that never
- * blocks the notice: a throw, like a provider that reports no runner, answers
- * `null` and the notice goes out without it.
+ * Every failed attempt of the head's failing checks — where each ran, and the step
+ * it failed in — a provider read that never blocks the policy: a throw answers
+ * `null`, and the caller carries on without it.
  */
-async function describeAttemptRunners(
+async function readFailedAttempts(
 	input: RecoverAdjudicatedApprovedHeadInput,
-): Promise<string | null> {
-	const { project, scm, prNumber, headSha, failedChecks } = input;
+): Promise<CheckAttemptRunner[] | null> {
+	const { project, scm, prNumber, headSha } = input;
 	try {
-		const attempts = await scm.describeFailedCheckAttempts(project, headSha);
-		return summarizeAttemptRunners(attempts, failedChecks);
+		return await scm.describeFailedCheckAttempts(project, headSha);
 	} catch (err) {
-		// The contract never throws; this keeps a provider that does from blocking the notice.
-		logger.warn('approved head: could not read the runners of the failed attempts', {
+		// The contract never throws; this keeps a provider that does from blocking the policy.
+		logger.warn('approved head: could not read the failed attempts of its checks', {
 			prNumber,
 			headSha,
 			error: describeError(err),
 		});
 		return null;
 	}
+}
+
+/**
+ * A failure signature (issue #1474): the **latest** attempt of each failing check
+ * — of the checks in `failedChecks`, or of every check when it names none — and
+ * the first step it failed in. `null` when no kept attempt reports a step at all
+ * (`failedStep` omitted), which is how a provider without step data gives no
+ * signature. Exported for tests.
+ */
+export function failureSignatureOf(
+	attempts: readonly CheckAttemptRunner[],
+	failedChecks: readonly string[],
+): AdjudicatedFailureSignature | null {
+	const named =
+		failedChecks.length > 0
+			? attempts.filter((attempt) => failedChecks.includes(attempt.check))
+			: attempts;
+	const latest = new Map<string, CheckAttemptRunner>();
+	for (const attempt of named) {
+		const kept = latest.get(attempt.check);
+		// A later attempt wins; on a tie (two jobs of one name), a concrete step does.
+		if (
+			!kept ||
+			attempt.attempt > kept.attempt ||
+			(attempt.attempt === kept.attempt && typeof kept.failedStep !== 'string')
+		) {
+			latest.set(attempt.check, attempt);
+		}
+	}
+	const kept = [...latest.values()];
+	if (!kept.some((attempt) => attempt.failedStep !== undefined)) return null;
+	return kept.map(({ check, attempt, failedStep }) => ({
+		check,
+		attempt,
+		failedStep: failedStep ?? null,
+	}));
+}
+
+/**
+ * Whether `latest` is a different failure from the `adjudicated` one (issue
+ * #1474): some check's attempt is newer than the one the verdict was made on (or
+ * the check was not failing then) and failed in a concrete step other than the
+ * verdict's. The same step failing again is the same failure, and so is a re-run
+ * in which no step failed (a lost runner says nothing new about the code).
+ * Exported for tests.
+ */
+export function failureMateriallyChanged(
+	adjudicated: AdjudicatedFailureSignature,
+	latest: AdjudicatedFailureSignature,
+): boolean {
+	return latest.some(({ check, attempt, failedStep }) => {
+		if (typeof failedStep !== 'string') return false;
+		const judged = adjudicated.find((entry) => entry.check === check);
+		if (!judged) return true;
+		return attempt > judged.attempt && failedStep !== judged.failedStep;
+	});
+}
+
+/**
+ * The operator notice's account of the attempt SWARM's CI agent judged against
+ * the latest one (issue #1474), so a stale diagnosis is visible: per check the
+ * verdict covered, the attempt it was made on and what that attempt failed in,
+ * then the latest attempt and what it failed in. `null` when either side is
+ * unknown — no recorded verdict failure, or a provider that reports no steps —
+ * and the notice goes out without it. Exported for tests.
+ */
+export function describeVerdictAgainstLatest(
+	adjudicated: AdjudicatedFailureSignature | null,
+	attempts: readonly CheckAttemptRunner[],
+	failedChecks: readonly string[],
+): string | null {
+	if (!adjudicated || adjudicated.length === 0) return null;
+	const latest = failureSignatureOf(attempts, failedChecks);
+	if (!latest) return null;
+	const sentences = adjudicated.flatMap((judged) => {
+		const now = latest.find((entry) => entry.check === judged.check);
+		if (!now) return [];
+		const verdict =
+			`SWARM's CI agent made its judgement on attempt ${judged.attempt} of \`${judged.check}\`, ` +
+			`where ${judgedStep(judged.failedStep)}`;
+		if (now.attempt <= judged.attempt) return [`${verdict}, and that is still its latest attempt.`];
+		return [`${verdict}; the latest attempt, ${now.attempt}, ${latestStep(now.failedStep)}.`];
+	});
+	return sentences.length > 0 ? sentences.join(' ') : null;
+}
+
+function judgedStep(failedStep: string | null): string {
+	return failedStep === null
+		? 'no step reported a failure (the job produced no result)'
+		: `step \`${failedStep}\` failed`;
+}
+
+function latestStep(failedStep: string | null): string {
+	return failedStep === null
+		? 'had no step report a failure (the job produced no result)'
+		: `failed in step \`${failedStep}\``;
 }
 
 /**

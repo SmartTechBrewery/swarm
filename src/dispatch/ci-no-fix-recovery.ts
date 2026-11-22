@@ -32,7 +32,11 @@
  * **Bounded by construction**, so a check that stays red cannot spin:
  *  - one recovery per (project, PR, head SHA) — the deterministic dedup key
  *    below, which the dispatch layer treats as "already recorded" on a conflict
- *    (issue #284), no matter how often the enqueue is retried;
+ *    (issue #284), no matter how often the enqueue is retried — plus one
+ *    `reverdict` recovery for an approved head the re-run policy sent back to
+ *    Respond-to-CI because a re-run failed differently (issue #1474), so a second
+ *    `no-fix` on it is handed back rather than absorbed by the first key and left
+ *    stalled. That re-route is itself once per head, so the head gets at most two;
  *  - one Review per head — the PR+SHA dispatch claim this recovery *keeps* (see
  *    {@link scheduleCiNoFixRecovery}) plus the durable review-verdict ledger
  *    reservation the handler still takes — and none at all for a head merge
@@ -48,7 +52,10 @@
 
 import type { ProjectConfig } from '../config/schema.js';
 import { findDispatchByDedupKey } from '../db/repositories/dispatchesRepository.js';
+import { getApprovedHeadSlot } from '../db/repositories/reviewVerdictsRepository.js';
 import { requireProjectSCMProvider } from '../integrations/scm/registry.js';
+import { describeError } from '../lib/errors.js';
+import { logger } from '../lib/logger.js';
 import { deliveryIdentity } from '../scm/delivery.js';
 import type { ScmEvent } from '../scm/events.js';
 import { resolveChecksWaitMinutes } from '../triggers/review-checks-wait.js';
@@ -90,14 +97,55 @@ export interface CiNoFixRecoveryInput {
  * (project, PR, head SHA), so retrying this enqueue can never duplicate the
  * dispatch. Its own `respond-to-ci-no-fix` prefix keeps it from ever colliding
  * with a follow-up Review (`followUpReviewDeliveryId`) for the same head.
+ * `reverdict` names the second recovery a re-routed approved head may take (issue
+ * #1474) — its own identity, still deterministic, so it too is recorded once.
  * Exported for tests that assert dedup across repeated calls.
  */
 export function ciNoFixRecoveryDeliveryId(
 	project: ProjectConfig,
 	prNumber: string,
 	headSha: string,
+	variant?: 'reverdict',
 ): string {
-	return deliveryIdentity(['respond-to-ci-no-fix', project.repo, prNumber, headSha]);
+	return deliveryIdentity([
+		'respond-to-ci-no-fix',
+		project.repo,
+		prNumber,
+		headSha,
+		...(variant ? [variant] : []),
+	]);
+}
+
+/**
+ * Which recovery this `no-fix` takes (issue #1474): the head's first, or — when
+ * the head already has one **and** the approved-head re-run policy sent it back to
+ * Respond-to-CI because a re-run failed differently — the `reverdict` one, so that
+ * second verdict is handed back rather than absorbed by the first key. Any other
+ * repeat (a retried enqueue of the first verdict) keeps the first key and dedups
+ * on it. A read that fails keeps the first key too: the pre-#1474 behaviour.
+ */
+async function recoveryVariant(
+	project: ProjectConfig,
+	prNumber: string,
+	headSha: string,
+): Promise<'reverdict' | undefined> {
+	try {
+		if (!(await hasCiNoFixRecovery(project, prNumber, headSha))) return undefined;
+		const slot = await getApprovedHeadSlot({
+			projectId: project.id,
+			repository: project.repo,
+			prNumber,
+			headSha,
+		});
+		return slot?.failureChangeRoutedAt ? 'reverdict' : undefined;
+	} catch (err) {
+		logger.warn('no-fix recovery: could not read whether this head was re-routed', {
+			prNumber,
+			headSha,
+			error: describeError(err),
+		});
+		return undefined;
+	}
 }
 
 /**
@@ -187,7 +235,12 @@ export async function scheduleCiNoFixRecovery({
 		headSha,
 		prBranch,
 	};
-	const deliveryId = ciNoFixRecoveryDeliveryId(project, prNumber, headSha);
+	const deliveryId = ciNoFixRecoveryDeliveryId(
+		project,
+		prNumber,
+		headSha,
+		await recoveryVariant(project, prNumber, headSha),
+	);
 	await createAndPublishDispatch({
 		projectId: project.id,
 		jobPayload: {
