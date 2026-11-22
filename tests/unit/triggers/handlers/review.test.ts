@@ -3095,6 +3095,36 @@ describe('review trigger — a red on an adjudicated approved head (issue #1128)
 			expect(await handler.handle(autoCtx())).toBeNull();
 			expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
 		});
+
+		// The policy keeps answering `failure-changed` until the re-routed fix has
+		// answered, so a dispatch deferred before it ran is not lost when its
+		// continuation re-evaluates the head from the top.
+		it('still dispatches Respond-to-CI on a continuation retry, reusing its claim and attempt', async () => {
+			adjudicatedAndApproved();
+			recoverAdjudicatedApprovedHead.mockResolvedValue({ outcome: 'failure-changed' });
+
+			expect(await handler.handle(autoCtx({ continuationDispatchClaimed: true }))).toMatchObject({
+				phase: 'respond-to-ci',
+				prNumber: '9',
+				headSha: 'cafe',
+			});
+			expect(recoverAdjudicatedApprovedHead).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ routeChangedFailure: true }),
+			);
+			expect(claimReviewDispatch).not.toHaveBeenCalled();
+			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+		});
+
+		it('dispatches nothing, and hands nothing to the operator, on a red while the CI fix holds the claim', async () => {
+			adjudicatedAndApproved();
+			recoverAdjudicatedApprovedHead.mockResolvedValue({ outcome: 'failure-changed' });
+			claimReviewDispatch.mockResolvedValue(false);
+
+			expect(await handler.handle(autoCtx())).toBeNull();
+			expect(claimReviewDispatch).toHaveBeenCalledTimes(1);
+			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+			expect(deliveryPostComment).not.toHaveBeenCalled();
+		});
 	});
 });
 

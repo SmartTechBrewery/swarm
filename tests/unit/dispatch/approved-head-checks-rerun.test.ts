@@ -63,6 +63,16 @@ vi.mock('@/dispatch/shared-check-failure.js', () => ({
 	noteAdjudicatedCheckFailures: (input: unknown) => noteAdjudicatedCheckFailures(input),
 }));
 
+// Whether the Respond-to-CI run a changed failure was re-routed to has answered
+// `no-fix` — its `reverdict` recovery (issue #1474). By default it has not.
+const hasCiNoFixReverdictRecovery = vi.fn(
+	async (_project: unknown, _prNumber: string, _headSha: string) => false,
+);
+vi.mock('@/dispatch/ci-no-fix-recovery.js', () => ({
+	hasCiNoFixReverdictRecovery: (project: unknown, prNumber: string, headSha: string) =>
+		hasCiNoFixReverdictRecovery(project, prNumber, headSha),
+}));
+
 vi.mock('@/lib/logger.js', () => ({
 	logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
@@ -178,6 +188,8 @@ beforeEach(() => {
 	runAsPullRequestOperator.mockClear();
 	noteAdjudicatedCheckFailures.mockReset();
 	noteAdjudicatedCheckFailures.mockResolvedValue(new Set());
+	hasCiNoFixReverdictRecovery.mockReset();
+	hasCiNoFixReverdictRecovery.mockResolvedValue(false);
 });
 
 afterEach(() => {
@@ -673,19 +685,80 @@ describe('a re-run failing differently from the verdict (issue #1474)', () => {
 		expect(claimApprovedHeadFailureChangeRoute).not.toHaveBeenCalled();
 	});
 
-	it('re-routes a head only once: a stamped head keeps the re-runs and the notice', async () => {
-		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(3, 60 * MINUTE, new Date(NOW)));
+	// The stamp is written when the route is claimed, before Respond-to-CI is even
+	// dispatched: a deferred dispatch's continuation, a sibling suite or a settle
+	// recheck re-evaluates the head while that fix is owed or running.
+	it.each([
+		['with re-runs left', 1],
+		['with the re-runs spent', 3],
+	])('answers failure-changed again, without a second claim, while the re-routed fix has not answered (%s)', async (_name, attempts) => {
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(attempts, 60 * MINUTE, new Date(NOW)));
 		describeFailedCheckAttempts.mockResolvedValue([
 			{ check: CHECK, attempt: 4, runner: 'r', failedStep: 'Run npm run verify' },
 		]);
+		expect(
+			await recoverAdjudicatedApprovedHead(
+				input({ failedChecks: [CHECK], routeChangedFailure: true }),
+			),
+		).toEqual({ outcome: 'failure-changed' });
+		expect(hasCiNoFixReverdictRecovery).toHaveBeenCalledExactlyOnceWith(PROJECT, '42', 'abc123');
+		expect(claimApprovedHeadFailureChangeRoute).not.toHaveBeenCalled();
+		expect(claimApprovedHeadChecksRerun).not.toHaveBeenCalled();
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+		expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
+		expect(createFailedRun).not.toHaveBeenCalled();
+		expect(postComment).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		['with re-runs left', 1],
+		['with the re-runs spent', 3],
+	])('spends no re-run and writes no notice for a caller that cannot dispatch, while the re-route is pending (%s)', async (_name, attempts) => {
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(attempts, 60 * MINUTE, new Date(NOW)));
+		expect(await recoverAdjudicatedApprovedHead(input({ failedChecks: [CHECK] }))).toEqual({
+			outcome: 'failure-rerouted',
+		});
+		expect(noteAdjudicatedCheckFailures).not.toHaveBeenCalled();
+		expect(claimApprovedHeadChecksRerun).not.toHaveBeenCalled();
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+		expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
+		expect(createFailedRun).not.toHaveBeenCalled();
+		expect(postComment).not.toHaveBeenCalled();
+	});
+
+	it('takes a failed read of the re-routed answer as still pending', async () => {
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(3, 60 * MINUTE, new Date(NOW)));
+		hasCiNoFixReverdictRecovery.mockRejectedValue(new Error('db down'));
+		expect((await recoverAdjudicatedApprovedHead(input({ failedChecks: [CHECK] }))).outcome).toBe(
+			'failure-rerouted',
+		);
 		expect(
 			(
 				await recoverAdjudicatedApprovedHead(
 					input({ failedChecks: [CHECK], routeChangedFailure: true }),
 				)
 			).outcome,
-		).toBe('needs-operator');
+		).toBe('failure-changed');
+		expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
+	});
+
+	it('re-routes a head only once: once the re-routed fix answered no-fix, the head keeps the re-runs and the notice', async () => {
+		hasCiNoFixReverdictRecovery.mockResolvedValue(true);
+		describeFailedCheckAttempts.mockResolvedValue([
+			{ check: CHECK, attempt: 4, runner: 'r', failedStep: 'Run npm run verify' },
+		]);
+		const routed = input({ failedChecks: [CHECK], routeChangedFailure: true });
+
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(1, 60 * MINUTE, new Date(NOW)));
+		expect((await recoverAdjudicatedApprovedHead(routed)).outcome).toBe('rerun-requested');
+		expect(rerunFailedChecks).toHaveBeenCalledOnce();
+
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(3, 60 * MINUTE, new Date(NOW)));
+		expect((await recoverAdjudicatedApprovedHead(routed)).outcome).toBe('needs-operator');
 		expect(claimApprovedHeadFailureChangeRoute).not.toHaveBeenCalled();
+		expect(createFailedRun).toHaveBeenCalledOnce();
 	});
 
 	it('settles when another caller won the re-route', async () => {
@@ -702,6 +775,7 @@ describe('a re-run failing differently from the verdict (issue #1474)', () => {
 	});
 
 	it('names the attempt the verdict was made on, and what the latest failed on, in the notice', async () => {
+		hasCiNoFixReverdictRecovery.mockResolvedValue(true);
 		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(3, 60 * MINUTE, new Date(NOW)));
 		describeFailedCheckAttempts.mockResolvedValue([
 			verdictAttempt,

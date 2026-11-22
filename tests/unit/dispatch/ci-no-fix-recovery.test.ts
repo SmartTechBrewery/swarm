@@ -42,6 +42,7 @@ vi.mock('@/integrations/scm/registry.js', () => ({
 import {
 	ciNoFixRecoveryDeliveryId,
 	hasCiNoFixRecovery,
+	hasCiNoFixReverdictRecovery,
 	scheduleCiNoFixRecovery,
 } from '@/dispatch/ci-no-fix-recovery.js';
 import { followUpReviewDeliveryId } from '@/pipeline/follow-up-review.js';
@@ -270,5 +271,22 @@ describe('hasCiNoFixRecovery', () => {
 	it('is false when no recovery was ever recorded for the head', async () => {
 		findDispatchByDedupKey.mockResolvedValueOnce(undefined);
 		expect(await hasCiNoFixRecovery(PROJECT, '42', 'def456')).toBe(false);
+	});
+});
+
+// Issue #1474: the `reverdict` recovery is the durable record that the Respond-to-CI
+// run a changed failure was re-routed to has answered `no-fix`.
+describe('hasCiNoFixReverdictRecovery', () => {
+	it('reads the reverdict recovery under its own dedup key, not the first one', async () => {
+		findDispatchByDedupKey.mockResolvedValueOnce({ id: 'dispatch-2' });
+		expect(await hasCiNoFixReverdictRecovery(PROJECT, '42', 'abc123')).toBe(true);
+		expect(findDispatchByDedupKey).toHaveBeenLastCalledWith(
+			`delivery:${ciNoFixRecoveryDeliveryId(PROJECT, '42', 'abc123', 'reverdict')}`,
+		);
+	});
+
+	it('is false while the re-routed run has not answered no-fix', async () => {
+		findDispatchByDedupKey.mockResolvedValueOnce(undefined);
+		expect(await hasCiNoFixReverdictRecovery(PROJECT, '42', 'abc123')).toBe(false);
 	});
 });

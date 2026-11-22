@@ -29,7 +29,12 @@
  *    (`failure-changed`). The verdict's failure is recorded as each check's latest
  *    attempt and first failed step when the first re-run is requested, before it
  *    runs; a re-run failing the same way, or with no failed step at all (a lost
- *    runner), keeps the re-runs;
+ *    runner), keeps the re-runs. Until that re-routed Respond-to-CI answers, the
+ *    head is its fix's: a `pr-review` red answers `failure-changed` again (the
+ *    PR+SHA claim and fix-attempt cap dedupe the dispatch), and every other caller
+ *    `failure-rerouted` — no re-run, no notice. A `no-fix` answer (the `reverdict`
+ *    recovery) puts the head back on the re-runs and the notice; a `fixed` one
+ *    pushes a new head;
  *  - if the last re-run fails too, or the provider cannot re-run them at all,
  *    SWARM hands the head to the operator once, naming the runner each failed
  *    attempt ran on where the provider reports it (issue #1468), and the attempt
@@ -62,13 +67,17 @@
  *  - at most two `no-fix` recoveries per head — that module's own dedup key, which
  *    is also how "adjudicated" is answered durably (`hasCiNoFixRecovery`), plus
  *    one `reverdict` key a head sent back to Respond-to-CI may use once;
- *  - at most one Respond-to-CI re-dispatch on an adjudicated approved head, and
- *    only for a re-run that failed differently (issue #1474) —
+ *  - one re-route to Respond-to-CI per adjudicated approved head, and only for a
+ *    re-run that failed differently (issue #1474) —
  *    `review_verdicts.failure_change_routed_at`, claimed conditionally
- *    ({@link claimApprovedHeadFailureChangeRoute}); otherwise the `pr-review`
- *    trigger resolves such a head's red to this policy before it takes any
- *    dispatch claim or fix attempt, and the re-dispatch itself still spends one of
- *    the per-PR `MAX_FIX_ATTEMPTS`;
+ *    ({@link claimApprovedHeadFailureChangeRoute}). The stamp marks the re-route
+ *    owed or in flight until the re-routed run answers `no-fix` (the `reverdict`
+ *    recovery, `hasCiNoFixReverdictRecovery`): until then a `pr-review` red is
+ *    answered `failure-changed` again without a second claim, so a deferred or
+ *    retried dispatch still reaches Respond-to-CI, and its PR+SHA claim and the
+ *    per-PR `MAX_FIX_ATTEMPTS` — which every such dispatch spends — dedupe and
+ *    bound it. Otherwise the `pr-review` trigger resolves such a head's red to
+ *    this policy before it takes any dispatch claim or fix attempt;
  *  - one recorded verdict failure per head — `review_verdicts.adjudicated_failure`,
  *    written once ({@link recordApprovedHeadAdjudicatedFailure});
  *  - one green re-arm per (approving run, head) — phase 1's own dedup key;
@@ -109,6 +118,7 @@ import {
 	releaseReviewDispatch,
 } from '../triggers/review-dispatch-dedup.js';
 import { operatorHandoffDiagnosis } from '../worker/failure-diagnosis.js';
+import { hasCiNoFixReverdictRecovery } from './ci-no-fix-recovery.js';
 import { noteAdjudicatedCheckFailures } from './shared-check-failure.js';
 
 /**
@@ -218,8 +228,13 @@ export function approvedHeadRerunInFlight(
  *    no re-run, no per-head notice or comment, nothing to re-read;
  *  - `failure-changed` — a re-run failed in a different step from the failure
  *    the `no-fix` verdict was made on, and this call claimed the head's one
- *    re-route (issue #1474): the caller dispatches Respond-to-CI for it. Only
- *    answered to a caller that set {@link RecoverAdjudicatedApprovedHeadInput.routeChangedFailure};
+ *    re-route, or that re-route is still owed — the re-routed Respond-to-CI has
+ *    not answered yet (issue #1474): the caller dispatches Respond-to-CI for it,
+ *    through the PR+SHA claim that dedupes a repeat. Only answered to a caller
+ *    that set {@link RecoverAdjudicatedApprovedHeadInput.routeChangedFailure};
+ *  - `failure-rerouted` — the same owed or in-flight re-route, met by a caller
+ *    that cannot dispatch Respond-to-CI: nothing is re-run or noticed, and
+ *    nothing re-read — the re-routed run's answer decides what happens next;
  *  - `not-applicable` — merge automation is off for the repository, or the head
  *    has no submitted approval, so the policy does not apply.
  */
@@ -230,6 +245,7 @@ export type AdjudicatedApprovedHeadOutcome =
 	| 'needs-operator'
 	| 'shared-failure'
 	| 'failure-changed'
+	| 'failure-rerouted'
 	| 'not-applicable';
 
 /** {@link recoverAdjudicatedApprovedHead}'s answer: what it did, and when to look again. */
@@ -283,6 +299,8 @@ export interface RecoverAdjudicatedApprovedHeadInput {
 const NOT_APPLICABLE: AdjudicatedApprovedHeadDecision = { outcome: 'not-applicable' };
 const NEEDS_OPERATOR: AdjudicatedApprovedHeadDecision = { outcome: 'needs-operator' };
 const SHARED_FAILURE: AdjudicatedApprovedHeadDecision = { outcome: 'shared-failure' };
+const FAILURE_CHANGED: AdjudicatedApprovedHeadDecision = { outcome: 'failure-changed' };
+const FAILURE_REROUTED: AdjudicatedApprovedHeadDecision = { outcome: 'failure-rerouted' };
 const SETTLING: AdjudicatedApprovedHeadDecision = {
 	outcome: 'rerun-settling',
 	recheckAfterMs: RERUN_SETTLE_RECHECK_DELAY_MS,
@@ -325,6 +343,10 @@ export async function recoverAdjudicatedApprovedHead(
 	if (!slot) return NOT_APPLICABLE;
 	// Already handed off: every later red finds the notice written and writes nothing.
 	if (slot.operatorNotifiedAt) return NEEDS_OPERATOR;
+	// The head's changed failure is with Respond-to-CI (issue #1474): no re-run,
+	// notice or shared-failure stand-down may land under that fix.
+	const pendingReroute = await answerPendingReroute(input, slot);
+	if (pendingReroute) return pendingReroute;
 	if (await isSharedFailure(input)) return SHARED_FAILURE;
 
 	const attempts = slot.checksRerunAttempts;
@@ -388,11 +410,59 @@ export async function recoverAdjudicatedApprovedHead(
 }
 
 /**
+ * A head whose changed failure was re-routed to Respond-to-CI (issue #1474) and
+ * whose re-routed run has not answered `no-fix` yet — the `reverdict` recovery
+ * records that answer the moment it is handed back, before its Review runs. The
+ * stamp is written when the route is claimed, before Respond-to-CI is dispatched,
+ * let alone run, so a dispatch deferred (concurrency, rate limit) and re-evaluated
+ * from the top, or a sibling suite's red while the fix runs, must not find the
+ * head back on the re-run policy. The caller that can dispatch is answered
+ * `failure-changed` again, with no second claim: the PR+SHA claim makes a
+ * continuation reuse its own and a sibling collide with the running fix, and the
+ * per-PR fix-attempt cap bounds the rest. Every other caller is answered
+ * `failure-rerouted`. A failed read is taken as "not answered yet", the side that
+ * never spends a re-run or the notice under a running fix. `null` — no re-route
+ * stamped, or the re-routed run already answered — carries on with the policy.
+ */
+async function answerPendingReroute(
+	input: RecoverAdjudicatedApprovedHeadInput,
+	slot: ApprovedHeadSlot,
+): Promise<AdjudicatedApprovedHeadDecision | null> {
+	if (!slot.failureChangeRoutedAt) return null;
+	const { project, prNumber, headSha } = input;
+	try {
+		if (await hasCiNoFixReverdictRecovery(project, prNumber, headSha)) return null;
+	} catch (err) {
+		logger.error('approved head: could not read whether its re-routed CI fix answered', {
+			prNumber,
+			headSha,
+			error: describeError(err),
+		});
+	}
+	const routedAt = slot.failureChangeRoutedAt.toISOString();
+	if (input.routeChangedFailure === true) {
+		logger.info('approved head: its changed failure is still owed to Respond-to-CI', {
+			prNumber,
+			headSha,
+			routedAt,
+		});
+		return FAILURE_CHANGED;
+	}
+	logger.info('approved head: its changed failure is with Respond-to-CI — standing by', {
+		prNumber,
+		headSha,
+		routedAt,
+	});
+	return FAILURE_REROUTED;
+}
+
+/**
  * Whether this re-run's red is a different failure from the one the `no-fix`
  * verdict was made on (issue #1474) — and if so, claim the head's one re-route to
  * Respond-to-CI. Asked only for a caller that set `routeChangedFailure`, about a
  * red that is a re-run's verdict, on a head with a recorded verdict failure and
- * no re-route yet. `null` carries on with the re-run policy: none of that holds,
+ * no re-route yet (a stamped head reaches here only once the re-routed run
+ * answered `no-fix`, {@link answerPendingReroute}). `null` carries on with the re-run policy: none of that holds,
  * the failure is the same, the provider read failed or gave no signature, or the
  * claim could not be written. A lost claim settles: the caller that won it
  * dispatches.
@@ -442,7 +512,7 @@ async function routeChangedFailure(
 			latestFailure: latest,
 		},
 	);
-	return { outcome: 'failure-changed' };
+	return FAILURE_CHANGED;
 }
 
 /**

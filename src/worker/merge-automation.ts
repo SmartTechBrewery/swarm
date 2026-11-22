@@ -2287,6 +2287,8 @@ const ADJUDICATED_RED_MESSAGES: Record<
 	// the map covers every outcome (issue #1474).
 	'failure-changed':
 		"a re-run failed differently from the failure SWARM's CI agent judged, so SWARM sent it back to Respond-to-CI",
+	'failure-rerouted':
+		"a re-run failed differently from the failure SWARM's CI agent judged, and that failure is with Respond-to-CI; SWARM re-runs nothing here until it answers",
 };
 
 /**

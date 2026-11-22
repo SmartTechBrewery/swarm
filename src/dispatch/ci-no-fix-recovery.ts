@@ -162,8 +162,27 @@ export async function hasCiNoFixRecovery(
 	prNumber: string,
 	headSha: string,
 ): Promise<boolean> {
-	const dedupKey = deliveryDedupKey(ciNoFixRecoveryDeliveryId(project, prNumber, headSha));
-	return (await findDispatchByDedupKey(dedupKey)) !== undefined;
+	return hasRecoveryRecorded(ciNoFixRecoveryDeliveryId(project, prNumber, headSha));
+}
+
+/**
+ * Whether the Respond-to-CI run the approved-head re-run policy re-routed this
+ * head to (issue #1474) has answered `no-fix` — answered from the `reverdict`
+ * recovery {@link scheduleCiNoFixRecovery} records for it, the same durable trace
+ * {@link hasCiNoFixRecovery} reads for the first verdict. Until it exists the
+ * policy treats the re-route as owed or in flight. Throws on a database error;
+ * the caller decides which way to fail.
+ */
+export async function hasCiNoFixReverdictRecovery(
+	project: ProjectConfig,
+	prNumber: string,
+	headSha: string,
+): Promise<boolean> {
+	return hasRecoveryRecorded(ciNoFixRecoveryDeliveryId(project, prNumber, headSha, 'reverdict'));
+}
+
+async function hasRecoveryRecorded(deliveryId: string): Promise<boolean> {
+	return (await findDispatchByDedupKey(deliveryDedupKey(deliveryId))) !== undefined;
 }
 
 /**
