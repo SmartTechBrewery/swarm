@@ -3320,6 +3320,13 @@ describe('processMergeAutomationDispatch: an adjudicated red approved head (issu
 		return vi.fn(async (_p: unknown, _n: number, _body: string, _persona?: string) => 1);
 	}
 
+	function prOnHeadBranch(headBranch: string) {
+		return vi.fn(
+			async (_p: unknown, _n: number, _persona?: string) =>
+				({ number: 17, headBranch, headSha: 'deadbeef' }) as PullRequestDetails,
+		);
+	}
+
 	function adjudicated(
 		outcome:
 			| 'rerun-requested'
@@ -3398,6 +3405,60 @@ describe('processMergeAutomationDispatch: an adjudicated red approved head (issu
 		);
 		expect(completeDispatch).toHaveBeenCalledExactlyOnceWith('dispatch-1', 'merge-not-eligible');
 		expect(outcome.result).toBe('not-eligible');
+	});
+
+	// Issue #1475: the hand-off run is retryable — its stored payload sends the
+	// head to a fresh Respond-to-CI through the `pr-review` trigger.
+	it('hands the policy a retry payload for a fresh Respond-to-CI on the approved head', async () => {
+		const policy = adjudicated('needs-operator');
+		const getPullRequest = prOnHeadBranch('issue-12');
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest: commentSpy(),
+			getPullRequest,
+			...policy,
+		});
+
+		expect(getPullRequest).toHaveBeenCalledWith(project, 17, 'reviewer');
+		expect(policy.recoverAdjudicatedApprovedHead).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({
+				jobPayload: {
+					type: 'scm',
+					providerId: 'github',
+					projectId: project.id,
+					approvedHeadOperatorRetry: true,
+					event: {
+						kind: 'checks',
+						action: 'completed',
+						repoFullName: project.repo,
+						workItemId: '17',
+						isCommentEvent: false,
+						headSha: 'deadbeef',
+						prBranch: 'issue-12',
+					},
+				},
+			}),
+		);
+	});
+
+	it('still applies the policy, record-only, when the pull request branch cannot be read', async () => {
+		const policy = adjudicated('needs-operator');
+
+		await processMergeAutomationDispatch(mockDispatchRow(), job, project, {
+			mergePullRequest: mergeReturning({ status: 'merged', message: 'merged' }),
+			getAggregateCheckStatus: checksConcluding('failure'),
+			commentOnPullRequest: commentSpy(),
+			getPullRequest: vi.fn(async () => {
+				throw new Error('provider down');
+			}),
+			...policy,
+		});
+
+		expect(policy.recoverAdjudicatedApprovedHead).toHaveBeenCalledExactlyOnceWith(
+			expect.not.objectContaining({ jobPayload: expect.anything() }),
+		);
 	});
 
 	it('records that a shared check failure was reported once, not re-run here (issue #1464)', async () => {

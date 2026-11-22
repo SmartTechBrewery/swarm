@@ -163,6 +163,13 @@ export type TriggerContext = {
 	 */
 	ciNoFixRecovery?: boolean;
 	/**
+	 * Set only on an operator's "Retry now" of an `approved-head-needs-operator`
+	 * hand-off run (issue #1475): the `pr-review` handler routes this head's red
+	 * to a fresh Respond-to-CI instead of re-applying the approved-head re-run
+	 * policy's stored verdict. Honoured only together with {@link runId}.
+	 */
+	approvedHeadOperatorRetry?: boolean;
+	/**
 	 * Set on the synthetic job merge automation enqueues when the provider cannot
 	 * bring a stale approved head up to date itself (issue #1117): the
 	 * `resolve-conflicts` handler dispatches a catch-up pass of that phase pinned

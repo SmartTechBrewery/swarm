@@ -282,8 +282,11 @@ export interface RecoverAdjudicatedApprovedHeadInput {
 	failedChecks: string[];
 	/**
 	 * The payload a dashboard "Retry now" on the notice's `failed` run rebuilds its
-	 * dispatch from — the `pr-review` trigger passes its own event. Omitted, the
-	 * run is a record only.
+	 * dispatch from — a `checks` event for the head marked
+	 * `approvedHeadOperatorRetry` (issue #1475), so the retry dispatches a fresh
+	 * Respond-to-CI rather than meeting this policy again. The `pr-review` trigger
+	 * passes its own event; merge automation builds one. Omitted, the run is a
+	 * record only.
 	 */
 	jobPayload?: SwarmJob;
 	/**

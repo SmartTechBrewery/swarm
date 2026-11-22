@@ -203,6 +203,7 @@ import {
 	type MergeAutomationJob,
 	type MergeCatchUpRequest,
 	normalizeStoredJobPayload,
+	type SwarmJob,
 } from '../queue/jobs.js';
 import type {
 	MergePullRequest,
@@ -2249,12 +2250,15 @@ async function adjudicateRedApprovedHead(
 		);
 		if (!adjudicated) return 'not-applicable';
 		const recover = capabilities.recoverAdjudicatedApprovedHead ?? recoverAdjudicatedApprovedHead;
+		const scm = requireProjectSCMProvider(project);
+		const jobPayload = await operatorRetryJobPayload(job, project, scm, capabilities);
 		const decision = await recover({
 			project,
-			scm: requireProjectSCMProvider(project),
+			scm,
 			prNumber: job.prNumber,
 			headSha: job.approvedHeadSha,
 			failedChecks,
+			...(jobPayload ? { jobPayload } : {}),
 		});
 		return decision.outcome;
 	} catch (err) {
@@ -2266,6 +2270,49 @@ async function adjudicateRedApprovedHead(
 		});
 		return 'not-applicable';
 	}
+}
+
+/**
+ * The payload the approved-head re-run policy stores on its operator hand-off run
+ * (issue #1475), so a "Retry now" of that run dispatches a fresh Respond-to-CI
+ * through the `pr-review` trigger, exactly as the trigger's own hand-off does: a
+ * completed-checks event for the approved head, marked `approvedHeadOperatorRetry`.
+ * The pull request's head branch is read for it — Respond-to-CI pushes there.
+ * `undefined` when that read fails, which leaves the hand-off a record only, as
+ * it was before.
+ */
+async function operatorRetryJobPayload(
+	job: MergeAutomationJob,
+	project: ProjectConfig,
+	scm: SCMProvider,
+	capabilities: MergeAutomationCapabilities,
+): Promise<SwarmJob | undefined> {
+	let prBranch: string;
+	try {
+		const read = capabilities.getPullRequest ?? scm.getPullRequest.bind(scm);
+		prBranch = (await read(project, Number(job.prNumber), 'reviewer')).headBranch;
+	} catch (err) {
+		logger.warn(
+			'Merge automation: could not read the pull request branch — the operator hand-off will not be retryable',
+			{ runId: job.reviewRunId, prNumber: job.prNumber, error: describeError(err) },
+		);
+		return undefined;
+	}
+	return {
+		type: 'scm',
+		providerId: scm.type,
+		projectId: project.id,
+		approvedHeadOperatorRetry: true,
+		event: {
+			kind: 'checks',
+			action: 'completed',
+			repoFullName: project.repo,
+			workItemId: job.prNumber,
+			isCommentEvent: false,
+			headSha: job.approvedHeadSha,
+			prBranch,
+		},
+	};
 }
 
 /** What the run row records for a red approved head the re-run policy took (issue #1128). */

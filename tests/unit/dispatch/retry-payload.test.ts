@@ -629,6 +629,18 @@ describe('reconstructRetryJob', () => {
 		expect(job.recoveryMode).toBe('checkpoint');
 	});
 
+	// Issue #1475: the approved-head hand-off run's stored marker is what routes its
+	// retry to a fresh Respond-to-CI, so the retry must keep it beside its run id.
+	it('keeps the approved-head operator-retry marker', () => {
+		const job = reconstructRetryJob(
+			createMockScmWebhookJob({ approvedHeadOperatorRetry: true }),
+			'run-1',
+			'respond-to-ci',
+		);
+
+		expect(job).toMatchObject({ runId: 'run-1', approvedHeadOperatorRetry: true });
+	});
+
 	// Two of the three callers ("Retry now"'s reconstruct-from-run-row fallback and
 	// "Reset & restart") pass a raw `run.jobPayload` straight out of `jsonb`, so a
 	// pre-#385 row must be upgraded here — otherwise the rebuilt dispatch persists

@@ -268,8 +268,8 @@ export function operatorHandoffDiagnosis(input: OperatorHandoffDiagnosisInput): 
 		return diagnosis(
 			input.kind,
 			'Approved head needs the operator',
-			`PR #${input.prNumber} at ${input.headSha} is approved, but its checks are still red (${checks}) after SWARM's one re-run. SWARM's CI agent judged the failure unrelated to this pull request, so SWARM handed it to a person and will not act on this head again.`,
-			'Re-run the checks — SWARM merges this head once they pass — or push a fix, which gets its own review.',
+			`PR #${input.prNumber} at ${input.headSha} is approved, but its checks are still red (${checks}) after SWARM's one re-run. SWARM's CI agent judged the failure unrelated to this pull request, so SWARM handed it to a person and will not act on this head again by itself.`,
+			'Re-run the checks — SWARM merges this head once they pass — push a fix, which gets its own review, or use Retry now on this run to have a fresh Respond-to-CI look at the current failure.',
 		);
 	}
 	if (input.kind === 'shared-check-failure') {
