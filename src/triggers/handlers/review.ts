@@ -161,7 +161,10 @@
  * (`failure-rerouted`) until the second `no-fix` is handed back. It applies only with
  * merge automation on (the policy's own precondition), and a policy that answers
  * `not-applicable` falls open to the routing above. A head that was not approved
- * keeps that routing too.
+ * keeps that routing too. The operator notice's `failed` run stores this event
+ * marked `approvedHeadOperatorRetry` (issue #1475), so its "Retry now" skips the
+ * policy and dispatches a fresh Respond-to-CI on the head's current failure —
+ * through the same PR+SHA claim and per-PR fix-attempt cap.
  *
  * **A green head this PR already approved re-arms its merge** (issue #1128).
  * When a green aggregate meets a review-verdict slot already `submitted` for
@@ -538,6 +541,24 @@ function baseReviewJobPayload(ctx: ScmTriggerContext): SwarmJob {
 		...(ctx.ciNoFixRecovery ? { ciNoFixRecovery: true } : {}),
 		event: ctx.event,
 	};
+}
+
+/**
+ * The payload stored on the approved-head re-run policy's operator hand-off run
+ * (issue #1475): {@link baseReviewJobPayload} marked `approvedHeadOperatorRetry`,
+ * so the run's "Retry now" re-enters this handler and dispatches a fresh
+ * Respond-to-CI ({@link resolveRedAggregate}) rather than meeting the stored
+ * verdict again. It drops `ciNoFixRecovery`, so the retry never takes the `no-fix`
+ * hand-back's branch or reuses a claim it does not hold, and `deliveryId`, so it
+ * never collides with the original delivery's dedup.
+ */
+function operatorRetryJobPayload(ctx: ScmTriggerContext): SwarmJob {
+	const {
+		deliveryId: _deliveryId,
+		ciNoFixRecovery: _ciNoFixRecovery,
+		...payload
+	} = baseReviewJobPayload(ctx);
+	return { ...payload, approvedHeadOperatorRetry: true };
 }
 
 /**
@@ -1094,7 +1115,7 @@ async function handleAdjudicatedRed(
 		prNumber,
 		headSha,
 		failedChecks,
-		jobPayload: baseReviewJobPayload(ctx),
+		jobPayload: operatorRetryJobPayload(ctx),
 		...(routeChangedFailure ? { routeChangedFailure: true } : {}),
 	});
 	if (outcome === 'failure-changed') {
@@ -1354,7 +1375,9 @@ async function settleSkippedNoFixUpdatedHead(
  * base-branch attribution (issue #873). Only what survives all five goes to
  * Respond-to-CI — bar an adjudicated approved head whose re-run failed
  * differently from the verdict's failure (issue #1474), which the re-run policy
- * sends straight there, once, past the three judgements after it.
+ * sends straight there, once, past the three judgements after it — and an
+ * operator's "Retry now" of the policy's hand-off run (issue #1475), which goes
+ * there ahead of all five.
  */
 async function resolveRedAggregate(
 	ctx: ScmTriggerContext,
@@ -1363,6 +1386,21 @@ async function resolveRedAggregate(
 	baseBranch: string,
 	failedChecks: string[],
 ): Promise<ReviewDisposition> {
+	// An operator's "Retry now" of the approved-head hand-off run (issue #1475):
+	// the operator asked for a fresh CI fix on the head's current failure, so the
+	// stored verdict is not applied again — every judgement below would only
+	// re-settle the red the hand-off already gave up on. Honoured only with the
+	// retried run's id, which no automatic dispatch carries; the PR+SHA claim and
+	// the per-PR fix-attempt cap still apply on the way.
+	if (ctx.approvedHeadOperatorRetry === true && ctx.runId) {
+		logger.info('review: operator retried the approved-head hand-off — dispatching Respond-to-CI', {
+			prNumber,
+			headSha,
+			failedChecks,
+			runId: ctx.runId,
+		});
+		return { kind: 'respond-to-ci', failedChecks };
+	}
 	// The `no-fix` hand-back (issue #841) — see the module header. The red is
 	// SWARM's own CI agent's verdict, not a fresh failure, so route to Review.
 	if (ctx.ciNoFixRecovery === true) {

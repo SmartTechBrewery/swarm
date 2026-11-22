@@ -476,6 +476,16 @@ const jobBase = z.object({
 	 */
 	ciNoFixRecovery: z.boolean().optional(),
 	/**
+	 * Set only on the payload stored on an `approved-head-needs-operator` run — the
+	 * once-only hand-off of an adjudicated red on an approved head (issue #1128) —
+	 * so only an operator's "Retry now" of that run carries it (issue #1475). The
+	 * `pr-review` handler then routes the head's red straight to Respond-to-CI,
+	 * past the approved-head re-run policy whose stored verdict made the hand-off,
+	 * and only while the job also carries its retried `runId`. Never set by an
+	 * inbound webhook or an automatic dispatch.
+	 */
+	approvedHeadOperatorRetry: z.boolean().optional(),
+	/**
 	 * Set on the synthetic job merge automation enqueues when the provider cannot
 	 * bring a stale approved head up to date itself (issue #1117): the
 	 * `resolve-conflicts` handler dispatches a **catch-up** pass of that phase —

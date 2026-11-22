@@ -5011,6 +5011,7 @@ function buildTriggerContext(
 				continuationDispatchClaimed: job.continuationDispatchClaimed,
 				forcedReReview: job.forcedReReview,
 				ciNoFixRecovery: job.ciNoFixRecovery,
+				approvedHeadOperatorRetry: job.approvedHeadOperatorRetry,
 				mergeCatchUp: job.mergeCatchUp,
 				source: 'scm',
 				providerId: job.providerId,

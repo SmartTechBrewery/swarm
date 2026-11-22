@@ -353,6 +353,7 @@ function ctx(
 		deliveryId?: string;
 		continuationDispatchClaimed?: boolean;
 		ciNoFixRecovery?: boolean;
+		approvedHeadOperatorRetry?: boolean;
 		noteDecline?: (decline: TriggerDecline) => void;
 		runId?: string;
 		project?: ProjectConfig;
@@ -3124,6 +3125,101 @@ describe('review trigger — a red on an adjudicated approved head (issue #1128)
 			expect(claimReviewDispatch).toHaveBeenCalledTimes(1);
 			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
 			expect(deliveryPostComment).not.toHaveBeenCalled();
+		});
+	});
+
+	// Issue #1475: the hand-off run's "Retry now" asks for a fresh CI fix on the
+	// head's current failure, so the stored verdict is not applied again.
+	describe('an operator retry of the hand-off run (issue #1475)', () => {
+		it('stores a retry payload marked for Respond-to-CI, without the hand-back marker or delivery id', async () => {
+			adjudicatedAndApproved();
+			recoverAdjudicatedApprovedHead.mockResolvedValue({ outcome: 'needs-operator' });
+
+			expect(await handler.handle(autoCtx({ deliveryId: 'delivery-1' }))).toBeNull();
+
+			const { jobPayload } = recoverAdjudicatedApprovedHead.mock.calls[0]?.[0] ?? {};
+			expect(jobPayload).toMatchObject({
+				type: 'scm',
+				projectId: AUTO_MERGE.id,
+				approvedHeadOperatorRetry: true,
+				event: { kind: 'checks', action: 'completed', workItemId: '9', headSha: 'cafe' },
+			});
+			expect(jobPayload).not.toHaveProperty('deliveryId');
+			expect(jobPayload).not.toHaveProperty('ciNoFixRecovery');
+		});
+
+		it('drops the hand-back marker from the payload the no-fix hand-back stores', async () => {
+			adjudicatedAndApproved();
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'failure']]));
+			reserveReviewVerdict.mockResolvedValue({
+				status: 'reused',
+				id: 'v1',
+				ordinal: 1,
+				state: 'submitted',
+			});
+
+			expect(await handler.handle(autoCtx({ ciNoFixRecovery: true }))).toBeNull();
+
+			const { jobPayload } = recoverAdjudicatedApprovedHead.mock.calls[0]?.[0] ?? {};
+			expect(jobPayload).toMatchObject({ approvedHeadOperatorRetry: true });
+			expect(jobPayload).not.toHaveProperty('ciNoFixRecovery');
+		});
+
+		it('dispatches Respond-to-CI on the retried run, never consulting the policy', async () => {
+			adjudicatedAndApproved();
+			recoverAdjudicatedApprovedHead.mockResolvedValue({ outcome: 'needs-operator' });
+			// The base branch's head reads the same red `test` — not consulted here.
+			getBranchHead.mockResolvedValue('base-head-sha');
+
+			expect(
+				await handler.handle(autoCtx({ approvedHeadOperatorRetry: true, runId: 'run-1' })),
+			).toMatchObject({
+				phase: 'respond-to-ci',
+				prNumber: '9',
+				headSha: 'cafe',
+				prBranch: 'issue-9',
+			});
+			expect(recoverAdjudicatedApprovedHead).not.toHaveBeenCalled();
+			expect(claimReviewDispatch).toHaveBeenCalledTimes(1);
+			expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+			expect(getBranchHead).not.toHaveBeenCalled();
+		});
+
+		it('still stops at the per-PR fix-attempt cap', async () => {
+			adjudicatedAndApproved();
+			claimRespondToCiAttempt.mockResolvedValue({ allowed: false, attempt: 5 });
+
+			expect(
+				await handler.handle(autoCtx({ approvedHeadOperatorRetry: true, runId: 'run-1' })),
+			).toBeNull();
+			expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+			expect(recoverAdjudicatedApprovedHead).not.toHaveBeenCalled();
+		});
+
+		it('ignores the marker on a job that carries no retried run', async () => {
+			adjudicatedAndApproved();
+			recoverAdjudicatedApprovedHead.mockResolvedValue({ outcome: 'needs-operator' });
+
+			expect(await handler.handle(autoCtx({ approvedHeadOperatorRetry: true }))).toBeNull();
+			expect(recoverAdjudicatedApprovedHead).toHaveBeenCalledOnce();
+			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+		});
+
+		it('re-arms the merge on a retried head whose checks have since passed', async () => {
+			adjudicatedAndApproved();
+			getAggregateCheckStatus.mockResolvedValue(checkStatus([['test', 'completed', 'success']]));
+			reserveReviewVerdict.mockResolvedValue({
+				status: 'reused',
+				id: 'v1',
+				ordinal: 1,
+				state: 'submitted',
+			});
+
+			expect(
+				await handler.handle(autoCtx({ approvedHeadOperatorRetry: true, runId: 'run-1' })),
+			).toBeNull();
+			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+			expect(rearmMergeAutomationForGreenHead).toHaveBeenCalledOnce();
 		});
 	});
 });

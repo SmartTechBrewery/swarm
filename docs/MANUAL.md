@@ -1813,7 +1813,10 @@ attempt for a run when all of these hold:
   failing on several pull requests* (a shared check failure, issue #1464). Each
   of these records its own failure diagnosis (`approved-head-needs-operator`,
   `ci-fix-attempts-exhausted`, `shared-check-failure`), and no leg of the sweep ever attempts it: it
-  already says what a person must do (issue #1462);
+  already says what a person must do (issue #1462). **Retry now** on an
+  *Approved head needs the operator* run is one of those things: it starts a
+  fresh Respond-to-CI on the head's current failure, within the per-PR attempt
+  cap (issue #1475);
 - the run is not itself a Resolve problem run, and it has no attempt yet.
 
 So every failed run gets at most one attempt, and a failed attempt never starts
