@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const enqueueJob = vi.fn(async (input: { jobPayload: unknown; dedupKey?: string }) => ({
 	dispatch: { id: 'dispatch-1', jobPayload: input.jobPayload },
@@ -24,6 +24,13 @@ vi.mock('@/db/repositories/dispatchesRepository.js', () => ({
 	findDispatchByDedupKey: (key: string) => findDispatchByDedupKey(key),
 }));
 
+// The approved slot's re-route stamp (issue #1474): a re-routed head's second
+// `no-fix` takes its own `reverdict` recovery.
+const getApprovedHeadSlot = vi.fn(async (_key: unknown): Promise<unknown> => undefined);
+vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
+	getApprovedHeadSlot: (key: unknown) => getApprovedHeadSlot(key),
+}));
+
 const requireProjectSCMProvider = vi.fn((_project?: unknown) => ({ type: 'github' as const }));
 vi.mock('@/integrations/scm/registry.js', () => ({
 	requireProjectSCMProvider: (project: unknown) => requireProjectSCMProvider(project),
@@ -35,6 +42,7 @@ vi.mock('@/integrations/scm/registry.js', () => ({
 import {
 	ciNoFixRecoveryDeliveryId,
 	hasCiNoFixRecovery,
+	hasCiNoFixReverdictRecovery,
 	scheduleCiNoFixRecovery,
 } from '@/dispatch/ci-no-fix-recovery.js';
 import { followUpReviewDeliveryId } from '@/pipeline/follow-up-review.js';
@@ -90,6 +98,13 @@ describe('ciNoFixRecoveryDeliveryId', () => {
 
 describe('scheduleCiNoFixRecovery', () => {
 	const input = { project: PROJECT, prNumber: '42', prBranch: 'issue-42', headSha: 'abc123' };
+
+	beforeEach(() => {
+		findDispatchByDedupKey.mockReset();
+		findDispatchByDedupKey.mockResolvedValue(undefined);
+		getApprovedHeadSlot.mockReset();
+		getApprovedHeadSlot.mockResolvedValue(undefined);
+	});
 
 	it('enqueues one synthetic checks-completed event carrying the recovery marker', async () => {
 		enqueueJob.mockClear();
@@ -179,6 +194,67 @@ describe('scheduleCiNoFixRecovery', () => {
 			(secondCall[0] as { dedupKey: string }).dedupKey,
 		);
 	});
+
+	// Issue #1474: a head the approved-head policy sent back to Respond-to-CI may be
+	// judged `no-fix` again; absorbed by the first key, it would stall silently.
+	describe('a second no-fix on a re-routed approved head', () => {
+		const dedupKeyOf = (call: unknown[] | undefined) =>
+			(call?.[0] as { dedupKey: string }).dedupKey;
+		const reverdictKey = `delivery:${ciNoFixRecoveryDeliveryId(PROJECT, '42', 'abc123', 'reverdict')}`;
+
+		it('takes its own reverdict recovery', async () => {
+			enqueueJob.mockClear();
+			findDispatchByDedupKey.mockResolvedValue({ id: 'dispatch-1' });
+			getApprovedHeadSlot.mockResolvedValue({ failureChangeRoutedAt: new Date() });
+
+			await scheduleCiNoFixRecovery(input);
+
+			expect(dedupKeyOf(enqueueJob.mock.calls[0])).toBe(reverdictKey);
+			expect(reverdictKey).not.toBe(
+				`delivery:${ciNoFixRecoveryDeliveryId(PROJECT, '42', 'abc123')}`,
+			);
+			expect(getApprovedHeadSlot).toHaveBeenCalledWith({
+				projectId: PROJECT.id,
+				repository: PROJECT.repo,
+				prNumber: '42',
+				headSha: 'abc123',
+			});
+		});
+
+		it('keeps the first key for a head that was never re-routed, so a repeat dedups', async () => {
+			enqueueJob.mockClear();
+			findDispatchByDedupKey.mockResolvedValue({ id: 'dispatch-1' });
+			getApprovedHeadSlot.mockResolvedValue({ failureChangeRoutedAt: null });
+
+			await scheduleCiNoFixRecovery(input);
+
+			expect(dedupKeyOf(enqueueJob.mock.calls[0])).toBe(
+				`delivery:${ciNoFixRecoveryDeliveryId(PROJECT, '42', 'abc123')}`,
+			);
+		});
+
+		it('keeps the first key for the first verdict, without reading the slot', async () => {
+			enqueueJob.mockClear();
+
+			await scheduleCiNoFixRecovery(input);
+
+			expect(getApprovedHeadSlot).not.toHaveBeenCalled();
+			expect(dedupKeyOf(enqueueJob.mock.calls[0])).toBe(
+				`delivery:${ciNoFixRecoveryDeliveryId(PROJECT, '42', 'abc123')}`,
+			);
+		});
+
+		it('falls back to the first key when the read fails', async () => {
+			enqueueJob.mockClear();
+			findDispatchByDedupKey.mockRejectedValue(new Error('db down'));
+
+			await scheduleCiNoFixRecovery(input);
+
+			expect(dedupKeyOf(enqueueJob.mock.calls[0])).toBe(
+				`delivery:${ciNoFixRecoveryDeliveryId(PROJECT, '42', 'abc123')}`,
+			);
+		});
+	});
 });
 
 // Issue #1128: the recovery dispatch's dedup key is the durable record that SWARM's
@@ -195,5 +271,22 @@ describe('hasCiNoFixRecovery', () => {
 	it('is false when no recovery was ever recorded for the head', async () => {
 		findDispatchByDedupKey.mockResolvedValueOnce(undefined);
 		expect(await hasCiNoFixRecovery(PROJECT, '42', 'def456')).toBe(false);
+	});
+});
+
+// Issue #1474: the `reverdict` recovery is the durable record that the Respond-to-CI
+// run a changed failure was re-routed to has answered `no-fix`.
+describe('hasCiNoFixReverdictRecovery', () => {
+	it('reads the reverdict recovery under its own dedup key, not the first one', async () => {
+		findDispatchByDedupKey.mockResolvedValueOnce({ id: 'dispatch-2' });
+		expect(await hasCiNoFixReverdictRecovery(PROJECT, '42', 'abc123')).toBe(true);
+		expect(findDispatchByDedupKey).toHaveBeenLastCalledWith(
+			`delivery:${ciNoFixRecoveryDeliveryId(PROJECT, '42', 'abc123', 'reverdict')}`,
+		);
+	});
+
+	it('is false while the re-routed run has not answered no-fix', async () => {
+		findDispatchByDedupKey.mockResolvedValueOnce(undefined);
+		expect(await hasCiNoFixReverdictRecovery(PROJECT, '42', 'abc123')).toBe(false);
 	});
 });

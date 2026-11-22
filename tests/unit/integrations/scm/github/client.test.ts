@@ -333,7 +333,7 @@ describe('github client', () => {
 	});
 
 	describe('listFailedWorkflowJobAttempts', () => {
-		it("walks every attempt of each failed latest run, keeping its failed jobs' runners", async () => {
+		it("walks every attempt of each failed latest run, keeping its failed jobs' runners and failed steps", async () => {
 			// Workflow 100's latest run (1) failed on its third attempt; workflow 200's is green.
 			paginate.mockImplementation(
 				async (endpoint: unknown, params: { attempt_number?: number }) => {
@@ -362,12 +362,31 @@ describe('github client', () => {
 						2: '',
 						3: 'm5_pro_sm_2',
 					};
+					// Attempt 1 lost its runner before any step failed; attempt 2 reports no
+					// steps at all; attempt 3 failed in its verify step.
+					const stepsByAttempt: Record<number, unknown> = {
+						1: [
+							{ name: 'Set up job', conclusion: 'success' },
+							{ name: 'Run npm run verify', conclusion: 'cancelled' },
+						],
+						2: undefined,
+						3: [
+							{ name: 'Set up job', conclusion: 'success' },
+							{ name: 'Run npm run verify', conclusion: 'failure' },
+							{ name: 'Upload logs', conclusion: 'failure' },
+						],
+					};
 					const attempt = params.attempt_number ?? 0;
 					return [
-						{ name: 'Verify', conclusion: 'failure', runner_name: runnerByAttempt[attempt] },
+						{
+							name: 'Verify',
+							conclusion: 'failure',
+							runner_name: runnerByAttempt[attempt],
+							steps: stepsByAttempt[attempt],
+						},
 						{ name: 'Build', conclusion: 'success', runner_name: 'm5_pro_sm_1' },
 						...(attempt === 3
-							? [{ name: 'E2E', conclusion: 'cancelled', runner_name: null }]
+							? [{ name: 'E2E', conclusion: 'cancelled', runner_name: null, steps: [] }]
 							: [{ name: 'E2E', conclusion: 'skipped', runner_name: null }]),
 					];
 				},
@@ -378,10 +397,10 @@ describe('github client', () => {
 			);
 
 			expect(attempts).toEqual([
-				{ check: 'Verify', attempt: 1, runner: 'm5_pro_sm_1' },
-				{ check: 'Verify', attempt: 2, runner: null },
-				{ check: 'Verify', attempt: 3, runner: 'm5_pro_sm_2' },
-				{ check: 'E2E', attempt: 3, runner: null },
+				{ check: 'Verify', attempt: 1, runner: 'm5_pro_sm_1', failedStep: null },
+				{ check: 'Verify', attempt: 2, runner: null, failedStep: null },
+				{ check: 'Verify', attempt: 3, runner: 'm5_pro_sm_2', failedStep: 'Run npm run verify' },
+				{ check: 'E2E', attempt: 3, runner: null, failedStep: null },
 			]);
 			const attemptReads = paginate.mock.calls.filter(
 				([endpoint]) => endpoint === listJobsForWorkflowRunAttempt,

@@ -2283,6 +2283,12 @@ const ADJUDICATED_RED_MESSAGES: Record<
 		"SWARM's CI agent judged the failure unrelated to this pull request, and the failing checks stayed red after SWARM's re-runs (or could not be re-run); the pull request needs the operator — see the notice on the pull request",
 	'shared-failure':
 		'the failing checks fail on several pull requests at once; SWARM reported that once and is not re-running them here',
+	// Never answered here — merge automation does not ask for the re-route — but
+	// the map covers every outcome (issue #1474).
+	'failure-changed':
+		"a re-run failed differently from the failure SWARM's CI agent judged, so SWARM sent it back to Respond-to-CI",
+	'failure-rerouted':
+		"a re-run failed differently from the failure SWARM's CI agent judged, and that failure is with Respond-to-CI; SWARM re-runs nothing here until it answers",
 };
 
 /**

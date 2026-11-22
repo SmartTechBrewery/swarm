@@ -1,7 +1,28 @@
 import { sql } from 'drizzle-orm';
-import { index, integer, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core';
+import {
+	index,
+	integer,
+	jsonb,
+	pgTable,
+	text,
+	timestamp,
+	uniqueIndex,
+	uuid,
+} from 'drizzle-orm/pg-core';
 import { dispatches } from './dispatches.js';
 import { projects } from './projects.js';
+
+/**
+ * The failure a Respond-to-CI `no-fix` verdict was made on (issue #1474): each
+ * failing check's latest attempt at the time, and the first step of it that
+ * concluded a failure — `null` when none did (a lost runner, a cancelled job).
+ * Stored on {@link reviewVerdicts.adjudicatedFailure}.
+ */
+export type AdjudicatedFailureSignature = {
+	check: string;
+	attempt: number;
+	failedStep: string | null;
+}[];
 
 /**
  * The durable, restart-safe ledger backing the SWARM Review verdict safety
@@ -125,6 +146,23 @@ export const reviewVerdicts = pgTable(
 		 * head. Never cleared.
 		 */
 		operatorNotifiedAt: timestamp('operator_notified_at'),
+		/**
+		 * The failure SWARM's Respond-to-CI agent judged unrelated on this approved
+		 * head (issue #1474): recorded when the first automatic re-run is requested,
+		 * before it runs, so the latest attempt of each check is still the one the
+		 * agent saw. Set only by a write-once conditional update (first writer wins),
+		 * and only where the provider reports failed steps — NULL means "no
+		 * signature", which leaves the head on the re-run-then-notice policy. Never
+		 * cleared.
+		 */
+		adjudicatedFailure: jsonb('adjudicated_failure').$type<AdjudicatedFailureSignature>(),
+		/**
+		 * When SWARM sent this approved head back to Respond-to-CI because a re-run
+		 * failed differently from {@link adjudicatedFailure} (issue #1474). The
+		 * once-per-head bound on that re-route, claimed by a conditional update the
+		 * way {@link operatorNotifiedAt} is. Never cleared.
+		 */
+		failureChangeRoutedAt: timestamp('failure_change_routed_at'),
 	},
 	(table) => [
 		// One *active* record per head — the same-head retry/reuse identity the

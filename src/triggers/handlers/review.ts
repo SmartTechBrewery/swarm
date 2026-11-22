@@ -147,11 +147,21 @@
  * and the last one failing again (or one that cannot be made) leaves a once-only
  * operator notice. The ordinary-red form is decided in
  * `resolveAggregateCheckReview`, before `blocked-by-base` and so before the
- * PR+SHA claim, so no claim, fix attempt or slot is consumed — which is what
- * guarantees an adjudicated approved head never routes back to Respond-to-CI. It
- * applies only with merge automation on (the policy's own precondition), and a
- * policy that answers `not-applicable` falls open to the routing above. A head
- * that was not approved keeps that routing too.
+ * PR+SHA claim, so no claim, fix attempt or slot is consumed. The one way back to
+ * Respond-to-CI is a re-run that failed differently from the failure the verdict
+ * was made on (issue #1474): a verdict covers only that failure, so the policy
+ * answers `failure-changed` — once per approved head — and the ordinary-red form
+ * dispatches Respond-to-CI for it through the usual claim and per-PR fix-attempt
+ * cap. Until that Respond-to-CI answers, the re-route stays owed: an ordinary
+ * red on the head — a deferred dispatch's continuation, a sibling suite, a
+ * settle recheck — is answered `failure-changed` again, and the claim makes the
+ * continuation reuse its own and a sibling collide with the running fix rather
+ * than drop it to the re-runs or the operator notice. The `no-fix` hand-back
+ * never asks for that re-route; on such a head it finds the policy standing by
+ * (`failure-rerouted`) until the second `no-fix` is handed back. It applies only with
+ * merge automation on (the policy's own precondition), and a policy that answers
+ * `not-applicable` falls open to the routing above. A head that was not approved
+ * keeps that routing too.
  *
  * **A green head this PR already approved re-arms its merge** (issue #1128).
  * When a green aggregate meets a review-verdict slot already `submitted` for
@@ -354,8 +364,10 @@ import { decideAggregateCheckOutcome } from './aggregate-check-decision.js';
  * failing on its head; one taken on a head reporting no checks under `if-present`
  * is marked `withoutChecks` (issue #1270). A red on a head this PR already
  * approved, whose red SWARM's CI agent already adjudicated, is handed to the
- * approved-head re-run policy in place (issue #1128) and resolves `none` — never
- * back to Respond-to-CI.
+ * approved-head re-run policy in place (issue #1128) and resolves `none` — unless
+ * a re-run failed differently from the verdict's failure (issue #1474), which
+ * resolves `respond-to-ci`, once per head (re-answered while that fix is owed or
+ * in flight, so a deferred dispatch is not lost).
  */
 type ReviewDisposition =
 	| { kind: 'review'; adjudicatedRed?: true; failedChecks?: string[]; withoutChecks?: true }
@@ -1025,7 +1037,7 @@ async function isAdjudicatedApprovedHead(
 
 /** What the approved-head re-run policy did, for the reason a retried run records (issue #1248). */
 const ADJUDICATED_RED_OUTCOMES: Record<
-	'rerun-requested' | 'needs-operator' | 'shared-failure',
+	'rerun-requested' | 'needs-operator' | 'shared-failure' | 'failure-rerouted',
 	string
 > = {
 	'rerun-requested': 'it re-ran them, and that re-run decides what happens next',
@@ -1033,7 +1045,17 @@ const ADJUDICATED_RED_OUTCOMES: Record<
 		'its re-runs already failed again or one could not be made, so the pull request needs an operator',
 	'shared-failure':
 		'the same checks fail on several pull requests at once, so SWARM reported that once and is not re-running them here',
+	'failure-rerouted':
+		"a re-run already failed differently from the CI agent's verdict, and that failure is with Respond-to-CI until it answers",
 };
+
+/**
+ * What {@link handleAdjudicatedRed} made of an adjudicated red: `settled` here,
+ * `failure-changed` — a re-run failed differently from the `no-fix` verdict's
+ * failure, so the head goes back to Respond-to-CI (issue #1474) — or
+ * `not-applicable`, the policy did nothing.
+ */
+type AdjudicatedRedHandling = 'settled' | 'failure-changed' | 'not-applicable';
 
 /**
  * Hand an adjudicated red on an approved head (issue #1128) to the approved-head
@@ -1047,18 +1069,25 @@ const ADJUDICATED_RED_OUTCOMES: Record<
  * use {@link scheduleRerunSettleRecheck} with the delay the policy returned. A
  * head whose failing checks fail on several pull requests at once
  * (`shared-failure`, issue #1464) is re-read by nothing: the one shared report
- * speaks for it.
+ * speaks for it, and neither is a head whose changed failure is with
+ * Respond-to-CI (`failure-rerouted`, issue #1474): that run's answer decides it.
  *
- * Returns `false` only when the policy answered `not-applicable` — it did
- * nothing — so the ordinary-red caller can fall open to its pre-#1128 routing,
- * and a waiting head never reaches Respond-to-CI.
+ * Answers `not-applicable` only when the policy did nothing, so the ordinary-red
+ * caller can fall open to its pre-#1128 routing, and a waiting head never reaches
+ * Respond-to-CI. `failure-changed` is answered only when `routeChangedFailure` is
+ * set — by the ordinary-red caller, the one that can dispatch the fix (issue
+ * #1474) — both when this call claimed the head's re-route and, again, while that
+ * re-routed Respond-to-CI has not answered: a continuation of a deferred dispatch
+ * re-evaluates from here and must still dispatch, and the PR+SHA claim dedupes a
+ * sibling. The `no-fix` hand-back leaves it unset.
  */
 async function handleAdjudicatedRed(
 	ctx: ScmTriggerContext,
 	prNumber: string,
 	headSha: string,
 	failedChecks: string[],
-): Promise<boolean> {
+	routeChangedFailure = false,
+): Promise<AdjudicatedRedHandling> {
 	const { outcome, recheckAfterMs } = await recoverAdjudicatedApprovedHead({
 		project: ctx.project,
 		scm: ctx.scm,
@@ -1066,7 +1095,15 @@ async function handleAdjudicatedRed(
 		headSha,
 		failedChecks,
 		jobPayload: baseReviewJobPayload(ctx),
+		...(routeChangedFailure ? { routeChangedFailure: true } : {}),
 	});
+	if (outcome === 'failure-changed') {
+		logger.info(
+			"review: a re-run of an approved head failed differently from the CI agent's verdict — re-routing to Respond-to-CI",
+			{ prNumber, headSha, failedChecks },
+		);
+		return 'failure-changed';
+	}
 	logger.info('review: adjudicated red on an approved head — no CI fix dispatched', {
 		prNumber,
 		headSha,
@@ -1083,7 +1120,7 @@ async function handleAdjudicatedRed(
 				`approved-head re-run policy instead of another phase (${ADJUDICATED_RED_OUTCOMES[outcome]}).`,
 		);
 	}
-	return outcome !== 'not-applicable';
+	return outcome === 'not-applicable' ? 'not-applicable' : 'settled';
 }
 
 /**
@@ -1315,7 +1352,9 @@ async function settleSkippedNoFixUpdatedHead(
  * policy (issue #1128), the updated head's one re-run (issue #1433), the
  * updated head whose `no-fix` hand-back was skipped (issue #1445), and the
  * base-branch attribution (issue #873). Only what survives all five goes to
- * Respond-to-CI.
+ * Respond-to-CI — bar an adjudicated approved head whose re-run failed
+ * differently from the verdict's failure (issue #1474), which the re-run policy
+ * sends straight there, once, past the three judgements after it.
  */
 async function resolveRedAggregate(
 	ctx: ScmTriggerContext,
@@ -1341,11 +1380,17 @@ async function resolveRedAggregate(
 	// approved-head re-run policy — a Respond-to-CI run would only decline again.
 	// Nothing is dispatched, so it settles here, before the PR+SHA claim; a
 	// policy that did nothing (`not-applicable`) falls open to the routing below.
-	if (
-		(await isAdjudicatedApprovedHead(ctx.project, prNumber, headSha)) &&
-		(await handleAdjudicatedRed(ctx, prNumber, headSha, failedChecks))
-	) {
-		return { kind: 'none' };
+	// The verdict covers only the failure it was made on (issue #1474): a re-run
+	// that failed in a different step goes back to Respond-to-CI, once per head,
+	// directly — the skipped-hand-back settle below would re-settle it on the old
+	// verdict, and the base attribution has nothing to add to a concrete failure
+	// already seen on this head. The PR+SHA claim and the per-PR fix-attempt cap
+	// still apply on the way — and dedupe the repeat `failure-changed` the policy
+	// answers while that fix is owed or in flight.
+	if (await isAdjudicatedApprovedHead(ctx.project, prNumber, headSha)) {
+		const handling = await handleAdjudicatedRed(ctx, prNumber, headSha, failedChecks, true);
+		if (handling === 'failure-changed') return { kind: 'respond-to-ci', failedChecks };
+		if (handling === 'settled') return { kind: 'none' };
 	}
 	// A red on a head merge automation brought up to date for an approval is
 	// often environmental (issue #1433): re-run its failed checks once before any

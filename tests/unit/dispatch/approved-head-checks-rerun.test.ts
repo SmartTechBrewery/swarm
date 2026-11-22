@@ -12,11 +12,19 @@ const getApprovedHeadSlot = vi.fn(
 	async (_key: unknown): Promise<ApprovedHeadSlot | undefined> => undefined,
 );
 const claimApprovedHeadOperatorNotice = vi.fn(async (_key: unknown) => true);
+// The verdict's recorded failure and the once-only re-route (issue #1474).
+const recordApprovedHeadAdjudicatedFailure = vi.fn(
+	async (_key: unknown, _signature: unknown) => true,
+);
+const claimApprovedHeadFailureChangeRoute = vi.fn(async (_key: unknown) => true);
 vi.mock('@/db/repositories/reviewVerdictsRepository.js', () => ({
 	claimApprovedHeadChecksRerun: (key: unknown, expected: number, max: number) =>
 		claimApprovedHeadChecksRerun(key, expected, max),
 	getApprovedHeadSlot: (key: unknown) => getApprovedHeadSlot(key),
 	claimApprovedHeadOperatorNotice: (key: unknown) => claimApprovedHeadOperatorNotice(key),
+	recordApprovedHeadAdjudicatedFailure: (key: unknown, signature: unknown) =>
+		recordApprovedHeadAdjudicatedFailure(key, signature),
+	claimApprovedHeadFailureChangeRoute: (key: unknown) => claimApprovedHeadFailureChangeRoute(key),
 }));
 
 const createFailedRun = vi.fn(async (_input: unknown) => 'run-notice');
@@ -55,6 +63,16 @@ vi.mock('@/dispatch/shared-check-failure.js', () => ({
 	noteAdjudicatedCheckFailures: (input: unknown) => noteAdjudicatedCheckFailures(input),
 }));
 
+// Whether the Respond-to-CI run a changed failure was re-routed to has answered
+// `no-fix` — its `reverdict` recovery (issue #1474). By default it has not.
+const hasCiNoFixReverdictRecovery = vi.fn(
+	async (_project: unknown, _prNumber: string, _headSha: string) => false,
+);
+vi.mock('@/dispatch/ci-no-fix-recovery.js', () => ({
+	hasCiNoFixReverdictRecovery: (project: unknown, prNumber: string, headSha: string) =>
+		hasCiNoFixReverdictRecovery(project, prNumber, headSha),
+}));
+
 vi.mock('@/lib/logger.js', () => ({
 	logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
@@ -63,6 +81,9 @@ import type { ProjectConfig } from '@/config/schema.js';
 import {
 	APPROVED_HEAD_RERUN_GAPS_MS,
 	approvedHeadRerunInFlight,
+	describeVerdictAgainstLatest,
+	failureMateriallyChanged,
+	failureSignatureOf,
 	MAX_APPROVED_HEAD_RERUNS,
 	nextApprovedHeadRerunDueAt,
 	RERUN_DUE_RECHECK_MARGIN_MS,
@@ -110,11 +131,19 @@ const NOW = new Date('2026-11-15T12:00:00.000Z');
 const MINUTE = 60 * 1000;
 
 /** An approved head's slot with `attempts` re-runs spent, the latest `agoMs` before {@link NOW}. */
-function slot(attempts: number, agoMs?: number, operatorNotifiedAt: Date | null = null) {
+function slot(
+	attempts: number,
+	agoMs?: number,
+	operatorNotifiedAt: Date | null = null,
+	extra: Partial<Pick<ApprovedHeadSlot, 'adjudicatedFailure' | 'failureChangeRoutedAt'>> = {},
+): ApprovedHeadSlot {
 	return {
 		checksRerunAttempts: attempts,
 		checksRerunAt: agoMs === undefined ? null : new Date(NOW.getTime() - agoMs),
 		operatorNotifiedAt,
+		adjudicatedFailure: null,
+		failureChangeRoutedAt: null,
+		...extra,
 	};
 }
 
@@ -145,6 +174,10 @@ beforeEach(() => {
 	getApprovedHeadSlot.mockResolvedValue(slot(0));
 	claimApprovedHeadOperatorNotice.mockReset();
 	claimApprovedHeadOperatorNotice.mockResolvedValue(true);
+	recordApprovedHeadAdjudicatedFailure.mockReset();
+	recordApprovedHeadAdjudicatedFailure.mockResolvedValue(true);
+	claimApprovedHeadFailureChangeRoute.mockReset();
+	claimApprovedHeadFailureChangeRoute.mockResolvedValue(true);
 	createFailedRun.mockClear();
 	releaseReviewDispatch.mockClear();
 	rerunFailedChecks.mockClear();
@@ -155,6 +188,8 @@ beforeEach(() => {
 	runAsPullRequestOperator.mockClear();
 	noteAdjudicatedCheckFailures.mockReset();
 	noteAdjudicatedCheckFailures.mockResolvedValue(new Set());
+	hasCiNoFixReverdictRecovery.mockReset();
+	hasCiNoFixReverdictRecovery.mockResolvedValue(false);
 });
 
 afterEach(() => {
@@ -514,6 +549,358 @@ describe('recoverAdjudicatedApprovedHead', () => {
 		createFailedRun.mockRejectedValueOnce(new Error('db down'));
 		postComment.mockRejectedValueOnce(new Error('HTTP 502'));
 		expect((await recoverAdjudicatedApprovedHead(input())).outcome).toBe('needs-operator');
+	});
+});
+
+// Issue #1474: a `no-fix` verdict covers only the failure it was made on.
+describe('a re-run failing differently from the verdict (issue #1474)', () => {
+	const CHECK = 'Lint, typecheck, and test';
+	const JUDGED = [{ check: CHECK, attempt: 1, failedStep: null }];
+	const verdictAttempt: CheckAttemptRunner = {
+		check: CHECK,
+		attempt: 1,
+		runner: 'm5_pro_sm_1',
+		failedStep: null,
+	};
+	const adjudicatedSlot = (attempts: number, agoMs: number, routedAt: Date | null = null) =>
+		slot(attempts, agoMs, null, { adjudicatedFailure: JUDGED, failureChangeRoutedAt: routedAt });
+
+	it('records the failure the verdict was made on before the first re-run runs', async () => {
+		describeFailedCheckAttempts.mockResolvedValue([verdictAttempt]);
+		expect((await recoverAdjudicatedApprovedHead(input({ failedChecks: [CHECK] }))).outcome).toBe(
+			'rerun-requested',
+		);
+		expect(recordApprovedHeadAdjudicatedFailure).toHaveBeenCalledExactlyOnceWith(KEY, JUDGED);
+		expect(recordApprovedHeadAdjudicatedFailure.mock.invocationCallOrder[0] as number).toBeLessThan(
+			rerunFailedChecks.mock.invocationCallOrder[0] as number,
+		);
+	});
+
+	it('does not record it again on a later re-run', async () => {
+		getApprovedHeadSlot.mockResolvedValue(slot(1, 15 * MINUTE));
+		describeFailedCheckAttempts.mockResolvedValue([verdictAttempt]);
+		expect((await recoverAdjudicatedApprovedHead(input({ failedChecks: [CHECK] }))).outcome).toBe(
+			'rerun-requested',
+		);
+		expect(recordApprovedHeadAdjudicatedFailure).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		['throws', () => describeFailedCheckAttempts.mockRejectedValueOnce(new Error('HTTP 502'))],
+		['reports nothing', () => describeFailedCheckAttempts.mockResolvedValueOnce([])],
+		[
+			'reports no steps',
+			() =>
+				describeFailedCheckAttempts.mockResolvedValueOnce([
+					{ check: CHECK, attempt: 1, runner: 'r1' },
+				]),
+		],
+	])('records nothing, and still re-runs, when the provider read %s', async (_name, arrange) => {
+		arrange();
+		expect((await recoverAdjudicatedApprovedHead(input({ failedChecks: [CHECK] }))).outcome).toBe(
+			'rerun-requested',
+		);
+		expect(recordApprovedHeadAdjudicatedFailure).not.toHaveBeenCalled();
+		expect(rerunFailedChecks).toHaveBeenCalledOnce();
+	});
+
+	it('still re-runs when the verdict failure cannot be written', async () => {
+		describeFailedCheckAttempts.mockResolvedValue([verdictAttempt]);
+		recordApprovedHeadAdjudicatedFailure.mockRejectedValueOnce(new Error('db down'));
+		expect((await recoverAdjudicatedApprovedHead(input({ failedChecks: [CHECK] }))).outcome).toBe(
+			'rerun-requested',
+		);
+	});
+
+	// The incident: the verdict was made on an attempt whose runner was lost (no
+	// step failed); the re-run then failed in the verify step itself.
+	it('sends a re-run that failed in a concrete new step back to Respond-to-CI, once', async () => {
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(1, RERUN_SETTLE_MS + 1_000));
+		describeFailedCheckAttempts.mockResolvedValue([
+			verdictAttempt,
+			{ check: CHECK, attempt: 2, runner: 'm5_pro_sm_2', failedStep: 'Run npm run verify' },
+		]);
+		expect(
+			await recoverAdjudicatedApprovedHead(
+				input({ failedChecks: [CHECK], routeChangedFailure: true }),
+			),
+		).toEqual({ outcome: 'failure-changed' });
+		expect(claimApprovedHeadFailureChangeRoute).toHaveBeenCalledExactlyOnceWith(KEY);
+		expect(claimApprovedHeadChecksRerun).not.toHaveBeenCalled();
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+		expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
+	});
+
+	it('re-routes the last re-run too, rather than handing it to the operator', async () => {
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(3, 60 * MINUTE));
+		describeFailedCheckAttempts.mockResolvedValue([
+			{ check: CHECK, attempt: 4, runner: 'r', failedStep: 'Run npm run verify' },
+		]);
+		expect(
+			(
+				await recoverAdjudicatedApprovedHead(
+					input({ failedChecks: [CHECK], routeChangedFailure: true }),
+				)
+			).outcome,
+		).toBe('failure-changed');
+		expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		['no step failed again', null],
+		['the same step failed again', 'Run npm run verify'],
+	])('keeps the re-runs, then the notice, when %s', async (_name, failedStep) => {
+		const judged = [{ check: CHECK, attempt: 1, failedStep }];
+		const sameAgain = (attempt: number): CheckAttemptRunner => ({
+			check: CHECK,
+			attempt,
+			runner: 'r',
+			failedStep,
+		});
+		getApprovedHeadSlot.mockResolvedValue(
+			slot(1, 5 * MINUTE, null, { adjudicatedFailure: judged }),
+		);
+		describeFailedCheckAttempts.mockResolvedValue([sameAgain(1), sameAgain(2)]);
+		const routed = input({ failedChecks: [CHECK], routeChangedFailure: true });
+		expect((await recoverAdjudicatedApprovedHead(routed)).outcome).toBe('rerun-waiting');
+
+		getApprovedHeadSlot.mockResolvedValue(
+			slot(3, 60 * MINUTE, null, { adjudicatedFailure: judged }),
+		);
+		describeFailedCheckAttempts.mockResolvedValue([sameAgain(1), sameAgain(4)]);
+		expect((await recoverAdjudicatedApprovedHead(routed)).outcome).toBe('needs-operator');
+		expect(claimApprovedHeadFailureChangeRoute).not.toHaveBeenCalled();
+		expect(createFailedRun).toHaveBeenCalledOnce();
+	});
+
+	it('runs no comparison for a caller that cannot dispatch the fix', async () => {
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(1, 5 * MINUTE));
+		describeFailedCheckAttempts.mockResolvedValue([
+			{ check: CHECK, attempt: 2, runner: 'r', failedStep: 'Run npm run verify' },
+		]);
+		expect((await recoverAdjudicatedApprovedHead(input({ failedChecks: [CHECK] }))).outcome).toBe(
+			'rerun-waiting',
+		);
+		expect(describeFailedCheckAttempts).not.toHaveBeenCalled();
+		expect(claimApprovedHeadFailureChangeRoute).not.toHaveBeenCalled();
+	});
+
+	// The stamp is written when the route is claimed, before Respond-to-CI is even
+	// dispatched: a deferred dispatch's continuation, a sibling suite or a settle
+	// recheck re-evaluates the head while that fix is owed or running.
+	it.each([
+		['with re-runs left', 1],
+		['with the re-runs spent', 3],
+	])('answers failure-changed again, without a second claim, while the re-routed fix has not answered (%s)', async (_name, attempts) => {
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(attempts, 60 * MINUTE, new Date(NOW)));
+		describeFailedCheckAttempts.mockResolvedValue([
+			{ check: CHECK, attempt: 4, runner: 'r', failedStep: 'Run npm run verify' },
+		]);
+		expect(
+			await recoverAdjudicatedApprovedHead(
+				input({ failedChecks: [CHECK], routeChangedFailure: true }),
+			),
+		).toEqual({ outcome: 'failure-changed' });
+		expect(hasCiNoFixReverdictRecovery).toHaveBeenCalledExactlyOnceWith(PROJECT, '42', 'abc123');
+		expect(claimApprovedHeadFailureChangeRoute).not.toHaveBeenCalled();
+		expect(claimApprovedHeadChecksRerun).not.toHaveBeenCalled();
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+		expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
+		expect(createFailedRun).not.toHaveBeenCalled();
+		expect(postComment).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		['with re-runs left', 1],
+		['with the re-runs spent', 3],
+	])('spends no re-run and writes no notice for a caller that cannot dispatch, while the re-route is pending (%s)', async (_name, attempts) => {
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(attempts, 60 * MINUTE, new Date(NOW)));
+		expect(await recoverAdjudicatedApprovedHead(input({ failedChecks: [CHECK] }))).toEqual({
+			outcome: 'failure-rerouted',
+		});
+		expect(noteAdjudicatedCheckFailures).not.toHaveBeenCalled();
+		expect(claimApprovedHeadChecksRerun).not.toHaveBeenCalled();
+		expect(rerunFailedChecks).not.toHaveBeenCalled();
+		expect(releaseReviewDispatch).not.toHaveBeenCalled();
+		expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
+		expect(createFailedRun).not.toHaveBeenCalled();
+		expect(postComment).not.toHaveBeenCalled();
+	});
+
+	it('takes a failed read of the re-routed answer as still pending', async () => {
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(3, 60 * MINUTE, new Date(NOW)));
+		hasCiNoFixReverdictRecovery.mockRejectedValue(new Error('db down'));
+		expect((await recoverAdjudicatedApprovedHead(input({ failedChecks: [CHECK] }))).outcome).toBe(
+			'failure-rerouted',
+		);
+		expect(
+			(
+				await recoverAdjudicatedApprovedHead(
+					input({ failedChecks: [CHECK], routeChangedFailure: true }),
+				)
+			).outcome,
+		).toBe('failure-changed');
+		expect(claimApprovedHeadOperatorNotice).not.toHaveBeenCalled();
+	});
+
+	it('re-routes a head only once: once the re-routed fix answered no-fix, the head keeps the re-runs and the notice', async () => {
+		hasCiNoFixReverdictRecovery.mockResolvedValue(true);
+		describeFailedCheckAttempts.mockResolvedValue([
+			{ check: CHECK, attempt: 4, runner: 'r', failedStep: 'Run npm run verify' },
+		]);
+		const routed = input({ failedChecks: [CHECK], routeChangedFailure: true });
+
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(1, 60 * MINUTE, new Date(NOW)));
+		expect((await recoverAdjudicatedApprovedHead(routed)).outcome).toBe('rerun-requested');
+		expect(rerunFailedChecks).toHaveBeenCalledOnce();
+
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(3, 60 * MINUTE, new Date(NOW)));
+		expect((await recoverAdjudicatedApprovedHead(routed)).outcome).toBe('needs-operator');
+		expect(claimApprovedHeadFailureChangeRoute).not.toHaveBeenCalled();
+		expect(createFailedRun).toHaveBeenCalledOnce();
+	});
+
+	it('settles when another caller won the re-route', async () => {
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(1, 5 * MINUTE));
+		describeFailedCheckAttempts.mockResolvedValue([
+			{ check: CHECK, attempt: 2, runner: 'r', failedStep: 'Run npm run verify' },
+		]);
+		claimApprovedHeadFailureChangeRoute.mockResolvedValueOnce(false);
+		expect(
+			await recoverAdjudicatedApprovedHead(
+				input({ failedChecks: [CHECK], routeChangedFailure: true }),
+			),
+		).toEqual({ outcome: 'rerun-settling', recheckAfterMs: RERUN_SETTLE_RECHECK_DELAY_MS });
+	});
+
+	it('names the attempt the verdict was made on, and what the latest failed on, in the notice', async () => {
+		hasCiNoFixReverdictRecovery.mockResolvedValue(true);
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(3, 60 * MINUTE, new Date(NOW)));
+		describeFailedCheckAttempts.mockResolvedValue([
+			verdictAttempt,
+			{ check: CHECK, attempt: 4, runner: 'm5_pro_sm_1', failedStep: 'Run npm run verify' },
+		]);
+		expect((await recoverAdjudicatedApprovedHead(input({ failedChecks: [CHECK] }))).outcome).toBe(
+			'needs-operator',
+		);
+		const sentence =
+			"SWARM's CI agent made its judgement on attempt 1 of `Lint, typecheck, and test`, where " +
+			'no step reported a failure (the job produced no result); the latest attempt, 4, failed ' +
+			'in step `Run npm run verify`.';
+		expect((createFailedRun.mock.calls[0][0] as { error: string }).error).toContain(sentence);
+		expect((postComment.mock.calls[0][0] as { body: string }).body).toContain(sentence);
+	});
+
+	it('leaves that sentence out when the provider reports no steps', async () => {
+		getApprovedHeadSlot.mockResolvedValue(adjudicatedSlot(3, 60 * MINUTE));
+		describeFailedCheckAttempts.mockResolvedValue([{ check: CHECK, attempt: 4, runner: 'r' }]);
+		expect((await recoverAdjudicatedApprovedHead(input({ failedChecks: [CHECK] }))).outcome).toBe(
+			'needs-operator',
+		);
+		expect((createFailedRun.mock.calls[0][0] as { error: string }).error).not.toContain(
+			'made its judgement',
+		);
+		expect((postComment.mock.calls[0][0] as { body: string }).body).not.toContain(
+			'made its judgement',
+		);
+	});
+});
+
+describe('failureSignatureOf', () => {
+	it('keeps the latest attempt of each failing check, with its failed step', () => {
+		expect(
+			failureSignatureOf(
+				[
+					{ check: 'a', attempt: 1, runner: 'r', failedStep: null },
+					{ check: 'a', attempt: 2, runner: 'r', failedStep: 'Test' },
+					{ check: 'b', attempt: 1, runner: 'r', failedStep: 'Lint' },
+				],
+				[],
+			),
+		).toEqual([
+			{ check: 'a', attempt: 2, failedStep: 'Test' },
+			{ check: 'b', attempt: 1, failedStep: 'Lint' },
+		]);
+	});
+
+	it('keeps only the checks named as failing', () => {
+		expect(
+			failureSignatureOf(
+				[
+					{ check: 'a', attempt: 1, runner: 'r', failedStep: 'Test' },
+					{ check: 'b', attempt: 1, runner: 'r', failedStep: 'Lint' },
+				],
+				['b'],
+			),
+		).toEqual([{ check: 'b', attempt: 1, failedStep: 'Lint' }]);
+	});
+
+	it('gives no signature when the provider reports no steps', () => {
+		expect(failureSignatureOf([{ check: 'a', attempt: 1, runner: 'r' }], [])).toBeNull();
+		expect(failureSignatureOf([], [])).toBeNull();
+	});
+});
+
+describe('failureMateriallyChanged', () => {
+	const judged = (failedStep: string | null) => [{ check: 'ci', attempt: 1, failedStep }];
+	const latest = (failedStep: string | null, attempt = 2, check = 'ci') => [
+		{ check, attempt, failedStep },
+	];
+
+	it('is a change when a newer attempt fails in a step the verdict did not see', () => {
+		expect(failureMateriallyChanged(judged(null), latest('Run npm run verify'))).toBe(true);
+		expect(failureMateriallyChanged(judged('Lint'), latest('Test'))).toBe(true);
+	});
+
+	it('is the same failure when the same step fails, or no step fails, again', () => {
+		expect(failureMateriallyChanged(judged('Test'), latest('Test'))).toBe(false);
+		expect(failureMateriallyChanged(judged(null), latest(null))).toBe(false);
+		expect(failureMateriallyChanged(judged('Test'), latest(null))).toBe(false);
+	});
+
+	it('is a change when a check the verdict did not cover fails in a step', () => {
+		expect(failureMateriallyChanged(judged(null), latest('Build', 1, 'other'))).toBe(true);
+	});
+
+	it('is no change while the latest attempt is not newer than the verdict’s', () => {
+		expect(failureMateriallyChanged(judged(null), latest('Test', 1))).toBe(false);
+	});
+});
+
+describe('describeVerdictAgainstLatest', () => {
+	const judged = [{ check: 'ci', attempt: 1, failedStep: 'Lint' }];
+
+	it('says so when no attempt has run since the verdict', () => {
+		expect(
+			describeVerdictAgainstLatest(
+				judged,
+				[{ check: 'ci', attempt: 1, runner: 'r', failedStep: 'Lint' }],
+				['ci'],
+			),
+		).toBe(
+			"SWARM's CI agent made its judgement on attempt 1 of `ci`, where step `Lint` failed, and that is still its latest attempt.",
+		);
+	});
+
+	it('describes a latest attempt in which no step failed', () => {
+		expect(
+			describeVerdictAgainstLatest(
+				judged,
+				[{ check: 'ci', attempt: 3, runner: 'r', failedStep: null }],
+				['ci'],
+			),
+		).toContain(
+			'the latest attempt, 3, had no step report a failure (the job produced no result).',
+		);
+	});
+
+	it('is null when either side is unknown', () => {
+		const attempts = [{ check: 'ci', attempt: 2, runner: 'r', failedStep: 'Lint' }];
+		expect(describeVerdictAgainstLatest(null, attempts, ['ci'])).toBeNull();
+		expect(
+			describeVerdictAgainstLatest(judged, [{ check: 'ci', attempt: 2, runner: 'r' }], ['ci']),
+		).toBeNull();
 	});
 });
 

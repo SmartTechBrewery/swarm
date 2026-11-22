@@ -275,7 +275,11 @@ export async function listFailedWorkflowJobAttempts(
 	return attempts;
 }
 
-/** One attempt of one workflow run: its failed jobs, and the runner each ran on. */
+/**
+ * One attempt of one workflow run: its failed jobs, the runner each ran on, and
+ * the first step of each that concluded `failure` (`null` when none did — a job
+ * cancelled, or lost with its runner, before any step failed; issue #1474).
+ */
 async function readFailedJobsOfAttempt(
 	client: Octokit,
 	owner: string,
@@ -292,7 +296,12 @@ async function readFailedJobsOfAttempt(
 	});
 	return jobs
 		.filter((job) => isRerunnableConclusion(job.conclusion))
-		.map((job) => ({ check: job.name, attempt, runner: job.runner_name || null }));
+		.map((job) => ({
+			check: job.name,
+			attempt,
+			runner: job.runner_name || null,
+			failedStep: job.steps?.find((step) => step.conclusion === 'failure')?.name ?? null,
+		}));
 }
 
 /**

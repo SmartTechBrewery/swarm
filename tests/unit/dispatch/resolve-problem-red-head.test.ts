@@ -282,6 +282,8 @@ describe('redHeadHandled (issue #1459)', () => {
 			checksRerunAt: at('12:00'),
 			checksRerunAttempts: 1,
 			operatorNotifiedAt: at('12:05'),
+			adjudicatedFailure: null,
+			failureChangeRoutedAt: null,
 		});
 		await expect(redHeadHandled(key, true, now, handed)).resolves.toMatch(/handed .* operator/);
 	});
@@ -290,6 +292,8 @@ describe('redHeadHandled (issue #1459)', () => {
 		checksRerunAt: new Date(now.getTime() - agoMs),
 		checksRerunAttempts,
 		operatorNotifiedAt: null,
+		adjudicatedFailure: null,
+		failureChangeRoutedAt: null,
 	});
 
 	it('is an approved head’s last re-run still settling, and not one past its window', async () => {
@@ -341,6 +345,8 @@ describe('redHeadHandled (issue #1459)', () => {
 			checksRerunAt: null,
 			checksRerunAttempts: 0,
 			operatorNotifiedAt: null,
+			adjudicatedFailure: null,
+			failureChangeRoutedAt: null,
 		});
 		await expect(redHeadHandled(key, false, now, approved)).resolves.toMatch(/person to merge/);
 		await expect(redHeadHandled(key, true, now, approved)).resolves.toBeUndefined();
@@ -351,6 +357,8 @@ describe('redHeadHandled (issue #1459)', () => {
 			checksRerunAt: null,
 			checksRerunAttempts: 0,
 			operatorNotifiedAt: null,
+			adjudicatedFailure: null,
+			failureChangeRoutedAt: null,
 		};
 		const shared = reads(approved, undefined, 'integration');
 		await expect(redHeadHandled(key, true, now, shared)).resolves.toMatch(

@@ -3062,6 +3062,70 @@ describe('review trigger — a red on an adjudicated approved head (issue #1128)
 		expect(await handler.handle(autoCtx())).toMatchObject({ phase: 'respond-to-ci' });
 		expect(recoverAdjudicatedApprovedHead).not.toHaveBeenCalled();
 	});
+
+	// Issue #1474: the verdict covers only the failure it was made on. A re-run that
+	// failed differently goes back to Respond-to-CI — through the ordinary claim and
+	// fix-attempt cap, but past the base attribution.
+	describe('a re-run that failed differently from the verdict (issue #1474)', () => {
+		it('asks the policy for the re-route, and dispatches Respond-to-CI on it', async () => {
+			adjudicatedAndApproved();
+			recoverAdjudicatedApprovedHead.mockResolvedValue({ outcome: 'failure-changed' });
+			// The base branch's head reads the same red `test` — not consulted here.
+			getBranchHead.mockResolvedValue('base-head-sha');
+
+			expect(await handler.handle(autoCtx())).toMatchObject({
+				phase: 'respond-to-ci',
+				prNumber: '9',
+				headSha: 'cafe',
+			});
+			expect(recoverAdjudicatedApprovedHead).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ routeChangedFailure: true, failedChecks: ['test'] }),
+			);
+			expect(claimReviewDispatch).toHaveBeenCalledTimes(1);
+			expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+			expect(getBranchHead).not.toHaveBeenCalled();
+			expect(deliveryPostComment).not.toHaveBeenCalled();
+		});
+
+		it('still stops at the per-PR fix-attempt cap', async () => {
+			adjudicatedAndApproved();
+			recoverAdjudicatedApprovedHead.mockResolvedValue({ outcome: 'failure-changed' });
+			claimRespondToCiAttempt.mockResolvedValue({ allowed: false, attempt: 5 });
+
+			expect(await handler.handle(autoCtx())).toBeNull();
+			expect(claimRespondToCiAttempt).toHaveBeenCalledTimes(1);
+		});
+
+		// The policy keeps answering `failure-changed` until the re-routed fix has
+		// answered, so a dispatch deferred before it ran is not lost when its
+		// continuation re-evaluates the head from the top.
+		it('still dispatches Respond-to-CI on a continuation retry, reusing its claim and attempt', async () => {
+			adjudicatedAndApproved();
+			recoverAdjudicatedApprovedHead.mockResolvedValue({ outcome: 'failure-changed' });
+
+			expect(await handler.handle(autoCtx({ continuationDispatchClaimed: true }))).toMatchObject({
+				phase: 'respond-to-ci',
+				prNumber: '9',
+				headSha: 'cafe',
+			});
+			expect(recoverAdjudicatedApprovedHead).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ routeChangedFailure: true }),
+			);
+			expect(claimReviewDispatch).not.toHaveBeenCalled();
+			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+		});
+
+		it('dispatches nothing, and hands nothing to the operator, on a red while the CI fix holds the claim', async () => {
+			adjudicatedAndApproved();
+			recoverAdjudicatedApprovedHead.mockResolvedValue({ outcome: 'failure-changed' });
+			claimReviewDispatch.mockResolvedValue(false);
+
+			expect(await handler.handle(autoCtx())).toBeNull();
+			expect(claimReviewDispatch).toHaveBeenCalledTimes(1);
+			expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
+			expect(deliveryPostComment).not.toHaveBeenCalled();
+		});
+	});
 });
 
 describe('review trigger — the no-fix hand-back to Review (issue #841)', () => {
@@ -3131,6 +3195,10 @@ describe('review trigger — the no-fix hand-back to Review (issue #841)', () =>
 				headSha: 'cafe',
 				failedChecks: ['test'],
 			}),
+		);
+		// The hand-back cannot dispatch a fix, so it never asks for the re-route (issue #1474).
+		expect(recoverAdjudicatedApprovedHead.mock.calls[0]?.[0]).not.toHaveProperty(
+			'routeChangedFailure',
 		);
 		expect(claimRespondToCiAttempt).not.toHaveBeenCalled();
 	});
