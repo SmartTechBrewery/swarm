@@ -5282,6 +5282,24 @@ describe('processJob', () => {
 		expect(discoverCliQuotas).not.toHaveBeenCalled();
 	});
 
+	it('diagnoses a message-only Claude auth failure from its wording (issue #1478)', async () => {
+		// A federated worker's failure reaches the control plane as a message alone,
+		// rebuilt as a plain `error`; the wording must still diagnose it.
+		const error =
+			'Review agent (claude) exited with code 1 (Claude requires authentication: run `claude auth login` on the worker host, or use `claude setup-token` and set CLAUDE_CODE_OAUTH_TOKEN for unattended jobs)';
+		phaseImpl = async () => {
+			throw new AgentRunError(error, { kind: 'error' });
+		};
+
+		const outcome = await processJob(createMockScmWebhookJob(), registryReturning(REVIEW_TRIGGER));
+
+		expect(outcome).toMatchObject({
+			status: 'phase-failed',
+			error,
+			failureDiagnosis: { kind: 'launch-or-authentication' },
+		});
+	});
+
 	it('defers a stalled phase instead of failing it, using minimum delayed-retry floor', async () => {
 		phaseImpl = async () => {
 			throw new AgentRunError('Review agent (antigravity) exited with code 1 (stalled)', {
