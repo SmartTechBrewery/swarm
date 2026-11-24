@@ -5237,7 +5237,7 @@ async function unmetAssigneeRequirement(
 }
 
 function isLaunchOrAuthenticationFailure(error: string): boolean {
-	return /(?:failed to launch|\benoent\b|permission denied|\beacces\b|not authenticated|authentication (?:failed|required)|login required|please log in)/i.test(
+	return /(?:failed to launch|\benoent\b|permission denied|\beacces\b|not authenticated|authentication (?:failed|required)|requires authentication|login required|please log in)/i.test(
 		error,
 	);
 }

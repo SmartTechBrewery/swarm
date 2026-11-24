@@ -19,7 +19,11 @@
  *
  * Not every recognised kind is a retry signal: `auth` (issue #343) is terminal
  * and classified purely so the run's headline says *why* — waiting cannot restore
- * a login, only a human re-running `/login` can.
+ * a login, only a human logging the CLI in again can. It is recognised from a
+ * CLI-owned banner in the terminal tail, or — for Claude — from the CLI's own
+ * failed terminal `result` record, which is where current Claude Code reports an
+ * expired login (`Failed to authenticate: this login reached its time limit …`,
+ * issue #1478).
  *
  * One signal is deliberately read outside "the CLI exited non-zero": an account
  * quota the CLI reported in its *own* terminal failure record (issue #1013). `agy`
@@ -234,6 +238,17 @@ const AUTH_BANNER_RE =
 // with no status code at all (`Claude run failed (success): You've hit your
 // 5-hour limit · …`, issue #1196).
 const CLAUDE_RATE_LIMIT_ERROR_RE = /\b429\b|\brate_limit_error\b/i;
+// Claude's "you are not authenticated" verdict inside that same structural
+// `Claude run failed (…)` record (issue #1478). Current Claude Code reports an
+// expired login there as `Failed to authenticate: this login reached its time
+// limit … Run \`claude auth login\` … or use \`claude setup-token\` and set
+// CLAUDE_CODE_OAUTH_TOKEN …`, none of which {@link AUTH_BANNER_RE} names. The
+// record exists only because the CLI itself reported the run as failed, so the
+// broad "failed to authenticate" phrase is safe *here*, exactly as a bare 429 is
+// for {@link CLAUDE_RATE_LIMIT_ERROR_RE}; it stays out of the free-text tail scan,
+// where a reviewed diff, CI log or SWARM's own docs can quote it (#343).
+const CLAUDE_AUTH_FAILURE_RE =
+	/\bfailed to authenticate\b|\bclaude auth login\b|\bclaude setup-token\b|\bCLAUDE_CODE_OAUTH_TOKEN\b|\blogin reached its time limit\b|\bauthentication_error\b|\bnot logged in\b|\brun \/login\b/i;
 // agy's terminal `result` event reports its own `status`, rendered as a single
 // `Antigravity run failed (…)` line ({@link ./antigravity-stream.ts}). Like
 // Claude's, that line is structural — it exists only because the CLI itself
@@ -387,6 +402,23 @@ function claudeRateLimitMessage(result: AgentCliResult): string | undefined {
 		LIMIT_BANNER_RE.test(message)
 		? message
 		: undefined;
+}
+
+/**
+ * Whether Claude's own failed terminal `result` record says the CLI is not
+ * authenticated (issue #1478). Structural for the reason
+ * {@link claudeRateLimitMessage} is: only the CLI writes that record, so text a
+ * run merely quotes — a reviewed diff, a CI log — can never satisfy it.
+ */
+function claudeAuthFailure(result: AgentCliResult): boolean {
+	if (result.cli !== 'claude' || result.claudeFailure === undefined) return false;
+	const { subtype = '', message = '' } = result.claudeFailure;
+	return CLAUDE_AUTH_FAILURE_RE.test(subtype) || CLAUDE_AUTH_FAILURE_RE.test(message);
+}
+
+/** A CLI-owned auth banner in the terminal tail, or Claude's structural verdict. */
+function isAuthFailure(result: AgentCliResult, tail: string): boolean {
+	return AUTH_BANNER_RE.test(tail) || claudeAuthFailure(result);
 }
 
 /**
@@ -624,8 +656,9 @@ function resolveResetHint(
  * the quota signal outright rather than merely being checked after it.
  * A recognisable terminal limit banner is then a `rate-limit`, as is the
  * structural quota verdict above.
- * Then a CLI's own "not authenticated" banner is `auth` — recognised for its
- * message, not to retry, and checked before the trailing stall marker so an
+ * Then a CLI's own "not authenticated" banner in the terminal tail, or Claude's
+ * own structural failure record naming one (issue #1478), is `auth` — recognised
+ * for its message, not to retry, and checked before the trailing stall marker so an
  * unauthenticated run cannot be deferred and resumed onto a login only a human
  * can restore. Otherwise a stalled run is classified as `stalled`, and
  * everything else is a plain `error`.
@@ -680,7 +713,7 @@ export function classifyAgentFailure(
 	// or terminal limit banner is more specific; auth still outranks the generic
 	// trailing stall marker below. `aborted` still wins above both, and so does a
 	// timeout that carried no structural quota verdict.
-	if (AUTH_BANNER_RE.test(tail)) return { kind: 'auth' };
+	if (isAuthFailure(result, tail)) return { kind: 'auth' };
 
 	// The CLI's own give-up-waiting phrasing (matched case-insensitively). Checked
 	// after timeout/abort and recognised provider conditions, so a trailing stall
@@ -707,6 +740,15 @@ const FAILURE_REASONS: Partial<Record<AgentFailureKind, string>> = {
 };
 
 /**
+ * What the operator reads when Claude's CLI is not authenticated (issue #1478):
+ * the cause, and how to restore it. Exported so the dashboard heads the run's
+ * failure callout with the same words `runs.error` carries.
+ */
+export const CLAUDE_AUTH_REQUIRED = 'Claude requires authentication';
+export const CLAUDE_AUTH_RECOVERY =
+	'run `claude auth login` on the worker host, or use `claude setup-token` and set CLAUDE_CODE_OAUTH_TOKEN for unattended jobs';
+
+/**
  * Build the {@link AgentRunError} a pipeline phase throws for a run
  * {@link agentRunFailed} rejected. `prefix` is the phase-specific stem (`Review
  * agent (claude) exited with code 1`) and `tail` its suffix (` for PR #90`); this
@@ -726,9 +768,14 @@ export function agentRunError(
 	// and the PR comment instead of only into `run_output_events`: the operator
 	// reads `(CLI timed out: [agy] print timeout after 5m0s …)` rather than having
 	// to query Postgres to find out why a hand-off was never written.
+	// A Claude auth failure names the CLI and its recovery (issue #1478) rather than
+	// the generic marker other CLIs keep, whichever banner it was recognised from:
+	// the older `/login` banners share the cause and the cure.
 	const reason = failure.cliSelfTimeout
 		? ` (CLI timed out: ${failure.cliSelfTimeout})`
-		: (FAILURE_REASONS[failure.kind] ?? '');
+		: failure.kind === 'auth' && result.cli === 'claude'
+			? ` (${CLAUDE_AUTH_REQUIRED}: ${CLAUDE_AUTH_RECOVERY})`
+			: (FAILURE_REASONS[failure.kind] ?? '');
 	return new AgentRunError(`${prefix}${reason}${tail}`, failure, result);
 }
 

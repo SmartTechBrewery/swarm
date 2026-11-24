@@ -113,6 +113,23 @@ describe('parseAgentOutput', () => {
 			});
 		});
 
+		it('records an expired-login result reported as subtype success (issue #1478)', () => {
+			const banner =
+				'Failed to authenticate: this login reached its time limit and cannot be renewed. ' +
+				'Run `claude auth login` to sign in again, or use `claude setup-token` and set ' +
+				'CLAUDE_CODE_OAUTH_TOKEN for unattended jobs';
+			const stdout = claudeStream({
+				type: 'result',
+				subtype: 'success',
+				is_error: true,
+				result: banner,
+			});
+
+			const parsed = parseAgentOutput('claude', stdout);
+			expect(parsed.claudeFailure).toEqual({ subtype: 'success', message: banner });
+			expect(parsed.logText).toMatch(/^Claude run failed \(success\): Failed to authenticate/);
+		});
+
 		it('skips malformed and unknown stream lines without losing the terminal event', () => {
 			const stdout = [
 				'not json at all',

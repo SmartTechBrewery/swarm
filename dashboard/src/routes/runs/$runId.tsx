@@ -45,6 +45,7 @@ import {
 import { describePreservedWorker, preservedWorkerLabel } from '@/lib/preserved-worker.js';
 import { describeCancellationOrigin, normalizeRunError } from '@/lib/run-cancellation.js';
 import { resolveRunDurationMs, useNow } from '@/lib/run-duration.js';
+import { pipelineFailureHeading } from '@/lib/run-failure-heading.js';
 import { isMaintenanceRun } from '@/lib/run-kind.js';
 import {
 	canRecoverRun,
@@ -2292,11 +2293,7 @@ interface PipelineFailureCalloutProps {
  * {@link MaintenanceFailureCallout}, which is what a maintenance run reads instead.
  */
 function PipelineFailureCallout({ run, error, onResetSuccess }: PipelineFailureCalloutProps) {
-	const heading = run.cancellation
-		? 'Run Cancelled'
-		: run.timedOut
-			? 'Run Timed Out'
-			: 'Run Failure Error';
+	const heading = pipelineFailureHeading(run, error);
 	return (
 		<div className="p-4 bg-red-950/20 border border-red-900/30 rounded flex items-start gap-3">
 			<AlertTriangle className="h-5 w-5 text-red-400 shrink-0 mt-0.5" />

@@ -1075,7 +1075,20 @@ describe('agentRunError', () => {
 			NOW,
 		);
 		expect(err.message).toBe(
-			"Implementation agent (claude) exited with code 1 (authentication failed) for task '337'",
+			"Implementation agent (claude) exited with code 1 (Claude requires authentication: run `claude auth login` on the worker host, or use `claude setup-token` and set CLAUDE_CODE_OAUTH_TOKEN for unattended jobs) for task '337'",
+		);
+		expect(err.failure).toEqual({ kind: 'auth' });
+	});
+
+	it('keeps the generic authentication marker for a non-Claude CLI', () => {
+		const err = agentRunError(
+			result({ cli: 'codex', stdout: 'Not logged in · Please run /login' }),
+			'Implementation agent (codex) exited with code 1',
+			" for task '337'",
+			NOW,
+		);
+		expect(err.message).toBe(
+			"Implementation agent (codex) exited with code 1 (authentication failed) for task '337'",
 		);
 		expect(err.failure).toEqual({ kind: 'auth' });
 	});
@@ -1336,5 +1349,81 @@ describe("Claude's duration-named usage-limit banner (issue #1196)", () => {
 				NOW,
 			).message,
 		).toBe("Implementation agent (claude) exited with code 1 (rate limited) for task '1190'");
+	});
+});
+
+describe("Claude's expired-login banner (issue #1478)", () => {
+	// Observed live on 2026-11-24 (CLI 2.1.327, runs 6dd6e70e… and 8d500f8c…): the
+	// CLI's failed `result` record, rendered as the structural line, then the banner.
+	const BANNER =
+		'Failed to authenticate: this login reached its time limit and cannot be renewed. ' +
+		'Run `claude auth login` to sign in again, or use `claude setup-token` and set ' +
+		'CLAUDE_CODE_OAUTH_TOKEN for unattended jobs';
+	const STDOUT = `Claude run failed (success): ${BANNER}\n${BANNER}\n`;
+	const claudeFailure = { subtype: 'success', message: BANNER };
+
+	it('classifies the observed output as auth', () => {
+		expect(classifyAgentFailure(result({ stdout: STDOUT, claudeFailure }), NOW)).toEqual({
+			kind: 'auth',
+		});
+	});
+
+	it.each([
+		'Failed to authenticate: the server rejected the credentials',
+		'Run `claude auth login` to sign in again',
+		'Use `claude setup-token` and set CLAUDE_CODE_OAUTH_TOKEN for unattended jobs',
+		'this login reached its time limit',
+	])('trusts the structural record alone: %s', (message) => {
+		expect(
+			classifyAgentFailure(
+				result({ stdout: 'TypeError: boom', claudeFailure: { subtype: 'success', message } }),
+				NOW,
+			).kind,
+		).toBe('auth');
+	});
+
+	it('does not read the same wording as auth when it is only free text (#343)', () => {
+		// A CI log or reviewed diff quoting the banner is not the CLI reporting
+		// itself logged out: with no structural record, the run stays an `error`.
+		for (const text of [
+			BANNER,
+			'Failed to authenticate',
+			'Docs: Run `claude auth login` on the worker host.\nError: process completed with exit code 1.',
+		]) {
+			expect(classifyAgentFailure(result({ stdout: text }), NOW).kind).toBe('error');
+		}
+	});
+
+	it('trusts the structural record for Claude only', () => {
+		expect(classifyAgentFailure(result({ cli: 'codex', stdout: STDOUT }), NOW).kind).toBe('error');
+	});
+
+	it('keeps a structural rate limit and the stop reasons ahead of auth', () => {
+		const both = { subtype: 'error', message: `API Error: 429 rate_limit_error. ${BANNER}` };
+		expect(classifyAgentFailure(result({ stdout: STDOUT, claudeFailure: both }), NOW).kind).toBe(
+			'rate-limit',
+		);
+		expect(
+			classifyAgentFailure(
+				result({ exitCode: null, timedOut: true, stdout: STDOUT, claudeFailure }),
+				NOW,
+			).kind,
+		).toBe('timeout');
+		expect(
+			classifyAgentFailure(result({ aborted: true, stdout: STDOUT, claudeFailure }), NOW).kind,
+		).toBe('aborted');
+	});
+
+	it('says Claude requires authentication, and how to restore it, in the headline', () => {
+		const err = agentRunError(
+			result({ stdout: STDOUT, claudeFailure }),
+			'Implementation agent (claude) exited with code 1',
+			" for task '892'",
+			NOW,
+		);
+		expect(err.message).toBe(
+			"Implementation agent (claude) exited with code 1 (Claude requires authentication: run `claude auth login` on the worker host, or use `claude setup-token` and set CLAUDE_CODE_OAUTH_TOKEN for unattended jobs) for task '892'",
+		);
+		expect(err.failure).toEqual({ kind: 'auth' });
 	});
 });
