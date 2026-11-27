@@ -14,7 +14,11 @@
  *   3. reconnect with exponential backoff (jittered, capped) whenever the
  *      transport is lost, re-acquiring the lease with a fresh handshake —
  *      presenting the session it already holds so a control-plane restart costs a
- *      round trip rather than the lease TTL (issue #608).
+ *      round trip rather than the lease TTL (issue #608). "Lost" includes a socket
+ *      that never reports closing: a session that delivers no inbound frame (the
+ *      control plane acks every heartbeat) for one lease TTL, or whose heartbeat
+ *      ticks show the host slept through one, is abandoned and reconnected
+ *      (issue #1480 — a half-open connection after a macOS sleep).
  *
  * **Backoff policy: unreachability and refusal are separate ladders (issue #611).**
  * A single counter advanced by every failure made the wait after a control-plane
@@ -300,6 +304,20 @@ export function heartbeatCadenceMs(heartbeatTtlMs: number): number {
 }
 
 /**
+ * How long a live session may go without a single inbound frame before the worker
+ * treats it as dead and reconnects (issue #1480): three heartbeat cadences, so the
+ * lease TTL. The control plane answers every heartbeat with a `heartbeat-ack`, so a
+ * window this long means two or three heartbeats went unanswered — by then the
+ * lease has lapsed on the control-plane side whether or not the socket noticed.
+ *
+ * The same bound is applied to the wall clock between two heartbeat ticks: a gap
+ * that long means the host slept through the TTL, so the lease is already gone.
+ */
+export function livenessTimeoutMs(heartbeatTtlMs: number): number {
+	return 3 * heartbeatCadenceMs(heartbeatTtlMs);
+}
+
+/**
  * Reconnect backoff schedule: exponential (base·2^(n-1)), capped, with equal jitter.
  * Two ceilings rather than one (issue #611 — see the module doc): `maxMs` bounds the
  * ladder for a control plane that answered and refused, `unreachableMaxMs` the one
@@ -438,6 +456,12 @@ export type FetchLike = (
 export interface TransportSocket {
 	send(data: string): void;
 	close(code?: number, reason?: string): void;
+	/**
+	 * Destroy the connection at once, with no closing handshake. Used for a session
+	 * that went silent (issue #1480): a graceful `close` waits for the peer's close
+	 * frame, and a half-open peer never sends one.
+	 */
+	terminate(): void;
 	/**
 	 * Subscribe to a socket event: `open` (no args), `message` (`data`),
 	 * `close` (`code`, `reason`), or `error` (`err`). Args arrive untyped —
@@ -913,7 +937,9 @@ export interface WorkerTransportOptions {
 type SessionEnd =
 	| { reason: 'disconnect'; message: string }
 	| { reason: 'close'; code: number }
-	| { reason: 'error'; error: unknown };
+	| { reason: 'error'; error: unknown }
+	/** The worker itself abandoned a session that went silent (issue #1480). */
+	| { reason: 'liveness'; message: string };
 
 /** Normal WebSocket close code sent on a graceful shutdown. */
 const WS_NORMAL_CLOSE = 1000;
@@ -981,17 +1007,34 @@ export function connectWorkerTransport(
 			activeSocket = socket;
 			let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
 			let settled = false;
-
 			const finish = (end: SessionEnd): void => {
 				if (settled) return;
 				settled = true;
 				if (heartbeatTimer) clearInterval(heartbeatTimer);
+				liveness.stop();
 				if (activeSocket === socket) activeSocket = undefined;
 				// From here on a still-running phase's terminal result is held rather than
 				// written into a dead socket (issue #718).
 				sink.detach(socket);
 				resolve(end);
 			};
+
+			// A session the socket still reports as open but that has stopped answering
+			// (issue #1480) is settled first and its socket destroyed after, so whatever
+			// that destruction emits lands on a finished session.
+			const liveness = createLivenessWatch(
+				livenessTimeoutMs(session.heartbeatTtlMs),
+				(message, context) => {
+					if (settled) return;
+					deps.logger.warn('worker transport session went silent; abandoning it', {
+						sessionId: session.sessionId,
+						reason: message,
+						...context,
+					});
+					finish({ reason: 'liveness', message });
+					terminateQuietly(socket, deps.logger);
+				},
+			);
 
 			socket.on('open', () => {
 				// stop() may have fired while the socket was connecting.
@@ -1000,6 +1043,8 @@ export function connectWorkerTransport(
 					return;
 				}
 				const sendHeartbeat = (): void => {
+					// A tick after the host slept through the TTL ends the session instead.
+					if (liveness.hostSlept()) return;
 					try {
 						socket.send(
 							JSON.stringify(buildHeartbeatFrame(session.fencingToken, options.health?.())),
@@ -1020,6 +1065,7 @@ export function connectWorkerTransport(
 				heartbeatTimer = setInterval(sendHeartbeat, heartbeatCadenceMs(session.heartbeatTtlMs));
 			});
 			socket.on('message', (data) => {
+				if (!settled) liveness.rearm();
 				const frame = parseControlFrame(data, deps.logger);
 				if (!frame) return;
 				// A `disconnect` control frame means the lease can no longer be refreshed
@@ -1032,7 +1078,8 @@ export function connectWorkerTransport(
 				// Everything else is work rather than session liveness: a pushed assignment
 				// and the cancellation that stops one, both handed to the executor. They run
 				// independently of this session's heartbeat loop, so a long phase never
-				// blocks lease liveness — and `heartbeat-ack` needs no action at all.
+				// blocks lease liveness — and `heartbeat-ack` needs no action beyond the
+				// liveness re-arm above (issue #1480).
 				routeWorkFrame(frame, options, deps.logger, sink);
 			});
 			socket.on('close', (code) =>
@@ -1225,6 +1272,84 @@ export function isFatalHandshakeRejection(err: unknown): boolean {
 	);
 }
 
+/** The liveness half of a live session (issue #1480) — see {@link createLivenessWatch}. */
+interface LivenessWatch {
+	/** Record an inbound frame: the silence window starts over. */
+	rearm(): void;
+	/**
+	 * Called on each heartbeat tick: whether the wall clock jumped past the window
+	 * since the previous tick, in which case the session has already been reported
+	 * lost and the tick must send nothing.
+	 */
+	hostSlept(): boolean;
+	stop(): void;
+}
+
+/**
+ * Watch a session for the silence a half-open socket produces (issue #1480). A TCP
+ * connection that died without a FIN/RST reaching this host — the host slept across
+ * the lease expiry — keeps accepting `send`s into the local buffer and never emits
+ * `close`, so without this the daemon heartbeats into nothing for as long as the
+ * process lives.
+ *
+ * Two signals, both bounded by `limitMs`:
+ *   - **Silence.** Armed on creation — so an upgrade that never completes is bounded
+ *     too — and re-armed by every inbound frame. Any frame counts: a `heartbeat-ack`
+ *     is the steady one, but an assignment proves the path just as well.
+ *   - **A wall-clock jump between heartbeat ticks.** Timers run on a clock that stops
+ *     while the host sleeps, so silence alone fires a whole window *after* a wake; a
+ *     gap that long between two ticks says on its face that the host slept and the
+ *     lease lapsed meanwhile.
+ *
+ * `onLost` is called at most once per signal; the caller makes it idempotent.
+ */
+function createLivenessWatch(
+	limitMs: number,
+	onLost: (message: string, context: Record<string, unknown>) => void,
+): LivenessWatch {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let lastTickAt = Date.now();
+	const rearm = (): void => {
+		if (timer) clearTimeout(timer);
+		timer = setTimeout(
+			() => onLost(`no frame from the control plane for ${limitMs}ms`, { silenceLimitMs: limitMs }),
+			limitMs,
+		);
+	};
+	rearm();
+	return {
+		rearm,
+		hostSlept(): boolean {
+			const now = Date.now();
+			const gapMs = now - lastTickAt;
+			lastTickAt = now;
+			if (gapMs <= limitMs) return false;
+			onLost(`wall clock jumped ${gapMs}ms between heartbeats (host likely slept)`, {
+				gapMs,
+				silenceLimitMs: limitMs,
+			});
+			return true;
+		},
+		stop(): void {
+			if (timer) clearTimeout(timer);
+		},
+	};
+}
+
+/**
+ * Destroy an abandoned session's socket. Not a graceful `close`: a closing handshake
+ * waits on the peer's close frame, and a half-open peer never sends one (issue #1480).
+ */
+function terminateQuietly(socket: TransportSocket, logger: TransportLogger): void {
+	try {
+		socket.terminate();
+	} catch (err) {
+		logger.debug('terminating an abandoned worker transport socket failed', {
+			error: err instanceof Error ? err.message : String(err),
+		});
+	}
+}
+
 /**
  * Hand the established session to the daemon's own bookkeeping
  * ({@link WorkerTransportOptions.onSession}). Guarded, because that handler is not
@@ -1409,5 +1534,7 @@ function describeSessionEnd(end: SessionEnd): string {
 			return `socket closed (code ${end.code})`;
 		case 'error':
 			return `socket error: ${end.error instanceof Error ? end.error.message : String(end.error)}`;
+		case 'liveness':
+			return `liveness lost: ${end.message}`;
 	}
 }
