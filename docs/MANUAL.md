@@ -495,7 +495,11 @@ submitted review's identity is unchanged.
 CLIs it can run, the pipeline phases it can execute, and which repositories its
 local checkouts actually are (read from each checkout's `origin`, primary first) — keeps its
 session live over the `/worker/stream` WebSocket, and reconnects with backoff
-(ADR-003 §1). Because it declares its phase repertoire, the control plane never
+(ADR-003 §1). A session the socket still reports as open but that has answered
+nothing for one heartbeat TTL — or whose heartbeat ticks show the host slept
+through one — is abandoned and reconnected too, logged as `worker transport
+session went silent; abandoning it`, so a worker on a laptop that slept comes
+back on its own after the wake. Because it declares its phase repertoire, the control plane never
 routes a phase to a worker that cannot run it; the work waits for one that can.
 
 **How it guards its checkouts.** An assignment runs in the checkout of its

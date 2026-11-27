@@ -23,6 +23,7 @@ import {
 	deriveTransportUrls,
 	type FetchResponse,
 	heartbeatCadenceMs,
+	livenessTimeoutMs,
 	MAX_UNDELIVERED_RESULTS,
 	performHandshake,
 	type TransportSocket,
@@ -393,6 +394,13 @@ describe('heartbeatCadenceMs', () => {
 	});
 });
 
+describe('livenessTimeoutMs', () => {
+	it('is three heartbeat cadences — the lease TTL — and keeps the cadence floor', () => {
+		expect(livenessTimeoutMs(60_000)).toBe(60_000);
+		expect(livenessTimeoutMs(900)).toBe(3_000);
+	});
+});
+
 describe('computeReconnectDelayMs', () => {
 	const cfg = DEFAULT_BACKOFF;
 
@@ -588,6 +596,7 @@ describe('performHandshake', () => {
 class FakeSocket implements TransportSocket {
 	readonly sent: string[] = [];
 	closedWith: { code?: number; reason?: string } | undefined;
+	terminated = false;
 	private readonly listeners = new Map<string, ((...args: unknown[]) => void)[]>();
 
 	constructor(
@@ -603,6 +612,13 @@ class FakeSocket implements TransportSocket {
 		if (this.closedWith) return;
 		this.closedWith = { code, reason };
 		this.dispatch('close', code ?? 1000, Buffer.from(reason ?? ''));
+	}
+
+	// Mirrors `ws`: no closing handshake, and the local `close` fires as an abnormal 1006.
+	terminate(): void {
+		if (this.terminated) return;
+		this.terminated = true;
+		this.dispatch('close', 1006, Buffer.from(''));
 	}
 
 	on(event: string, listener: (...args: unknown[]) => void): void {
@@ -1019,6 +1035,140 @@ describe('connectWorkerTransport (reconnect loop)', () => {
 		expect(fetch).toHaveBeenCalledTimes(2);
 
 		await client.stop();
+	});
+
+	// Issue #1480: the TCP connection died without a FIN/RST reaching the host (it slept
+	// across the lease expiry). Every heartbeat `send` still succeeds into the local
+	// buffer, nothing ever comes back, and the socket never emits `close` — the daemon
+	// sat in that state for ~12h until restarted by hand.
+	describe('half-open socket (issue #1480)', () => {
+		const HEARTBEAT_ACK = { type: 'heartbeat-ack' };
+
+		it('abandons a session that answers nothing within the lease TTL and reconnects', async () => {
+			fetch
+				.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)))
+				.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(5)));
+			const logger = recordingLogger();
+			const client = connectWorkerTransport(
+				{ ...options, capabilities: ['claude'] },
+				{ ...overrides(), logger },
+			);
+			await flush();
+			sockets[0].emitOpen();
+
+			// Sends keep "succeeding", no ack and no close arrive: just short of the window
+			// nothing has noticed.
+			await vi.advanceTimersByTimeAsync(59_999);
+			expect(sockets[0].sent.length).toBeGreaterThanOrEqual(3);
+			expect(sockets[0].terminated).toBe(false);
+			expect(fetch).toHaveBeenCalledTimes(1);
+
+			await vi.advanceTimersByTimeAsync(1);
+			// Destroyed, not gracefully closed — a closing handshake would wait on a peer
+			// that is not there.
+			expect(sockets[0].terminated).toBe(true);
+			expect(sockets[0].closedWith).toBeUndefined();
+			expect(logger.lines).toContainEqual(
+				expect.objectContaining({
+					level: 'warn',
+					message: 'worker transport session went silent; abandoning it',
+				}),
+			);
+			expect(logger.lines).toContainEqual(
+				expect.objectContaining({
+					message: 'worker transport session ended; reconnecting',
+					context: expect.objectContaining({
+						end: 'liveness lost: no frame from the control plane for 60000ms',
+					}),
+				}),
+			);
+
+			// The normal reconnect path: first rung of the ordinary ladder, then a handshake
+			// that reclaims the lease this daemon held.
+			await vi.advanceTimersByTimeAsync(500);
+			expect(fetch).toHaveBeenCalledTimes(2);
+			expect(JSON.parse(String(fetch.mock.calls[1][1].body)).reclaim).toEqual({
+				sessionId: SESSION_ID,
+				fencingToken: 4,
+			});
+			expect(sockets).toHaveLength(2);
+			sockets[1].emitOpen();
+			expect(JSON.parse(sockets[1].sent[0])).toEqual({ type: 'heartbeat', fencingToken: 5 });
+
+			await client.stop();
+			await expect(client.done).resolves.toBeUndefined();
+		});
+
+		it('keeps a session whose heartbeats are acknowledged', async () => {
+			fetch.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)));
+			const client = connectWorkerTransport({ ...options, capabilities: ['claude'] }, overrides());
+			await flush();
+			sockets[0].emitOpen();
+			sockets[0].emitMessage(HEARTBEAT_ACK);
+
+			// Ten minutes of heartbeats, each answered.
+			for (let i = 0; i < 30; i += 1) {
+				await vi.advanceTimersByTimeAsync(heartbeatCadenceMs(60_000));
+				sockets[0].emitMessage(HEARTBEAT_ACK);
+			}
+
+			expect(sockets[0].terminated).toBe(false);
+			expect(sockets).toHaveLength(1);
+			expect(fetch).toHaveBeenCalledTimes(1);
+			await client.stop();
+		});
+
+		it('bounds an upgrade that never completes', async () => {
+			fetch
+				.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)))
+				.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(5)));
+			const client = connectWorkerTransport({ ...options, capabilities: ['claude'] }, overrides());
+			await flush();
+
+			// `open` never fires.
+			await vi.advanceTimersByTimeAsync(60_000);
+			expect(sockets[0].terminated).toBe(true);
+			await vi.advanceTimersByTimeAsync(500);
+			expect(fetch).toHaveBeenCalledTimes(2);
+
+			await client.stop();
+		});
+
+		// Timers run on a clock that stops while the host sleeps, so the silence window
+		// alone would only fire a full TTL after a wake. A wall-clock jump past the TTL
+		// between two heartbeat ticks shows the lease already lapsed.
+		it('reconnects on the first heartbeat tick after the host slept through the TTL', async () => {
+			fetch
+				.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(4)))
+				.mockResolvedValueOnce(jsonResponse(200, handshakeResponseBody(5)));
+			const logger = recordingLogger();
+			const client = connectWorkerTransport(
+				{ ...options, capabilities: ['claude'] },
+				{ ...overrides(), logger },
+			);
+			await flush();
+			sockets[0].emitOpen();
+			sockets[0].emitMessage(HEARTBEAT_ACK);
+			const sentBeforeSleep = sockets[0].sent.length;
+
+			// Seven hours asleep: the wall clock moves, the timer clock does not.
+			vi.setSystemTime(Date.now() + 7 * 60 * 60 * 1_000);
+			await vi.advanceTimersByTimeAsync(heartbeatCadenceMs(60_000));
+
+			expect(sockets[0].terminated).toBe(true);
+			// The tick that noticed sent nothing into the dead socket.
+			expect(sockets[0].sent).toHaveLength(sentBeforeSleep);
+			const abandoned = logger.lines.find(
+				(line) => line.message === 'worker transport session went silent; abandoning it',
+			);
+			expect(abandoned?.context?.reason).toMatch(/wall clock jumped \d+ms .*host likely slept/);
+
+			await vi.advanceTimersByTimeAsync(500);
+			expect(fetch).toHaveBeenCalledTimes(2);
+			expect(sockets).toHaveLength(2);
+
+			await client.stop();
+		});
 	});
 
 	it('fails fatally when the stream upgrade is rejected (4401 close)', async () => {
